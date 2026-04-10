@@ -26,6 +26,13 @@
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
             meta.mainProgram = "explicit";
+            postInstall = ''
+              mkdir -p $out/lib
+              trace_lib="$(find target -type f \( -name 'libexplicit_env_trace.so' -o -name 'libexplicit_env_trace.dylib' \) | head -n 1)"
+              if [ -n "$trace_lib" ]; then
+                cp "$trace_lib" "$out/lib/"
+              fi
+            '';
           };
         in
         {

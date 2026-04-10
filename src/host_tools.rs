@@ -35,7 +35,10 @@ fn inspect_command(path_env: Option<&OsStr>, command: &str) -> Option<HostComman
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    Some(HostCommandSupport { paths, support_dirs })
+    Some(HostCommandSupport {
+        paths,
+        support_dirs,
+    })
 }
 
 fn expand_command_path(path_env: Option<&OsStr>, path: &Path) -> Vec<PathBuf> {
@@ -185,9 +188,9 @@ fn parse_wrapper_delegate_paths(contents: &str) -> Vec<PathBuf> {
 
 fn package_root_dir(path: &Path) -> Option<PathBuf> {
     let components = path.components().collect::<Vec<_>>();
-    let node_modules_index = components.iter().position(|component| {
-        component.as_os_str().to_str() == Some("node_modules")
-    })?;
+    let node_modules_index = components
+        .iter()
+        .position(|component| component.as_os_str().to_str() == Some("node_modules"))?;
     let package_index = node_modules_index + 1;
     let package_component = components.get(package_index)?;
     let package_name = package_component.as_os_str().to_str()?;
@@ -346,8 +349,10 @@ done
         let path_env = std::env::join_paths([bin_dir.as_path(), runtime_dir.as_path()]).unwrap();
 
         let support = inspect_command(Some(path_env.as_os_str()), "codex").unwrap();
-        assert!(support
-            .support_dirs
-            .contains(&fs::canonicalize(&package_dir).unwrap()));
+        assert!(
+            support
+                .support_dirs
+                .contains(&fs::canonicalize(&package_dir).unwrap())
+        );
     }
 }

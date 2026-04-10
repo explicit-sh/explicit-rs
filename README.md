@@ -125,6 +125,7 @@ explicit shell --command codex
 explicit shell --command claude
 explicit observe
 explicit observe codex exec --skip-git-repo-check "say hello in one word"
+explicit observe claude -- --help
 explicit observe list
 explicit observe report --latest
 explicit codex
@@ -139,7 +140,7 @@ cargo run -- shell --command 'pwd; command -v cargo; cargo --version'
 
 ## Observability
 
-`explicit observe codex` adds a run-scoped SQLite event store on top of the existing sandbox.
+`explicit observe codex` and `explicit observe claude` add a run-scoped SQLite event store on top of the existing sandbox.
 
 Plain `explicit codex` and `explicit claude` also publish a live run snapshot over a Unix socket in the project root:
 
@@ -161,6 +162,7 @@ It currently captures:
 - web search events
 - patch apply events
 - derived file touches from parsed shell commands and patch metadata
+- environment variable access events when the observed process runs on Linux with `LD_PRELOAD`
 
 Observed runs are written under:
 
@@ -178,11 +180,12 @@ You can also use the shorthand:
 
 ```bash
 explicit codex --observe
+explicit claude --observe
 ```
 
-This uses the same sandbox as `explicit codex`, then ingests the new Codex session after the run exits.
+This uses the same sandbox as the normal agent launch, then ingests the run-scoped telemetry after the process exits. Codex gets session JSONL ingestion on top; Claude currently contributes sandbox and environment telemetry.
 
-The current observability implementation does not yet do full MITM network capture or kernel-level file tracing. The exploration and planned next layers are documented in [docs/observability.md](/Users/onnimonni/Projects/devenv-nono-llm/docs/observability.md).
+The current observability implementation does not yet do full MITM network capture or kernel-level file tracing. Environment access tracing is currently implemented only on Linux; the macOS dyld path still needs a more reliable interposition strategy. The exploration and planned next layers are documented in [docs/observability.md](/Users/onnimonni/Projects/devenv-nono-llm/docs/observability.md).
 
 The sandbox is intentionally narrow. It allows:
 

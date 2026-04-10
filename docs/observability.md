@@ -8,6 +8,13 @@ This document outlines a practical way to add a second layer around `explicit co
 - file access patterns
 - outbound domains and, when possible, full HTTP and WebSocket requests
 
+Current status in the codebase:
+
+- Codex session JSONL ingestion is implemented
+- SQLite run storage and shared live socket reporting are implemented
+- Linux environment-variable access tracing via `LD_PRELOAD` is implemented
+- macOS environment-variable access tracing is not yet reliable enough to enable by default
+
 ## Goal
 
 We want a launch mode that does two jobs at once:

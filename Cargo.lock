@@ -961,6 +961,7 @@ dependencies = [
  "anyhow",
  "clap",
  "dirs",
+ "libc",
  "nono",
  "onefetch",
  "onefetch-manifest",

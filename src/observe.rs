@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::analysis::Analysis;
+use crate::env_trace;
 use crate::runtime;
 
 pub fn list_runs(root: &Path) -> Result<()> {
@@ -33,12 +34,13 @@ pub fn list_runs(root: &Path) -> Result<()> {
 
     for run in runs {
         println!(
-            "{}  {}  {}  messages={} commands={} tokens={}  {}",
+            "{}  {}  {}  messages={} commands={} env={} tokens={}  {}",
             run.run_id,
             run.status,
             format_started_at(run.started_at_ms),
             run.message_count,
             run.exec_command_count,
+            run.env_access_count,
             run.latest_total_tokens
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "unknown".to_string()),
@@ -77,6 +79,7 @@ pub fn print_report(root: &Path, run: Option<&str>, latest: bool) -> Result<()> 
     let conn = Connection::open(&run.db_path)
         .with_context(|| format!("failed to open {}", run.db_path.display()))?;
     configure_db(&conn)?;
+    init_schema(&conn)?;
 
     let prompt_preview = conn
         .query_row(
@@ -96,6 +99,7 @@ pub fn print_report(root: &Path, run: Option<&str>, latest: bool) -> Result<()> 
     let top_commands = top_commands(&conn, &run.run_id)?;
     let failed_commands = failed_commands(&conn, &run.run_id)?;
     let top_files = top_files(&conn, &run.run_id)?;
+    let top_env_keys = top_env_keys(&conn, &run.run_id)?;
 
     println!("Run: {}", run.run_id);
     println!("Status: {}", run.status);
@@ -108,6 +112,7 @@ pub fn print_report(root: &Path, run: Option<&str>, latest: bool) -> Result<()> 
     println!("Web searches: {}", run.web_search_count);
     println!("Patch events: {}", run.patch_event_count);
     println!("Derived file touches: {}", run.file_touch_count);
+    println!("Env accesses: {}", run.env_access_count);
     println!(
         "Latest total tokens: {}",
         run.latest_total_tokens
@@ -172,6 +177,24 @@ pub fn print_report(root: &Path, run: Option<&str>, latest: bool) -> Result<()> 
         }
     }
 
+    println!("Top env keys:");
+    if top_env_keys.is_empty() {
+        println!("  none");
+    } else {
+        for row in top_env_keys {
+            println!(
+                "  {}  count={}  values={}  latest={}",
+                row.key,
+                row.count,
+                row.distinct_values,
+                row.latest_value
+                    .as_deref()
+                    .map(truncate_preview)
+                    .unwrap_or_else(|| "missing".to_string())
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -188,7 +211,14 @@ pub fn launch_live_agent(
         LiveRunSnapshot::new(root, agent, &command, false, None, None),
     )?;
     server.update(|snapshot| snapshot.state = "running".to_string());
-    let status = runtime::launch_shell(root, analysis, Some(command), block_network, no_services)?;
+    let status = runtime::launch_shell(
+        root,
+        analysis,
+        Some(command),
+        block_network,
+        no_services,
+        None,
+    )?;
     server.finish(status);
     Ok(status)
 }
@@ -219,17 +249,33 @@ pub fn launch_observed_agent(
     } else {
         BTreeMap::new()
     };
+    let trace_env = env_trace::build_injection_env(&run.trace_log_path)?;
 
     server.update(|snapshot| snapshot.state = "running".to_string());
-    let status = runtime::launch_shell(root, analysis, Some(command), block_network, no_services)?;
+    let status = runtime::launch_shell(
+        root,
+        analysis,
+        Some(command),
+        block_network,
+        no_services,
+        Some(&trace_env),
+    )?;
     server.update(|snapshot| snapshot.state = "ingesting".to_string());
 
-    let summary = if agent == "codex" {
+    let mut summary = ImportSummary::default();
+    if agent == "codex" {
         let changed_files = changed_session_files(&codex_sessions_root()?, &session_snapshot)?;
-        ingest_codex_sessions(&run.db_path, &run.run_id, &changed_files)?
-    } else {
-        ImportSummary::default()
-    };
+        summary.merge(ingest_codex_sessions(
+            &run.db_path,
+            &run.run_id,
+            &changed_files,
+        )?);
+    }
+    summary.merge(ingest_env_trace_file(
+        &run.db_path,
+        &run.run_id,
+        &run.trace_log_path,
+    )?);
 
     server.update(|snapshot| apply_summary_to_snapshot(snapshot, &summary));
     server.finish(status);
@@ -243,6 +289,7 @@ struct ObservationRun {
     run_id: String,
     root: PathBuf,
     db_path: PathBuf,
+    trace_log_path: PathBuf,
 }
 
 struct LiveRunServer {
@@ -269,6 +316,7 @@ struct LiveRunSnapshot {
     web_search_count: usize,
     patch_event_count: usize,
     file_touch_count: usize,
+    env_access_count: usize,
     latest_total_tokens: Option<i64>,
 }
 
@@ -285,6 +333,7 @@ struct RunRow {
     web_search_count: i64,
     patch_event_count: i64,
     file_touch_count: i64,
+    env_access_count: i64,
     latest_total_tokens: Option<i64>,
 }
 
@@ -310,6 +359,14 @@ struct FileTouchRow {
     ops: Vec<String>,
 }
 
+#[derive(Debug)]
+struct EnvAccessRow {
+    key: String,
+    count: i64,
+    distinct_values: i64,
+    latest_value: Option<String>,
+}
+
 #[derive(Debug, Default)]
 struct ImportSummary {
     session_count: usize,
@@ -319,6 +376,7 @@ struct ImportSummary {
     web_search_count: usize,
     patch_event_count: usize,
     file_touch_count: usize,
+    env_access_count: usize,
     latest_total_tokens: Option<i64>,
 }
 
@@ -354,12 +412,29 @@ impl LiveRunSnapshot {
             web_search_count: 0,
             patch_event_count: 0,
             file_touch_count: 0,
+            env_access_count: 0,
             latest_total_tokens: None,
         }
     }
 
     fn is_terminal(&self) -> bool {
         matches!(self.state.as_str(), "completed" | "failed")
+    }
+}
+
+impl ImportSummary {
+    fn merge(&mut self, other: Self) {
+        self.session_count += other.session_count;
+        self.message_count += other.message_count;
+        self.token_count_events += other.token_count_events;
+        self.exec_command_count += other.exec_command_count;
+        self.web_search_count += other.web_search_count;
+        self.patch_event_count += other.patch_event_count;
+        self.file_touch_count += other.file_touch_count;
+        self.env_access_count += other.env_access_count;
+        if other.latest_total_tokens.is_some() {
+            self.latest_total_tokens = other.latest_total_tokens;
+        }
     }
 }
 
@@ -465,6 +540,7 @@ impl ObservationRun {
             run_id,
             root: root.to_path_buf(),
             db_path,
+            trace_log_path: run_dir.join("env-access.jsonl"),
         })
     }
 
@@ -483,7 +559,8 @@ impl ObservationRun {
                  web_search_count = ?8,
                  patch_event_count = ?9,
                  file_touch_count = ?10,
-                 latest_total_tokens = ?11
+                 env_access_count = ?11,
+                 latest_total_tokens = ?12
              where run_id = ?1",
             params![
                 &self.run_id,
@@ -500,6 +577,7 @@ impl ObservationRun {
                 summary.web_search_count as i64,
                 summary.patch_event_count as i64,
                 summary.file_touch_count as i64,
+                summary.env_access_count as i64,
                 summary.latest_total_tokens,
             ],
         )
@@ -519,6 +597,7 @@ fn print_summary(run: &ObservationRun, summary: &ImportSummary) {
     println!("Web searches: {}", summary.web_search_count);
     println!("Patch events: {}", summary.patch_event_count);
     println!("Derived file touches: {}", summary.file_touch_count);
+    println!("Env accesses: {}", summary.env_access_count);
     println!(
         "Latest total tokens: {}",
         summary
@@ -618,6 +697,7 @@ fn render_live_snapshot(snapshot: &LiveRunSnapshot) {
     println!("Web searches: {}", snapshot.web_search_count);
     println!("Patch events: {}", snapshot.patch_event_count);
     println!("Derived file touches: {}", snapshot.file_touch_count);
+    println!("Env accesses: {}", snapshot.env_access_count);
     println!(
         "Latest total tokens: {}",
         snapshot
@@ -635,6 +715,7 @@ fn apply_summary_to_snapshot(snapshot: &mut LiveRunSnapshot, summary: &ImportSum
     snapshot.web_search_count = summary.web_search_count;
     snapshot.patch_event_count = summary.patch_event_count;
     snapshot.file_touch_count = summary.file_touch_count;
+    snapshot.env_access_count = summary.env_access_count;
     snapshot.latest_total_tokens = summary.latest_total_tokens;
 }
 
@@ -659,9 +740,10 @@ fn load_run_rows(root: &Path) -> Result<Vec<RunRow>> {
         }
         let conn = Connection::open(&path)
             .with_context(|| format!("failed to open {}", path.display()))?;
+        init_schema(&conn)?;
         let row = conn
             .query_row(
-                "select run_id, agent, status, started_at_ms, message_count, token_count_events, exec_command_count, web_search_count, patch_event_count, file_touch_count, latest_total_tokens from runs limit 1",
+                "select run_id, agent, status, started_at_ms, message_count, token_count_events, exec_command_count, web_search_count, patch_event_count, file_touch_count, env_access_count, latest_total_tokens from runs limit 1",
                 [],
                 |row| {
                     Ok(RunRow {
@@ -676,7 +758,8 @@ fn load_run_rows(root: &Path) -> Result<Vec<RunRow>> {
                         web_search_count: row.get(7)?,
                         patch_event_count: row.get(8)?,
                         file_touch_count: row.get(9)?,
-                        latest_total_tokens: row.get(10)?,
+                        env_access_count: row.get(10)?,
+                        latest_total_tokens: row.get(11)?,
                     })
                 },
             )
@@ -779,6 +862,38 @@ fn top_files(conn: &Connection, run_id: &str) -> Result<Vec<FileTouchRow>> {
     Ok(rows)
 }
 
+fn top_env_keys(conn: &Connection, run_id: &str) -> Result<Vec<EnvAccessRow>> {
+    let mut stmt = conn.prepare(
+        "select key,
+                count(*) as count,
+                count(distinct coalesce(value, '')) as distinct_values,
+                (
+                    select value
+                    from env_accesses latest
+                    where latest.run_id = env_accesses.run_id
+                      and latest.key = env_accesses.key
+                    order by latest.id desc
+                    limit 1
+                ) as latest_value
+         from env_accesses
+         where run_id = ?1
+         group by key
+         order by count desc, key asc
+         limit 10",
+    )?;
+    let rows = stmt
+        .query_map(params![run_id], |row| {
+            Ok(EnvAccessRow {
+                key: row.get(0)?,
+                count: row.get(1)?,
+                distinct_values: row.get(2)?,
+                latest_value: row.get(3)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 fn truncate_preview(value: &str) -> String {
     let max_len = 120;
     let char_count = value.chars().count();
@@ -817,6 +932,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
             web_search_count integer not null default 0,
             patch_event_count integer not null default 0,
             file_touch_count integer not null default 0,
+            env_access_count integer not null default 0,
             latest_total_tokens integer
         );
 
@@ -919,9 +1035,50 @@ fn init_schema(conn: &Connection) -> Result<()> {
         );
         create index if not exists idx_file_touches_run_id on file_touches(run_id);
         create index if not exists idx_file_touches_path on file_touches(path);
+
+        create table if not exists env_accesses (
+            id integer primary key,
+            run_id text not null,
+            created_at_ms integer not null,
+            process_id integer not null,
+            parent_process_id integer not null,
+            operation text not null,
+            key text not null,
+            found integer not null,
+            value text,
+            executable text,
+            raw_json text not null
+        );
+        create index if not exists idx_env_accesses_run_id on env_accesses(run_id);
+        create index if not exists idx_env_accesses_key on env_accesses(key);
         ",
     )
     .context("failed to initialize observability schema")?;
+    ensure_column(
+        conn,
+        "runs",
+        "env_access_count",
+        "integer not null default 0",
+    )?;
+    Ok(())
+}
+
+fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("pragma table_info({table})"))?;
+    let exists = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .any(|name| name == column);
+    if exists {
+        return Ok(());
+    }
+
+    conn.execute(
+        &format!("alter table {table} add column {column} {definition}"),
+        [],
+    )
+    .with_context(|| format!("failed to add {column} to {table}"))?;
     Ok(())
 }
 
@@ -1014,6 +1171,44 @@ fn unique_run_id(agent: &str) -> String {
     format!("{agent}-{nanos}-{}-{counter}", std::process::id())
 }
 
+#[derive(Debug, Deserialize)]
+struct EnvTraceRecord {
+    ts_ms: i64,
+    pid: i32,
+    ppid: i32,
+    operation: String,
+    key: String,
+    found: bool,
+    value: Option<String>,
+    executable: Option<String>,
+}
+
+fn ingest_env_trace_file(db_path: &Path, run_id: &str, trace_path: &Path) -> Result<ImportSummary> {
+    let mut summary = ImportSummary::default();
+    if !trace_path.exists() {
+        return Ok(summary);
+    }
+
+    let conn = Connection::open(db_path)
+        .with_context(|| format!("failed to open {}", db_path.display()))?;
+    configure_db(&conn)?;
+
+    let file = File::open(trace_path)
+        .with_context(|| format!("failed to open {}", trace_path.display()))?;
+    for line in BufReader::new(file).lines() {
+        let line = line.with_context(|| format!("failed to read {}", trace_path.display()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record: EnvTraceRecord = serde_json::from_str(&line)
+            .with_context(|| format!("failed to parse {}", trace_path.display()))?;
+        insert_env_access(&conn, run_id, &record, &line)?;
+        summary.env_access_count += 1;
+    }
+
+    Ok(summary)
+}
+
 fn ingest_codex_sessions(
     db_path: &Path,
     run_id: &str,
@@ -1086,6 +1281,42 @@ fn ingest_codex_session_file(
     .with_context(|| format!("failed to update raw event count for {}", session_id))?;
 
     summary.session_count += 1;
+    Ok(())
+}
+
+fn insert_env_access(
+    conn: &Connection,
+    run_id: &str,
+    record: &EnvTraceRecord,
+    raw_json: &str,
+) -> Result<()> {
+    conn.execute(
+        "insert into env_accesses (
+            run_id,
+            created_at_ms,
+            process_id,
+            parent_process_id,
+            operation,
+            key,
+            found,
+            value,
+            executable,
+            raw_json
+        ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            run_id,
+            record.ts_ms,
+            record.pid,
+            record.ppid,
+            record.operation,
+            record.key,
+            if record.found { 1 } else { 0 },
+            record.value,
+            record.executable,
+            raw_json,
+        ],
+    )
+    .context("failed to insert env access")?;
     Ok(())
 }
 
@@ -1542,9 +1773,10 @@ mod tests {
     use super::{
         ImportSummary, LiveRunServer, LiveRunSnapshot, apply_summary_to_snapshot,
         changed_session_files, collect_file_touches_from_parsed_cmd, configure_db,
-        fetch_live_snapshot, ingest_codex_session_file, init_schema, prepare_socket_path,
-        snapshot_session_files, socket_path, unique_run_id,
+        fetch_live_snapshot, ingest_codex_session_file, ingest_env_trace_file, init_schema,
+        prepare_socket_path, snapshot_session_files, socket_path, unique_run_id,
     };
+    use crate::env_trace;
     use rusqlite::Connection;
     use serde_json::json;
     use std::{fs, path::Path, process::ExitCode};
@@ -1685,6 +1917,7 @@ mod tests {
             web_search_count: 5,
             patch_event_count: 6,
             file_touch_count: 7,
+            env_access_count: 8,
             latest_total_tokens: Some(42),
         };
         apply_summary_to_snapshot(&mut snapshot, &summary);
@@ -1694,7 +1927,122 @@ mod tests {
         assert_eq!(snapshot.web_search_count, 5);
         assert_eq!(snapshot.patch_event_count, 6);
         assert_eq!(snapshot.file_touch_count, 7);
+        assert_eq!(snapshot.env_access_count, 8);
         assert_eq!(snapshot.latest_total_tokens, Some(42));
+    }
+
+    #[test]
+    fn ingests_env_trace_file_into_sqlite() {
+        let dir = tempdir().unwrap();
+        let trace_path = dir.path().join("env-access.jsonl");
+        fs::write(
+            &trace_path,
+            [
+                r#"{"ts_ms":1,"pid":100,"ppid":10,"operation":"getenv","key":"PATH","found":true,"value":"/bin:/usr/bin","executable":"/tmp/probe"}"#,
+                r#"{"ts_ms":2,"pid":100,"ppid":10,"operation":"getenv","key":"AWS_SECRET_KEY","found":true,"value":"secret","executable":"/tmp/probe"}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let db_path = dir.path().join("events.sqlite");
+        let conn = Connection::open(&db_path).unwrap();
+        configure_db(&conn).unwrap();
+        init_schema(&conn).unwrap();
+        conn.execute(
+            "insert into runs (
+                run_id,
+                agent,
+                root,
+                command,
+                agent_args_json,
+                started_at_ms,
+                status,
+                analysis_json,
+                sandbox_plan_json
+            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                "run-1",
+                "claude",
+                "/tmp/project",
+                "claude",
+                "[]",
+                1i64,
+                "running",
+                "{}",
+                "{}",
+            ],
+        )
+        .unwrap();
+
+        let summary = ingest_env_trace_file(&db_path, "run-1", &trace_path).unwrap();
+        assert_eq!(summary.env_access_count, 2);
+
+        let env_count: i64 = conn
+            .query_row("select count(*) from env_accesses", [], |row| row.get(0))
+            .unwrap();
+        let secret: String = conn
+            .query_row(
+                "select value from env_accesses where key = 'AWS_SECRET_KEY' limit 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(env_count, 2);
+        assert_eq!(secret, "secret");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn preload_trace_captures_getenv_calls() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("probe.c");
+        let binary = dir.path().join("probe");
+        let log_path = dir.path().join("env-access.jsonl");
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+        let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+        fs::write(
+            &source,
+            r#"
+#include <stdlib.h>
+
+int main(void) {
+    (void)getenv("PATH");
+    (void)getenv("AWS_SECRET_KEY");
+    return 0;
+}
+"#,
+        )
+        .unwrap();
+
+        let status = std::process::Command::new(&cargo)
+            .arg("build")
+            .arg("--lib")
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let status = std::process::Command::new(&cc)
+            .arg(&source)
+            .arg("-o")
+            .arg(&binary)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let mut command = std::process::Command::new(&binary);
+        command.env("AWS_SECRET_KEY", "trace-secret");
+        for (key, value) in env_trace::build_injection_env(&log_path).unwrap() {
+            command.env(key, value);
+        }
+        let status = command.status().unwrap();
+        assert!(status.success());
+
+        let contents = fs::read_to_string(&log_path).unwrap();
+        assert!(contents.contains("\"key\":\"PATH\""));
+        assert!(contents.contains("\"key\":\"AWS_SECRET_KEY\""));
+        assert!(contents.contains("\"value\":\"trace-secret\""));
     }
 
     #[test]

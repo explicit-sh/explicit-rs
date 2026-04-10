@@ -137,6 +137,7 @@ pub fn launch_shell(
     command: Option<String>,
     block_network: bool,
     no_services: bool,
+    extra_env: Option<&BTreeMap<String, String>>,
 ) -> Result<ExitCode> {
     apply_project(root, analysis)?;
     let total_steps = if !no_services && !analysis.services.is_empty() {
@@ -145,7 +146,7 @@ pub fn launch_shell(
         2
     };
 
-    let env_map = capture_devenv_env(root, 1, total_steps)?;
+    let mut env_map = capture_devenv_env(root, 1, total_steps)?;
     if !no_services && !analysis.services.is_empty() {
         run_devenv_up(root, 2, total_steps)?;
     }
@@ -159,6 +160,10 @@ pub fn launch_shell(
     if block_network {
         plan.notes
             .push("network access blocked for this shell invocation".to_string());
+    }
+
+    if let Some(extra_env) = extra_env {
+        env_map.extend(extra_env.clone());
     }
 
     fs::write(&env_file, serde_json::to_string_pretty(&env_map)?)
@@ -730,8 +735,7 @@ fn _write_sandbox_plan(path: &Path, plan: &SandboxPlan) -> Result<()> {
 mod tests {
     use super::{
         classify_devenv_stderr_line, harmonize_tls_certificate_env, humanize_process_command,
-        parse_process_snapshot,
-        summarize_process_tree,
+        parse_process_snapshot, summarize_process_tree,
     };
     use std::collections::BTreeMap;
 

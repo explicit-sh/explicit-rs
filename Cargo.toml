@@ -3,10 +3,16 @@ name = "explicit"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "explicit_env_trace"
+path = "src/env_trace_lib.rs"
+crate-type = ["cdylib"]
+
 [dependencies]
 anyhow = "1.0.100"
 clap = { version = "4.5.53", features = ["derive"] }
 dirs = "6.0.0"
+libc = "0.2.177"
 nono = "0.31.0"
 onefetch = "2.27.1"
 onefetch-manifest = "2.27.1"

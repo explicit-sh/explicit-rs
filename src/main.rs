@@ -1,5 +1,6 @@
 mod analysis;
 mod devenv_file;
+mod env_trace;
 mod hooks;
 mod host_tools;
 mod observe;
@@ -94,6 +95,12 @@ enum ObserveCommand {
         disable_help_subcommand = true
     )]
     Codex(ObserveAgentArgs),
+    #[command(
+        about = "Launch Claude and save sandbox, env, and runtime telemetry to SQLite.",
+        disable_help_flag = true,
+        disable_help_subcommand = true
+    )]
+    Claude(ObserveAgentArgs),
     #[command(about = "List observed runs under the current project.")]
     List(CommonArgs),
     #[command(about = "Print a report for an observed run.")]
@@ -188,11 +195,13 @@ fn run() -> Result<ExitCode> {
                 args.command,
                 args.block_network,
                 args.no_services,
+                None,
             )?;
             Ok(status)
         }
         Command::Observe(args) => match args.command {
             Some(ObserveCommand::Codex(args)) => launch_observed_agent("codex", args),
+            Some(ObserveCommand::Claude(args)) => launch_observed_agent("claude", args),
             Some(ObserveCommand::List(args)) => {
                 let root = args.root.canonicalize().context("failed to resolve root")?;
                 observe::list_runs(&root)?;
@@ -294,7 +303,9 @@ fn extract_observe_flag(args: Vec<String>) -> (bool, Vec<String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, build_agent_command, extract_observe_flag, shell_escape};
+    use super::{
+        Cli, Command, ObserveCommand, build_agent_command, extract_observe_flag, shell_escape,
+    };
     use clap::Parser;
 
     #[test]
@@ -341,5 +352,20 @@ mod tests {
             panic!("expected observe command");
         };
         assert!(args.command.is_none());
+    }
+
+    #[test]
+    fn observe_claude_subcommand_parses() {
+        let cli = Cli::try_parse_from(["explicit", "observe", "claude", "--", "-p", "hello"])
+            .expect("expected observe claude to parse");
+        let Command::Observe(args) = cli.command else {
+            panic!("expected observe command");
+        };
+        match args.command {
+            Some(ObserveCommand::Claude(args)) => {
+                assert_eq!(args.args, vec!["-p", "hello"]);
+            }
+            _ => panic!("expected observe claude command"),
+        }
     }
 }
