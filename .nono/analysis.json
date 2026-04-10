@@ -1,0 +1,73 @@
+{
+  "root": "/Users/onnimonni/Projects/devenv-nono-llm",
+  "markers": [
+    "Cargo.toml"
+  ],
+  "manifests": [
+    "Cargo"
+  ],
+  "detected_languages": [
+    "rust"
+  ],
+  "language_hints": [
+    "Nix",
+    "Rust"
+  ],
+  "packages": [
+    "git",
+    "jq",
+    "nono"
+  ],
+  "services": [],
+  "nix_options": [],
+  "requires_allow_unfree": false,
+  "lint_commands": [
+    "cargo fmt --check",
+    "cargo clippy --all-targets --all-features -- -D warnings"
+  ],
+  "build_commands": [
+    "cargo build"
+  ],
+  "test_commands": [
+    "cargo test"
+  ],
+  "notes": [],
+  "sandbox_plan": {
+    "root": "/Users/onnimonni/Projects/devenv-nono-llm",
+    "read_write_dirs": [
+      "/Users/onnimonni/.cargo",
+      "/Users/onnimonni/.claude",
+      "/Users/onnimonni/.codex",
+      "/Users/onnimonni/Library/Containers/com.maxgoedjen.Secretive.SecretAgent/Data",
+      "/Users/onnimonni/Library/Keychains",
+      "/Users/onnimonni/Projects/devenv-nono-llm",
+      "/Users/onnimonni/Projects/devenv-nono-llm/.claude",
+      "/Users/onnimonni/Projects/devenv-nono-llm/.codex",
+      "/Users/onnimonni/Projects/devenv-nono-llm/.devenv",
+      "/Users/onnimonni/Projects/devenv-nono-llm/.nono",
+      "/private/var/run",
+      "/var/folders/km/9w5jrr7924n3wwcvjpb800800000gn/T/",
+      "/var/run"
+    ],
+    "read_only_dirs": [
+      "/Library/Keychains",
+      "/System",
+      "/System/Library/Keychains",
+      "/Users/onnimonni/Library/Preferences",
+      "/bin",
+      "/dev",
+      "/etc",
+      "/nix",
+      "/nix/store/bb0z7w4vrf36rbz6s4k95yfic23wws9s-claude/bin",
+      "/nix/store/c25yknyfr5qrq6j0i3b5rvg6j802m75h-devenv-2.0.6/bin",
+      "/nix/store/r2aaparq6v3xq7z4ayq38nqkvks01c18-codex/bin",
+      "/opt/homebrew/Caskroom/claude-code/2.1.89",
+      "/opt/homebrew/Caskroom/codex/0.118.0",
+      "/opt/homebrew/bin",
+      "/run/current-system/sw/bin",
+      "/usr",
+      "/usr/bin"
+    ],
+    "notes": []
+  }
+}

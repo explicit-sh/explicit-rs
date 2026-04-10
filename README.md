@@ -1,0 +1,228 @@
+# explicit
+
+`explicit` analyzes a project, infers what it needs to run locally, writes that into `devenv`, and opens a restricted agent shell with only the required tools and permissions.
+
+The point is to make the normally implicit parts of local development explicit:
+
+- which languages are needed
+- which packages are needed
+- which local services are needed
+- which cache directories agents must access
+- which commands must pass before an agent is allowed to stop
+
+## What It Does
+
+Given a project directory, `explicit`:
+
+- scans common project markers such as `package.json`, `Cargo.toml`, `go.mod`, `mix.exs`, `Gemfile`, `composer.json`, `pyproject.toml`, `requirements.txt`, `Makefile`, Gradle files, Maven files, and Compose files
+- detects likely languages, packages, lint commands, build commands, and local services
+- detects likely test commands and common test frameworks
+- ensures [devenv.nix](/Users/onnimonni/Projects/devenv-nono-llm/devenv.nix) imports [devenv.generated.nix](/Users/onnimonni/Projects/devenv-nono-llm/devenv.generated.nix)
+- regenerates [devenv.generated.nix](/Users/onnimonni/Projects/devenv-nono-llm/devenv.generated.nix) from the detected requirements
+- writes analysis output to `.nono/analysis.json` and `.nono/sandbox-plan.json`
+- writes a shared stop hook used by Claude and Codex
+- launches a `devenv` shell, starts detected services, and re-execs into a `nono` sandbox
+
+## Why The Name
+
+Most local development environments rely on hidden assumptions:
+
+- a language runtime happens to already exist
+- a service happens to already be running
+- a package manager cache happens to be available
+- an agent can read broad parts of the machine because nobody defined a narrower boundary
+
+`explicit` turns those assumptions into generated configuration and a concrete sandbox plan.
+
+## Commands
+
+The CLI is:
+
+```bash
+explicit scan
+explicit apply
+explicit doctor
+explicit shell
+explicit codex
+explicit claude
+```
+
+What each command does:
+
+- `scan`: prints the detected requirements as JSON
+- `apply`: updates `devenv.nix` wiring, rewrites `devenv.generated.nix`, and refreshes `.nono/` metadata and hooks
+- `doctor`: prints a readable summary of what was detected
+- `shell`: realizes the `devenv` environment and launches a sandboxed shell for agents or manual use
+- `codex`: shorthand for launching `codex` inside the managed sandbox in the current project
+- `claude`: shorthand for launching `claude` inside the managed sandbox in the current project
+
+## Usage
+
+Run directly with Cargo:
+
+```bash
+cargo run -- scan
+cargo run -- apply
+cargo run -- doctor
+cargo run -- shell
+cargo run -- codex
+cargo run -- claude
+```
+
+Run through the built package:
+
+```bash
+nix build .#explicit
+./result/bin/explicit doctor
+```
+
+Run as a flake app:
+
+```bash
+nix run .#explicit -- doctor
+nix run .#explicit -- apply
+nix run .#explicit -- shell
+```
+
+Run inside the repo `devenv` shell:
+
+```bash
+devenv shell
+explicit apply
+explicit doctor
+explicit shell --command codex
+explicit codex
+explicit claude
+```
+
+## Agent Shell
+
+The `shell` command does four things in order:
+
+1. runs `apply`
+2. captures the environment from `devenv shell`
+3. starts detected services with `devenv up --detach` when needed
+4. launches a `nono` sandbox with only the required paths allowed
+
+Examples:
+
+```bash
+explicit shell --command codex
+explicit shell --command claude
+explicit codex
+explicit claude
+explicit codex -m gpt-5.4
+explicit claude -- --help
+cargo run -- shell --command 'pwd; command -v cargo; cargo --version'
+```
+
+`explicit codex ...` and `explicit claude ...` pass everything after the subcommand directly to the agent binary. If you need sandbox-specific controls such as `--root`, `--block-network`, or `--no-services`, use `explicit shell --command ...` instead.
+
+The sandbox is intentionally narrow. It allows:
+
+- the project root
+- `.devenv`, `.nono`, `.codex`, and `.claude` in the project
+- user-level agent config directories such as `~/.codex` and `~/.claude`
+- detected cache directories such as `~/.cargo`, `~/.mix`, `~/.hex`, npm and pnpm caches, Maven and Gradle caches, and similar language-specific locations
+- the minimal executable and system paths needed to run the realized environment and agent binaries
+
+## Stop Hooks
+
+`explicit` writes:
+
+- `.nono/guard-commands.json`
+- `.nono/stop-guard.sh`
+- `.claude/settings.local.json`
+- `.codex/hooks.json`
+- `.codex/config.toml`
+
+The stop hook blocks agent shutdown if discovered lint, build, or test commands fail.
+
+For example, if a project exposes `cargo fmt --check`, `cargo clippy`, `cargo build`, `cargo test`, `pytest`, `pnpm test`, or `make build`, those commands become part of the stop gate.
+
+If no concrete lint or build command is detected, the hook remains advisory and allows exit.
+
+## Generated Files
+
+Files managed by the tool:
+
+- [devenv.generated.nix](/Users/onnimonni/Projects/devenv-nono-llm/devenv.generated.nix): generated language, package, and service settings
+- `.nono/analysis.json`: raw scan result
+- `.nono/sandbox-plan.json`: resolved sandbox permissions
+- `.nono/guard-commands.json`: lint and build commands used by the stop hook
+- `.nono/stop-guard.sh`: hook implementation
+
+[devenv.nix](/Users/onnimonni/Projects/devenv-nono-llm/devenv.nix) is treated as the user-owned entrypoint. `explicit` only ensures the generated import exists and leaves the rest of the file under user control.
+
+## Current Heuristics
+
+Today the detector understands common patterns for:
+
+- Rust
+- JavaScript and TypeScript
+- Python
+- Go
+- Elixir
+- Ruby
+- PHP
+- Java
+- PostgreSQL, Redis, and MySQL from Compose-style service definitions
+
+It also has a built-in native dependency registry for common packaging failures, stored in [registry.toml](/Users/onnimonni/Projects/devenv-nono-llm/registry.toml). The registry is versioned and each rule carries:
+
+- a stable rule id
+- an ecosystem and matcher type
+- packages, services, and extra toolchains to enable
+- a confidence level
+- source URLs for the rule
+
+The current rule set covers, for example:
+
+- Ruby and Rails: `nokogiri`, `pg`, `mysql2`, `sqlite3`, `ffi`, `sidekiq`
+- Python and Django: `psycopg`, `psycopg2`, `lxml`, `pillow`, `mysqlclient`, `maturin`
+- JavaScript and Next.js: `sharp`, `canvas`, `better-sqlite3`, `sqlite3`, `prisma`, `pg`, `mysql2`, `ioredis`
+- Elixir and Phoenix: `postgrex`, `myxql`, `exqlite`, `rustler`, `redix`
+- Rust: `openssl`, `openssl-sys`, `rusqlite`, `libsqlite3-sys`, `pq-sys`, `sqlx`, `diesel`
+- Go: `mattn/go-sqlite3`, `lib/pq`, `pgx`, `go-sql-driver/mysql`, `go-redis`
+- PHP and Laravel-style stacks: `ext-pgsql`, `ext-pdo_pgsql`, `ext-redis`, `ext-gd`, `ext-imagick`, `ext-zip`
+
+Those rules add the matching `nixpkgs` system packages, enable local services when the dependency clearly implies one, and can also enable extra toolchains such as Rust for `maturin` or `rustler`.
+
+This is heuristic-driven, not a full project evaluator. When a project is unusual, `explicit` should still give a useful baseline, but you may need to extend `devenv.nix` manually.
+
+## Project Layout
+
+Important files in this repo:
+
+- [src/main.rs](/Users/onnimonni/Projects/devenv-nono-llm/src/main.rs): CLI entrypoint
+- [src/analysis.rs](/Users/onnimonni/Projects/devenv-nono-llm/src/analysis.rs): project detection and sandbox planning
+- [src/registry.rs](/Users/onnimonni/Projects/devenv-nono-llm/src/registry.rs): TOML-backed cross-language native dependency and service registry loader
+- [registry.toml](/Users/onnimonni/Projects/devenv-nono-llm/registry.toml): versioned rule data with confidence levels and source URLs
+- [src/devenv_file.rs](/Users/onnimonni/Projects/devenv-nono-llm/src/devenv_file.rs): `rnix`-based `devenv.nix` inspection and generated file rendering
+- [src/runtime.rs](/Users/onnimonni/Projects/devenv-nono-llm/src/runtime.rs): `devenv` orchestration and shell launch
+- [src/sandbox.rs](/Users/onnimonni/Projects/devenv-nono-llm/src/sandbox.rs): `nono` sandbox application and exec
+- [src/hooks.rs](/Users/onnimonni/Projects/devenv-nono-llm/src/hooks.rs): Claude and Codex hook generation
+- [flake.nix](/Users/onnimonni/Projects/devenv-nono-llm/flake.nix): Nix packaging and app entrypoints
+- [devenv.nix](/Users/onnimonni/Projects/devenv-nono-llm/devenv.nix): repo-level `devenv` entrypoint
+
+## Development
+
+Useful commands while working on the tool itself:
+
+```bash
+cargo fmt
+cargo test
+cargo run -- doctor
+nix build .#explicit
+```
+
+## Status
+
+The current implementation is aimed at being a strong baseline:
+
+- it makes tool and permission assumptions visible
+- it generates a usable `devenv` layer automatically
+- it gives Claude and Codex the same stop policy
+- it launches agents inside a narrower sandbox than the host machine
+
+It does not yet try to fully infer every project-specific service, package, or permission edge case.

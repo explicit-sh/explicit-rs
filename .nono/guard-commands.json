@@ -1,0 +1,21 @@
+{
+  "commands": [
+    {
+      "kind": "lint",
+      "command": "cargo fmt --check"
+    },
+    {
+      "kind": "lint",
+      "command": "cargo clippy --all-targets --all-features -- -D warnings"
+    },
+    {
+      "kind": "build",
+      "command": "cargo build"
+    },
+    {
+      "kind": "test",
+      "command": "cargo test"
+    }
+  ],
+  "notes": []
+}

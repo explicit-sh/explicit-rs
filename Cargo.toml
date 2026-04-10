@@ -1,0 +1,21 @@
+[package]
+name = "explicit"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+clap = { version = "4.5.53", features = ["derive"] }
+dirs = "6.0.0"
+nono = "0.31.0"
+onefetch = "2.27.1"
+onefetch-manifest = "2.27.1"
+regex = "1.12.2"
+rnix = "0.14.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+serde_yaml = "0.9.34"
+toml = "0.9.8"
+
+[dev-dependencies]
+tempfile = "3.23.0"

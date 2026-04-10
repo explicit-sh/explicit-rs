@@ -1,0 +1,625 @@
+version = 1
+
+[[rules]]
+id = "javascript-sharp"
+ecosystem = "javascript"
+matcher = "dependency"
+dependencies = ["sharp"]
+packages = ["pkg-config", "vips"]
+note = "Detected sharp in the JavaScript dependencies; adding pkg-config and vips for native image processing builds commonly used by Next.js and similar stacks."
+confidence = "high"
+sources = ["https://sharp.pixelplumbing.com/install/", "https://search.nixos.org/packages?show=vips&type=packages"]
+
+[[rules]]
+id = "javascript-canvas"
+ecosystem = "javascript"
+matcher = "dependency"
+dependencies = ["canvas"]
+packages = ["pkg-config", "cairo", "pango", "pixman"]
+note = "Detected canvas in the JavaScript dependencies; adding Cairo and Pango build dependencies for native Node canvas bindings."
+confidence = "high"
+sources = ["https://github.com/Automattic/node-canvas", "https://search.nixos.org/packages?show=cairo&type=packages"]
+
+[[rules]]
+id = "javascript-better-sqlite3"
+ecosystem = "javascript"
+matcher = "dependency"
+dependencies = ["better-sqlite3"]
+packages = ["pkg-config", "sqlite"]
+note = "Detected better-sqlite3 in the JavaScript dependencies; adding sqlite and pkg-config for native SQLite bindings."
+confidence = "high"
+sources = ["https://github.com/WiseLibs/better-sqlite3", "https://search.nixos.org/packages?show=sqlite&type=packages"]
+
+[[rules]]
+id = "javascript-sqlite3"
+ecosystem = "javascript"
+matcher = "dependency"
+dependencies = ["sqlite3"]
+packages = ["pkg-config", "sqlite"]
+note = "Detected sqlite3 in the JavaScript dependencies; adding sqlite and pkg-config for native SQLite bindings."
+confidence = "high"
+sources = ["https://github.com/TryGhost/node-sqlite3", "https://search.nixos.org/packages?show=sqlite&type=packages"]
+
+[[rules]]
+id = "javascript-prisma"
+ecosystem = "javascript"
+matcher = "dependency"
+dependencies = ["prisma"]
+packages = ["openssl"]
+note = "Detected Prisma in the JavaScript dependencies; adding OpenSSL because Prisma engines commonly require it in Nix shells."
+confidence = "medium"
+sources = ["https://www.prisma.io/docs/orm/reference/system-requirements", "https://search.nixos.org/packages?show=openssl&type=packages"]
+
+[[rules]]
+id = "javascript-pg"
+ecosystem = "javascript"
+matcher = "dependency"
+dependencies = ["pg"]
+packages = ["postgresql"]
+services = ["postgres"]
+note = "Detected pg in the JavaScript dependencies; enabling PostgreSQL and adding the client package for local database work."
+confidence = "high"
+sources = ["https://node-postgres.com/", "https://search.nixos.org/packages?show=postgresql&type=packages"]
+
+[[rules]]
+id = "javascript-pg-native"
+ecosystem = "javascript"
+matcher = "dependency"
+dependencies = ["pg-native"]
+packages = ["pkg-config", "postgresql"]
+services = ["postgres"]
+note = "Detected pg-native in the JavaScript dependencies; adding PostgreSQL client libraries and pkg-config for native libpq bindings."
+confidence = "high"
+sources = ["https://node-postgres.com/features/native", "https://search.nixos.org/packages?show=postgresql&type=packages"]
+
+[[rules]]
+id = "javascript-mysql2"
+ecosystem = "javascript"
+matcher = "dependency"
+dependencies = ["mysql2"]
+packages = ["pkg-config", "mariadb-connector-c"]
+services = ["mysql"]
+note = "Detected mysql2 in the JavaScript dependencies; adding MariaDB client libraries and enabling MySQL for local development."
+confidence = "high"
+sources = ["https://github.com/sidorares/node-mysql2", "https://search.nixos.org/packages?show=mariadb-connector-c&type=packages"]
+
+[[rules]]
+id = "javascript-redis"
+ecosystem = "javascript"
+matcher = "dependency"
+dependencies = ["redis"]
+services = ["redis"]
+note = "Detected redis in the JavaScript dependencies; enabling Redis for local development."
+confidence = "medium"
+sources = ["https://github.com/redis/node-redis"]
+
+[[rules]]
+id = "javascript-ioredis"
+ecosystem = "javascript"
+matcher = "dependency"
+dependencies = ["ioredis"]
+services = ["redis"]
+note = "Detected ioredis in the JavaScript dependencies; enabling Redis for local development."
+confidence = "medium"
+sources = ["https://github.com/redis/ioredis"]
+
+[[rules]]
+id = "javascript-react-native"
+ecosystem = "javascript"
+matcher = "dependency"
+dependencies = ["react-native"]
+packages = ["watchman"]
+languages = ["java"]
+nix_options = [
+  "android.enable = true;",
+  "android.reactNative.enable = true;",
+  "android.emulator.enable = false;",
+  "android.systemImages.enable = false;"
+]
+requires_allow_unfree = true
+note = "Detected a React Native project; enabling devenv Android support, adding watchman for Metro, and enabling Java for Android builds. Xcode and CocoaPods remain host-level dependencies on macOS."
+confidence = "medium"
+sources = ["https://devenv.sh/supported-languages/android/", "https://reactnative.dev/docs/set-up-your-environment", "https://search.nixos.org/packages?show=watchman&type=packages"]
+
+[[rules]]
+id = "javascript-expo"
+ecosystem = "javascript"
+matcher = "dependency"
+dependencies = ["expo"]
+packages = ["watchman"]
+note = "Detected an Expo project; adding watchman for Metro. Native mobile SDKs remain host-level dependencies when you use prebuild or native modules."
+confidence = "medium"
+sources = ["https://docs.expo.dev/get-started/set-up-your-environment/", "https://search.nixos.org/packages?show=watchman&type=packages"]
+
+[[rules]]
+id = "python-psycopg"
+ecosystem = "python"
+matcher = "dependency"
+dependencies = ["psycopg"]
+packages = ["pkg-config", "postgresql"]
+services = ["postgres"]
+note = "Detected psycopg in the Python dependencies; adding PostgreSQL client libraries and pkg-config for local builds against libpq."
+confidence = "high"
+sources = ["https://www.psycopg.org/psycopg3/docs/basic/install.html", "https://search.nixos.org/packages?show=postgresql&type=packages"]
+
+[[rules]]
+id = "python-psycopg2"
+ecosystem = "python"
+matcher = "dependency"
+dependencies = ["psycopg2"]
+packages = ["pkg-config", "postgresql"]
+services = ["postgres"]
+note = "Detected psycopg2 in the Python dependencies; adding PostgreSQL client libraries and pkg-config for local builds against libpq."
+confidence = "high"
+sources = ["https://www.psycopg.org/docs/install.html", "https://search.nixos.org/packages?show=postgresql&type=packages"]
+
+[[rules]]
+id = "python-lxml"
+ecosystem = "python"
+matcher = "dependency"
+dependencies = ["lxml"]
+packages = ["pkg-config", "libxml2", "libxslt"]
+note = "Detected lxml in the Python dependencies; adding libxml2, libxslt, and pkg-config for source builds."
+confidence = "high"
+sources = ["https://lxml.de/installation.html", "https://search.nixos.org/packages?show=libxml2&type=packages"]
+
+[[rules]]
+id = "python-pillow"
+ecosystem = "python"
+matcher = "dependency"
+dependencies = ["pillow"]
+packages = ["pkg-config", "zlib", "freetype", "libjpeg"]
+note = "Detected Pillow in the Python dependencies; adding common image codec libraries used when building Pillow from source."
+confidence = "high"
+sources = ["https://pillow.readthedocs.io/en/stable/installation/basic-installation.html", "https://search.nixos.org/packages?show=freetype&type=packages"]
+
+[[rules]]
+id = "python-mysqlclient"
+ecosystem = "python"
+matcher = "dependency"
+dependencies = ["mysqlclient"]
+packages = ["pkg-config", "mariadb-connector-c"]
+services = ["mysql"]
+note = "Detected mysqlclient in the Python dependencies; adding MariaDB client libraries and enabling MySQL for local development."
+confidence = "high"
+sources = ["https://github.com/PyMySQL/mysqlclient", "https://search.nixos.org/packages?show=mariadb-connector-c&type=packages"]
+
+[[rules]]
+id = "python-redis"
+ecosystem = "python"
+matcher = "dependency"
+dependencies = ["redis"]
+services = ["redis"]
+note = "Detected redis in the Python dependencies; enabling Redis for local development."
+confidence = "medium"
+sources = ["https://github.com/redis/redis-py"]
+
+[[rules]]
+id = "python-hiredis"
+ecosystem = "python"
+matcher = "dependency"
+dependencies = ["hiredis"]
+services = ["redis"]
+note = "Detected hiredis in the Python dependencies; enabling Redis for local development."
+confidence = "medium"
+sources = ["https://github.com/redis/hiredis-py"]
+
+[[rules]]
+id = "python-cffi"
+ecosystem = "python"
+matcher = "dependency"
+dependencies = ["cffi"]
+packages = ["pkg-config", "libffi"]
+note = "Detected cffi in the Python dependencies; adding libffi and pkg-config for native extension builds."
+confidence = "high"
+sources = ["https://cffi.readthedocs.io/en/latest/installation.html", "https://search.nixos.org/packages?show=libffi&type=packages"]
+
+[[rules]]
+id = "python-maturin"
+ecosystem = "python"
+matcher = "dependency"
+dependencies = ["maturin"]
+languages = ["rust"]
+note = "Detected maturin in the Python dependencies; enabling Rust because maturin-backed extensions need a Rust toolchain."
+confidence = "high"
+sources = ["https://www.maturin.rs/"]
+
+[[rules]]
+id = "python-setuptools-rust"
+ecosystem = "python"
+matcher = "dependency"
+dependencies = ["setuptools-rust"]
+languages = ["rust"]
+note = "Detected setuptools-rust in the Python dependencies; enabling Rust because Rust-backed extensions need a Rust toolchain."
+confidence = "high"
+sources = ["https://setuptools-rust.readthedocs.io/en/latest/"]
+
+[[rules]]
+id = "ruby-nokogiri"
+ecosystem = "ruby"
+matcher = "dependency"
+dependencies = ["nokogiri"]
+packages = ["pkg-config", "libxml2", "libxslt"]
+note = "Detected nokogiri in the Ruby dependencies; adding pkg-config, libxml2, and libxslt to support native XML builds."
+confidence = "high"
+sources = ["https://nokogiri.org/tutorials/installing_nokogiri.html", "https://search.nixos.org/packages?show=rubyPackages.nokogiri&type=packages"]
+
+[[rules]]
+id = "ruby-pg"
+ecosystem = "ruby"
+matcher = "dependency"
+dependencies = ["pg"]
+packages = ["pkg-config", "postgresql"]
+services = ["postgres"]
+note = "Detected pg in the Ruby dependencies; adding PostgreSQL client libraries and enabling PostgreSQL for local development."
+confidence = "high"
+sources = ["https://github.com/ged/ruby-pg", "https://search.nixos.org/packages?show=postgresql&type=packages"]
+
+[[rules]]
+id = "ruby-mysql2"
+ecosystem = "ruby"
+matcher = "dependency"
+dependencies = ["mysql2"]
+packages = ["pkg-config", "mariadb-connector-c"]
+services = ["mysql"]
+note = "Detected mysql2 in the Ruby dependencies; adding MariaDB client libraries and enabling MySQL for local development."
+confidence = "high"
+sources = ["https://github.com/brianmario/mysql2", "https://search.nixos.org/packages?show=mariadb-connector-c&type=packages"]
+
+[[rules]]
+id = "ruby-sqlite3"
+ecosystem = "ruby"
+matcher = "dependency"
+dependencies = ["sqlite3"]
+packages = ["pkg-config", "sqlite"]
+note = "Detected sqlite3 in the Ruby dependencies; adding sqlite and pkg-config for native SQLite builds."
+confidence = "high"
+sources = ["https://github.com/sparklemotion/sqlite3-ruby", "https://search.nixos.org/packages?show=sqlite&type=packages"]
+
+[[rules]]
+id = "ruby-ffi"
+ecosystem = "ruby"
+matcher = "dependency"
+dependencies = ["ffi"]
+packages = ["pkg-config", "libffi"]
+note = "Detected ffi in the Ruby dependencies; adding libffi and pkg-config for native extension builds."
+confidence = "high"
+sources = ["https://github.com/ffi/ffi", "https://search.nixos.org/packages?show=libffi&type=packages"]
+
+[[rules]]
+id = "ruby-redis"
+ecosystem = "ruby"
+matcher = "dependency"
+dependencies = ["redis"]
+services = ["redis"]
+note = "Detected redis in the Ruby dependencies; enabling Redis for local development."
+confidence = "medium"
+sources = ["https://github.com/redis/redis-rb"]
+
+[[rules]]
+id = "ruby-sidekiq"
+ecosystem = "ruby"
+matcher = "dependency"
+dependencies = ["sidekiq"]
+services = ["redis"]
+note = "Detected sidekiq in the Ruby dependencies; enabling Redis because Sidekiq commonly depends on it locally."
+confidence = "medium"
+sources = ["https://github.com/sidekiq/sidekiq", "https://github.com/redis/redis-rb"]
+
+[[rules]]
+id = "ruby-vips"
+ecosystem = "ruby"
+matcher = "dependency"
+dependencies = ["ruby-vips"]
+packages = ["pkg-config", "vips"]
+note = "Detected ruby-vips in the Ruby dependencies; adding pkg-config and vips for native image processing bindings."
+confidence = "high"
+sources = ["https://github.com/libvips/ruby-vips", "https://search.nixos.org/packages?show=vips&type=packages"]
+
+[[rules]]
+id = "ruby-mini-magick"
+ecosystem = "ruby"
+matcher = "dependency"
+dependencies = ["mini_magick"]
+packages = ["imagemagick"]
+note = "Detected mini_magick in the Ruby dependencies; adding ImageMagick for local image processing workflows."
+confidence = "medium"
+sources = ["https://github.com/minimagick/minimagick", "https://search.nixos.org/packages?show=imagemagick&type=packages"]
+
+[[rules]]
+id = "elixir-postgrex"
+ecosystem = "elixir"
+matcher = "dependency"
+dependencies = ["postgrex"]
+packages = ["postgresql"]
+services = ["postgres"]
+note = "Detected postgrex in the Elixir dependencies; adding the PostgreSQL client package and enabling PostgreSQL for local development."
+confidence = "high"
+sources = ["https://hexdocs.pm/postgrex/readme.html", "https://search.nixos.org/packages?show=postgresql&type=packages"]
+
+[[rules]]
+id = "elixir-myxql"
+ecosystem = "elixir"
+matcher = "dependency"
+dependencies = ["myxql"]
+packages = ["mariadb-connector-c"]
+services = ["mysql"]
+note = "Detected myxql in the Elixir dependencies; adding MariaDB client libraries and enabling MySQL for local development."
+confidence = "high"
+sources = ["https://hexdocs.pm/myxql/readme.html", "https://search.nixos.org/packages?show=mariadb-connector-c&type=packages"]
+
+[[rules]]
+id = "elixir-exqlite"
+ecosystem = "elixir"
+matcher = "dependency"
+dependencies = ["exqlite"]
+packages = ["pkg-config", "sqlite"]
+note = "Detected exqlite in the Elixir dependencies; adding sqlite and pkg-config for local NIF builds."
+confidence = "high"
+sources = ["https://hexdocs.pm/exqlite/readme.html", "https://search.nixos.org/packages?show=sqlite&type=packages"]
+
+[[rules]]
+id = "elixir-rustler"
+ecosystem = "elixir"
+matcher = "dependency"
+dependencies = ["rustler"]
+languages = ["rust"]
+note = "Detected rustler in the Elixir dependencies; enabling Rust because Rustler-backed NIFs need a Rust toolchain."
+confidence = "high"
+sources = ["https://github.com/rusterlium/rustler"]
+
+[[rules]]
+id = "elixir-redix"
+ecosystem = "elixir"
+matcher = "dependency"
+dependencies = ["redix"]
+services = ["redis"]
+note = "Detected redix in the Elixir dependencies; enabling Redis for local development."
+confidence = "medium"
+sources = ["https://hexdocs.pm/redix/readme.html"]
+
+[[rules]]
+id = "rust-openssl"
+ecosystem = "rust"
+matcher = "dependency"
+dependencies = ["openssl"]
+packages = ["pkg-config", "openssl"]
+note = "Detected openssl in the Rust dependencies; adding OpenSSL and pkg-config for native linking."
+confidence = "high"
+sources = ["https://docs.rs/openssl/latest/openssl/", "https://search.nixos.org/packages?show=openssl&type=packages"]
+
+[[rules]]
+id = "rust-openssl-sys"
+ecosystem = "rust"
+matcher = "dependency"
+dependencies = ["openssl-sys"]
+packages = ["pkg-config", "openssl"]
+note = "Detected openssl-sys in the Rust dependencies; adding OpenSSL and pkg-config for native linking."
+confidence = "high"
+sources = ["https://docs.rs/openssl-sys/latest/openssl_sys/", "https://search.nixos.org/packages?show=openssl&type=packages"]
+
+[[rules]]
+id = "rust-rusqlite"
+ecosystem = "rust"
+matcher = "dependency"
+dependencies = ["rusqlite"]
+packages = ["pkg-config", "sqlite"]
+note = "Detected rusqlite in the Rust dependencies; adding sqlite and pkg-config for native SQLite bindings."
+confidence = "high"
+sources = ["https://docs.rs/rusqlite/latest/rusqlite/", "https://search.nixos.org/packages?show=sqlite&type=packages"]
+
+[[rules]]
+id = "rust-libsqlite3-sys"
+ecosystem = "rust"
+matcher = "dependency"
+dependencies = ["libsqlite3-sys"]
+packages = ["pkg-config", "sqlite"]
+note = "Detected libsqlite3-sys in the Rust dependencies; adding sqlite and pkg-config for native SQLite bindings."
+confidence = "high"
+sources = ["https://docs.rs/libsqlite3-sys/latest/libsqlite3_sys/", "https://search.nixos.org/packages?show=sqlite&type=packages"]
+
+[[rules]]
+id = "rust-pq-sys"
+ecosystem = "rust"
+matcher = "dependency"
+dependencies = ["pq-sys"]
+packages = ["pkg-config", "postgresql"]
+services = ["postgres"]
+note = "Detected pq-sys in the Rust dependencies; adding PostgreSQL client libraries and pkg-config for native libpq bindings."
+confidence = "high"
+sources = ["https://docs.rs/pq-sys/latest/pq_sys/", "https://search.nixos.org/packages?show=postgresql&type=packages"]
+
+[[rules]]
+id = "rust-redis"
+ecosystem = "rust"
+matcher = "dependency"
+dependencies = ["redis"]
+services = ["redis"]
+note = "Detected redis in the Rust dependencies; enabling Redis for local development."
+confidence = "medium"
+sources = ["https://docs.rs/redis/latest/redis/"]
+
+[[rules]]
+id = "rust-sqlx-or-diesel-postgres"
+ecosystem = "rust"
+matcher = "file_contains"
+dependencies = ["diesel", "sqlx"]
+files = ["Cargo.toml"]
+contains_any = ["postgres"]
+packages = ["pkg-config", "postgresql"]
+services = ["postgres"]
+note = "Detected postgres features in Cargo.toml for diesel or sqlx; adding PostgreSQL client libraries and enabling PostgreSQL for local development."
+confidence = "medium"
+sources = ["https://docs.rs/sqlx/latest/sqlx/", "https://docs.rs/diesel/latest/diesel/", "https://search.nixos.org/packages?show=postgresql&type=packages"]
+
+[[rules]]
+id = "rust-sqlx-or-diesel-sqlite"
+ecosystem = "rust"
+matcher = "file_contains"
+dependencies = ["diesel", "sqlx"]
+files = ["Cargo.toml"]
+contains_any = ["sqlite"]
+packages = ["pkg-config", "sqlite"]
+note = "Detected sqlite features in Cargo.toml for diesel or sqlx; adding sqlite and pkg-config for local builds."
+confidence = "medium"
+sources = ["https://docs.rs/sqlx/latest/sqlx/", "https://docs.rs/diesel/latest/diesel/", "https://search.nixos.org/packages?show=sqlite&type=packages"]
+
+[[rules]]
+id = "rust-sqlx-or-diesel-mysql"
+ecosystem = "rust"
+matcher = "file_contains"
+dependencies = ["diesel", "sqlx"]
+files = ["Cargo.toml"]
+contains_any = ["mysql"]
+packages = ["pkg-config", "mariadb-connector-c"]
+services = ["mysql"]
+note = "Detected mysql features in Cargo.toml for diesel or sqlx; adding MariaDB client libraries and enabling MySQL for local development."
+confidence = "medium"
+sources = ["https://docs.rs/sqlx/latest/sqlx/", "https://docs.rs/diesel/latest/diesel/", "https://search.nixos.org/packages?show=mariadb-connector-c&type=packages"]
+
+[[rules]]
+id = "go-sqlite3"
+ecosystem = "go"
+matcher = "dependency"
+dependencies = ["github.com/mattn/go-sqlite3"]
+packages = ["pkg-config", "sqlite"]
+note = "Detected mattn/go-sqlite3 in go.mod; adding sqlite and pkg-config for CGO-backed SQLite builds."
+confidence = "high"
+sources = ["https://github.com/mattn/go-sqlite3", "https://search.nixos.org/packages?show=sqlite&type=packages"]
+
+[[rules]]
+id = "go-libpq"
+ecosystem = "go"
+matcher = "dependency"
+dependencies = ["github.com/lib/pq"]
+packages = ["postgresql"]
+services = ["postgres"]
+note = "Detected lib/pq in go.mod; adding the PostgreSQL client package and enabling PostgreSQL for local development."
+confidence = "high"
+sources = ["https://github.com/lib/pq", "https://search.nixos.org/packages?show=postgresql&type=packages"]
+
+[[rules]]
+id = "go-pgx"
+ecosystem = "go"
+matcher = "dependency"
+dependencies = ["github.com/jackc/pgx", "github.com/jackc/pgx/v5"]
+packages = ["postgresql"]
+services = ["postgres"]
+note = "Detected pgx in go.mod; adding the PostgreSQL client package and enabling PostgreSQL for local development."
+confidence = "medium"
+sources = ["https://github.com/jackc/pgx", "https://search.nixos.org/packages?show=postgresql&type=packages"]
+
+[[rules]]
+id = "go-mysql-driver"
+ecosystem = "go"
+matcher = "dependency"
+dependencies = ["github.com/go-sql-driver/mysql"]
+services = ["mysql"]
+note = "Detected go-sql-driver/mysql in go.mod; enabling MySQL for local development."
+confidence = "medium"
+sources = ["https://github.com/go-sql-driver/mysql"]
+
+[[rules]]
+id = "go-redis"
+ecosystem = "go"
+matcher = "dependency"
+dependencies = ["github.com/redis/go-redis/v9", "github.com/go-redis/redis/v8"]
+services = ["redis"]
+note = "Detected go-redis in go.mod; enabling Redis for local development."
+confidence = "medium"
+sources = ["https://github.com/redis/go-redis"]
+
+[[rules]]
+id = "php-ext-pgsql"
+ecosystem = "php"
+matcher = "dependency"
+dependencies = ["ext-pgsql", "ext-pdo_pgsql"]
+packages = ["postgresql"]
+services = ["postgres"]
+note = "Detected PostgreSQL extensions in composer requirements; adding the PostgreSQL client package and enabling PostgreSQL for local development."
+confidence = "high"
+sources = ["https://www.php.net/manual/en/book.pgsql.php", "https://search.nixos.org/packages?show=postgresql&type=packages"]
+
+[[rules]]
+id = "php-ext-redis"
+ecosystem = "php"
+matcher = "dependency"
+dependencies = ["ext-redis"]
+services = ["redis"]
+note = "Detected ext-redis in composer requirements; enabling Redis for local development."
+confidence = "medium"
+sources = ["https://github.com/phpredis/phpredis"]
+
+[[rules]]
+id = "php-ext-imagick"
+ecosystem = "php"
+matcher = "dependency"
+dependencies = ["ext-imagick"]
+packages = ["imagemagick"]
+note = "Detected ext-imagick in composer requirements; adding ImageMagick for local image processing workflows."
+confidence = "medium"
+sources = ["https://github.com/Imagick/imagick", "https://search.nixos.org/packages?show=imagemagick&type=packages"]
+
+[[rules]]
+id = "php-ext-gd"
+ecosystem = "php"
+matcher = "dependency"
+dependencies = ["ext-gd"]
+packages = ["pkg-config", "freetype", "libjpeg", "libpng"]
+note = "Detected ext-gd in composer requirements; adding common GD image dependencies for local builds."
+confidence = "high"
+sources = ["https://www.php.net/manual/en/book.image.php", "https://search.nixos.org/packages?show=libpng&type=packages"]
+
+[[rules]]
+id = "php-ext-zip"
+ecosystem = "php"
+matcher = "dependency"
+dependencies = ["ext-zip"]
+packages = ["zlib"]
+note = "Detected ext-zip in composer requirements; adding zlib for local builds of the ZIP extension."
+confidence = "medium"
+sources = ["https://www.php.net/manual/en/book.zip.php", "https://search.nixos.org/packages?show=zlib&type=packages"]
+
+[[rules]]
+id = "jvm-postgres"
+ecosystem = "jvm"
+matcher = "file_contains"
+files = ["pom.xml", "build.gradle", "build.gradle.kts"]
+contains_any = ["org.postgresql:postgresql", "<artifactid>postgresql</artifactid>"]
+packages = ["postgresql"]
+services = ["postgres"]
+note = "Detected PostgreSQL JDBC dependencies in the JVM build files; adding the PostgreSQL client package and enabling PostgreSQL for local development."
+confidence = "medium"
+sources = ["https://jdbc.postgresql.org/", "https://search.nixos.org/packages?show=postgresql&type=packages"]
+
+[[rules]]
+id = "jvm-mysql"
+ecosystem = "jvm"
+matcher = "file_contains"
+files = ["pom.xml", "build.gradle", "build.gradle.kts"]
+contains_any = [
+  "mysql:mysql-connector-j",
+  "mysql:mysql-connector-java",
+  "<artifactid>mysql-connector-j</artifactid>",
+  "<artifactid>mysql-connector-java</artifactid>",
+]
+services = ["mysql"]
+note = "Detected MySQL JDBC dependencies in the JVM build files; enabling MySQL for local development."
+confidence = "medium"
+sources = ["https://dev.mysql.com/doc/connector-j/en/", "https://search.nixos.org/packages?show=mariadb-connector-c&type=packages"]
+
+[[rules]]
+id = "jvm-redis"
+ecosystem = "jvm"
+matcher = "file_contains"
+files = ["pom.xml", "build.gradle", "build.gradle.kts"]
+contains_any = [
+  "redis.clients:jedis",
+  "io.lettuce:lettuce-core",
+  "<artifactid>jedis</artifactid>",
+  "<artifactid>lettuce-core</artifactid>",
+]
+services = ["redis"]
+note = "Detected Redis client dependencies in the JVM build files; enabling Redis for local development."
+confidence = "medium"
+sources = ["https://github.com/redis/jedis", "https://redis.github.io/lettuce/"]
