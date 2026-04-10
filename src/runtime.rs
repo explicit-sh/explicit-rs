@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::os::unix::process::ExitStatusExt;
@@ -138,6 +139,7 @@ pub fn launch_shell(
     block_network: bool,
     no_services: bool,
     extra_env: Option<&BTreeMap<String, String>>,
+    transcript_path: Option<&Path>,
 ) -> Result<ExitCode> {
     apply_project(root, analysis)?;
     let total_steps = if !no_services && !analysis.services.is_empty() {
@@ -179,22 +181,14 @@ pub fn launch_shell(
     print_step_start(launch_step, total_steps, "Launching sandbox shell");
 
     let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
-    let mut child = Command::new(current_exe);
-    child
-        .current_dir(root)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .arg("__sandbox-exec")
-        .arg("--root")
-        .arg(root)
-        .arg("--env-file")
-        .arg(&env_file)
-        .arg("--plan-file")
-        .arg(&plan_file);
-    if let Some(command) = command {
-        child.arg("--command").arg(command);
-    }
+    let mut child = build_sandbox_command(
+        &current_exe,
+        root,
+        &env_file,
+        &plan_file,
+        command.as_deref(),
+        transcript_path,
+    );
     if block_network {
         child.env("DEVENV_NONO_BLOCK_NETWORK", "1");
     } else {
@@ -212,6 +206,104 @@ pub fn launch_shell(
         bail!("sandboxed shell exited from signal {signal}");
     }
     bail!("sandboxed shell failed without an exit code")
+}
+
+fn build_sandbox_command(
+    current_exe: &Path,
+    root: &Path,
+    env_file: &Path,
+    plan_file: &Path,
+    command: Option<&str>,
+    transcript_path: Option<&Path>,
+) -> Command {
+    let sandbox_args = sandbox_exec_args(root, env_file, plan_file, command);
+    match transcript_path {
+        Some(transcript_path) => {
+            script_wrapped_sandbox_command(current_exe, root, transcript_path, &sandbox_args)
+        }
+        None => {
+            let mut child = Command::new(current_exe);
+            child
+                .current_dir(root)
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .args(&sandbox_args);
+            child
+        }
+    }
+}
+
+fn sandbox_exec_args(
+    root: &Path,
+    env_file: &Path,
+    plan_file: &Path,
+    command: Option<&str>,
+) -> Vec<OsString> {
+    let mut args = vec![
+        OsString::from("__sandbox-exec"),
+        OsString::from("--root"),
+        root.as_os_str().to_os_string(),
+        OsString::from("--env-file"),
+        env_file.as_os_str().to_os_string(),
+        OsString::from("--plan-file"),
+        plan_file.as_os_str().to_os_string(),
+    ];
+    if let Some(command) = command {
+        args.push(OsString::from("--command"));
+        args.push(OsString::from(command));
+    }
+    args
+}
+
+fn script_wrapped_sandbox_command(
+    current_exe: &Path,
+    root: &Path,
+    transcript_path: &Path,
+    sandbox_args: &[OsString],
+) -> Command {
+    let transcript_arg = transcript_path
+        .strip_prefix(root)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|_| transcript_path.to_path_buf());
+    let mut child = Command::new("script");
+    child
+        .current_dir(root)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+
+    #[cfg(target_os = "macos")]
+    {
+        child
+            .arg("-q")
+            .arg("-F")
+            .arg("-e")
+            .arg("-k")
+            .arg(&transcript_arg)
+            .arg(current_exe)
+            .args(sandbox_args);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        child
+            .arg("--quiet")
+            .arg("--flush")
+            .arg("--return")
+            .arg(&transcript_arg)
+            .arg("--")
+            .arg(current_exe)
+            .args(sandbox_args);
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = transcript_path;
+        child.arg(current_exe).args(sandbox_args);
+    }
+
+    child
 }
 
 fn capture_devenv_env(
@@ -734,10 +826,10 @@ fn _write_sandbox_plan(path: &Path, plan: &SandboxPlan) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_devenv_stderr_line, harmonize_tls_certificate_env, humanize_process_command,
-        parse_process_snapshot, summarize_process_tree,
+        build_sandbox_command, classify_devenv_stderr_line, harmonize_tls_certificate_env,
+        humanize_process_command, parse_process_snapshot, summarize_process_tree,
     };
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, path::Path};
 
     #[test]
     fn summarize_process_tree_prefers_interesting_leaf_processes() {
@@ -833,6 +925,67 @@ not-a-row
         assert_eq!(
             env_map.get("NIX_SSL_CERT_FILE").map(String::as_str),
             Some("/etc/ssl/certs/ca-certificates.crt")
+        );
+    }
+
+    #[test]
+    fn transcript_capture_wraps_sandbox_with_script() {
+        let command = build_sandbox_command(
+            Path::new("/tmp/explicit"),
+            Path::new("/tmp/project"),
+            Path::new("/tmp/shell-env.json"),
+            Path::new("/tmp/shell-plan.json"),
+            Some("claude -p hello"),
+            Some(Path::new("/tmp/console.typescript")),
+        );
+        assert_eq!(command.get_program().to_string_lossy(), "script");
+        let args = command
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            args,
+            vec![
+                "-q",
+                "-F",
+                "-e",
+                "-k",
+                "/tmp/console.typescript",
+                "/tmp/explicit",
+                "__sandbox-exec",
+                "--root",
+                "/tmp/project",
+                "--env-file",
+                "/tmp/shell-env.json",
+                "--plan-file",
+                "/tmp/shell-plan.json",
+                "--command",
+                "claude -p hello",
+            ]
+        );
+
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            args,
+            vec![
+                "--quiet",
+                "--flush",
+                "--return",
+                "/tmp/console.typescript",
+                "--",
+                "/tmp/explicit",
+                "__sandbox-exec",
+                "--root",
+                "/tmp/project",
+                "--env-file",
+                "/tmp/shell-env.json",
+                "--plan-file",
+                "/tmp/shell-plan.json",
+                "--command",
+                "claude -p hello",
+            ]
         );
     }
 }

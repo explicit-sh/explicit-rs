@@ -157,6 +157,7 @@ If a live socket exists, `explicit observe` renders the current run state from t
 It currently captures:
 
 - model input and output from Codex session JSONL
+- raw terminal transcript bytes and a console preview for observed Claude/Codex runs
 - token usage events
 - shell tool calls and outputs
 - web search events
@@ -167,6 +168,7 @@ It currently captures:
 Observed runs are written under:
 
 - `.nono/observability/<run-id>/events.sqlite`
+- `.nono/observability/<run-id>/console.typescript` for the raw captured terminal session
 
 You can inspect recorded runs with:
 
@@ -183,7 +185,7 @@ explicit codex --observe
 explicit claude --observe
 ```
 
-This uses the same sandbox as the normal agent launch, then ingests the run-scoped telemetry after the process exits. Codex gets session JSONL ingestion on top; Claude currently contributes sandbox and environment telemetry.
+This uses the same sandbox as the normal agent launch, then ingests the run-scoped telemetry after the process exits. Codex gets session JSONL ingestion on top, and both Codex and Claude observed runs now save a raw terminal transcript plus a console preview in the SQLite report. Claude still does not have a Claude-native structured session ingestor yet, so its deepest telemetry is currently the terminal transcript plus runtime and environment data.
 
 The current observability implementation does not yet do full MITM network capture or kernel-level file tracing. Environment access tracing is currently implemented only on Linux; the macOS dyld path still needs a more reliable interposition strategy. The exploration and planned next layers are documented in [docs/observability.md](/Users/onnimonni/Projects/devenv-nono-llm/docs/observability.md).
 

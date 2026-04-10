@@ -34,13 +34,14 @@ pub fn list_runs(root: &Path) -> Result<()> {
 
     for run in runs {
         println!(
-            "{}  {}  {}  messages={} commands={} env={} tokens={}  {}",
+            "{}  {}  {}  messages={} commands={} env={} console_bytes={} tokens={}  {}",
             run.run_id,
             run.status,
             format_started_at(run.started_at_ms),
             run.message_count,
             run.exec_command_count,
             run.env_access_count,
+            run.console_transcript_bytes,
             run.latest_total_tokens
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "unknown".to_string()),
@@ -100,6 +101,7 @@ pub fn print_report(root: &Path, run: Option<&str>, latest: bool) -> Result<()> 
     let failed_commands = failed_commands(&conn, &run.run_id)?;
     let top_files = top_files(&conn, &run.run_id)?;
     let top_env_keys = top_env_keys(&conn, &run.run_id)?;
+    let transcript_preview = console_transcript_preview(&conn, &run.run_id)?;
 
     println!("Run: {}", run.run_id);
     println!("Status: {}", run.status);
@@ -113,6 +115,7 @@ pub fn print_report(root: &Path, run: Option<&str>, latest: bool) -> Result<()> 
     println!("Patch events: {}", run.patch_event_count);
     println!("Derived file touches: {}", run.file_touch_count);
     println!("Env accesses: {}", run.env_access_count);
+    println!("Console transcript bytes: {}", run.console_transcript_bytes);
     println!(
         "Latest total tokens: {}",
         run.latest_total_tokens
@@ -129,6 +132,13 @@ pub fn print_report(root: &Path, run: Option<&str>, latest: bool) -> Result<()> 
     println!(
         "Answer preview: {}",
         answer_preview
+            .as_deref()
+            .map(truncate_preview)
+            .unwrap_or("none".to_string())
+    );
+    println!(
+        "Console preview: {}",
+        transcript_preview
             .as_deref()
             .map(truncate_preview)
             .unwrap_or("none".to_string())
@@ -218,6 +228,7 @@ pub fn launch_live_agent(
         block_network,
         no_services,
         None,
+        None,
     )?;
     server.finish(status);
     Ok(status)
@@ -259,6 +270,7 @@ pub fn launch_observed_agent(
         block_network,
         no_services,
         Some(&trace_env),
+        Some(&run.transcript_log_path),
     )?;
     server.update(|snapshot| snapshot.state = "ingesting".to_string());
 
@@ -276,6 +288,11 @@ pub fn launch_observed_agent(
         &run.run_id,
         &run.trace_log_path,
     )?);
+    summary.merge(ingest_console_transcript_file(
+        &run.db_path,
+        &run.run_id,
+        &run.transcript_log_path,
+    )?);
 
     server.update(|snapshot| apply_summary_to_snapshot(snapshot, &summary));
     server.finish(status);
@@ -290,6 +307,7 @@ struct ObservationRun {
     root: PathBuf,
     db_path: PathBuf,
     trace_log_path: PathBuf,
+    transcript_log_path: PathBuf,
 }
 
 struct LiveRunServer {
@@ -317,6 +335,7 @@ struct LiveRunSnapshot {
     patch_event_count: usize,
     file_touch_count: usize,
     env_access_count: usize,
+    console_transcript_bytes: usize,
     latest_total_tokens: Option<i64>,
 }
 
@@ -334,6 +353,7 @@ struct RunRow {
     patch_event_count: i64,
     file_touch_count: i64,
     env_access_count: i64,
+    console_transcript_bytes: i64,
     latest_total_tokens: Option<i64>,
 }
 
@@ -377,6 +397,7 @@ struct ImportSummary {
     patch_event_count: usize,
     file_touch_count: usize,
     env_access_count: usize,
+    console_transcript_bytes: usize,
     latest_total_tokens: Option<i64>,
 }
 
@@ -413,6 +434,7 @@ impl LiveRunSnapshot {
             patch_event_count: 0,
             file_touch_count: 0,
             env_access_count: 0,
+            console_transcript_bytes: 0,
             latest_total_tokens: None,
         }
     }
@@ -432,6 +454,7 @@ impl ImportSummary {
         self.patch_event_count += other.patch_event_count;
         self.file_touch_count += other.file_touch_count;
         self.env_access_count += other.env_access_count;
+        self.console_transcript_bytes += other.console_transcript_bytes;
         if other.latest_total_tokens.is_some() {
             self.latest_total_tokens = other.latest_total_tokens;
         }
@@ -541,6 +564,7 @@ impl ObservationRun {
             root: root.to_path_buf(),
             db_path,
             trace_log_path: run_dir.join("env-access.jsonl"),
+            transcript_log_path: run_dir.join("console.typescript"),
         })
     }
 
@@ -560,7 +584,8 @@ impl ObservationRun {
                  patch_event_count = ?9,
                  file_touch_count = ?10,
                  env_access_count = ?11,
-                 latest_total_tokens = ?12
+                 console_transcript_bytes = ?12,
+                 latest_total_tokens = ?13
              where run_id = ?1",
             params![
                 &self.run_id,
@@ -578,6 +603,7 @@ impl ObservationRun {
                 summary.patch_event_count as i64,
                 summary.file_touch_count as i64,
                 summary.env_access_count as i64,
+                summary.console_transcript_bytes as i64,
                 summary.latest_total_tokens,
             ],
         )
@@ -598,6 +624,10 @@ fn print_summary(run: &ObservationRun, summary: &ImportSummary) {
     println!("Patch events: {}", summary.patch_event_count);
     println!("Derived file touches: {}", summary.file_touch_count);
     println!("Env accesses: {}", summary.env_access_count);
+    println!(
+        "Console transcript bytes: {}",
+        summary.console_transcript_bytes
+    );
     println!(
         "Latest total tokens: {}",
         summary
@@ -699,6 +729,10 @@ fn render_live_snapshot(snapshot: &LiveRunSnapshot) {
     println!("Derived file touches: {}", snapshot.file_touch_count);
     println!("Env accesses: {}", snapshot.env_access_count);
     println!(
+        "Console transcript bytes: {}",
+        snapshot.console_transcript_bytes
+    );
+    println!(
         "Latest total tokens: {}",
         snapshot
             .latest_total_tokens
@@ -716,6 +750,7 @@ fn apply_summary_to_snapshot(snapshot: &mut LiveRunSnapshot, summary: &ImportSum
     snapshot.patch_event_count = summary.patch_event_count;
     snapshot.file_touch_count = summary.file_touch_count;
     snapshot.env_access_count = summary.env_access_count;
+    snapshot.console_transcript_bytes = summary.console_transcript_bytes;
     snapshot.latest_total_tokens = summary.latest_total_tokens;
 }
 
@@ -743,7 +778,7 @@ fn load_run_rows(root: &Path) -> Result<Vec<RunRow>> {
         init_schema(&conn)?;
         let row = conn
             .query_row(
-                "select run_id, agent, status, started_at_ms, message_count, token_count_events, exec_command_count, web_search_count, patch_event_count, file_touch_count, env_access_count, latest_total_tokens from runs limit 1",
+                "select run_id, agent, status, started_at_ms, message_count, token_count_events, exec_command_count, web_search_count, patch_event_count, file_touch_count, env_access_count, console_transcript_bytes, latest_total_tokens from runs limit 1",
                 [],
                 |row| {
                     Ok(RunRow {
@@ -759,7 +794,8 @@ fn load_run_rows(root: &Path) -> Result<Vec<RunRow>> {
                         patch_event_count: row.get(8)?,
                         file_touch_count: row.get(9)?,
                         env_access_count: row.get(10)?,
-                        latest_total_tokens: row.get(11)?,
+                        console_transcript_bytes: row.get(11)?,
+                        latest_total_tokens: row.get(12)?,
                     })
                 },
             )
@@ -894,6 +930,40 @@ fn top_env_keys(conn: &Connection, run_id: &str) -> Result<Vec<EnvAccessRow>> {
     Ok(rows)
 }
 
+fn console_transcript_preview(conn: &Connection, run_id: &str) -> Result<Option<String>> {
+    let content = conn
+        .query_row(
+            "select content from console_transcripts where run_id = ?1 limit 1",
+            params![run_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(content
+        .as_deref()
+        .map(sanitize_transcript_preview)
+        .filter(|value| !value.trim().is_empty()))
+}
+
+fn sanitize_transcript_preview(content: &str) -> String {
+    let ansi = regex::Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]").expect("valid ansi regex");
+    let without_ansi = ansi.replace_all(content, "");
+    let cleaned = without_ansi
+        .chars()
+        .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\r' | '\t'))
+        .collect::<String>();
+    cleaned
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
 fn truncate_preview(value: &str) -> String {
     let max_len = 120;
     let char_count = value.chars().count();
@@ -933,6 +1003,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
             patch_event_count integer not null default 0,
             file_touch_count integer not null default 0,
             env_access_count integer not null default 0,
+            console_transcript_bytes integer not null default 0,
             latest_total_tokens integer
         );
 
@@ -1051,6 +1122,13 @@ fn init_schema(conn: &Connection) -> Result<()> {
         );
         create index if not exists idx_env_accesses_run_id on env_accesses(run_id);
         create index if not exists idx_env_accesses_key on env_accesses(key);
+
+        create table if not exists console_transcripts (
+            run_id text primary key,
+            captured_at_ms integer not null,
+            byte_count integer not null,
+            content text not null
+        );
         ",
     )
     .context("failed to initialize observability schema")?;
@@ -1058,6 +1136,12 @@ fn init_schema(conn: &Connection) -> Result<()> {
         conn,
         "runs",
         "env_access_count",
+        "integer not null default 0",
+    )?;
+    ensure_column(
+        conn,
+        "runs",
+        "console_transcript_bytes",
         "integer not null default 0",
     )?;
     Ok(())
@@ -1206,6 +1290,47 @@ fn ingest_env_trace_file(db_path: &Path, run_id: &str, trace_path: &Path) -> Res
         summary.env_access_count += 1;
     }
 
+    Ok(summary)
+}
+
+fn ingest_console_transcript_file(
+    db_path: &Path,
+    run_id: &str,
+    transcript_path: &Path,
+) -> Result<ImportSummary> {
+    let mut summary = ImportSummary::default();
+    if !transcript_path.exists() {
+        return Ok(summary);
+    }
+
+    let raw_bytes = fs::read(transcript_path)
+        .with_context(|| format!("failed to read {}", transcript_path.display()))?;
+    if raw_bytes.is_empty() {
+        return Ok(summary);
+    }
+
+    let conn = Connection::open(db_path)
+        .with_context(|| format!("failed to open {}", db_path.display()))?;
+    configure_db(&conn)?;
+
+    let content = String::from_utf8_lossy(&raw_bytes).into_owned();
+    conn.execute(
+        "insert into console_transcripts (run_id, captured_at_ms, byte_count, content)
+         values (?1, ?2, ?3, ?4)
+         on conflict(run_id) do update set
+             captured_at_ms = excluded.captured_at_ms,
+             byte_count = excluded.byte_count,
+             content = excluded.content",
+        params![
+            run_id,
+            unix_millis() as i64,
+            raw_bytes.len() as i64,
+            content
+        ],
+    )
+    .context("failed to insert console transcript")?;
+
+    summary.console_transcript_bytes = raw_bytes.len();
     Ok(summary)
 }
 
@@ -1773,8 +1898,9 @@ mod tests {
     use super::{
         ImportSummary, LiveRunServer, LiveRunSnapshot, apply_summary_to_snapshot,
         changed_session_files, collect_file_touches_from_parsed_cmd, configure_db,
-        fetch_live_snapshot, ingest_codex_session_file, ingest_env_trace_file, init_schema,
-        prepare_socket_path, snapshot_session_files, socket_path, unique_run_id,
+        console_transcript_preview, fetch_live_snapshot, ingest_codex_session_file,
+        ingest_console_transcript_file, ingest_env_trace_file, init_schema, prepare_socket_path,
+        sanitize_transcript_preview, snapshot_session_files, socket_path, unique_run_id,
     };
     use crate::env_trace;
     use rusqlite::Connection;
@@ -1918,6 +2044,7 @@ mod tests {
             patch_event_count: 6,
             file_touch_count: 7,
             env_access_count: 8,
+            console_transcript_bytes: 9,
             latest_total_tokens: Some(42),
         };
         apply_summary_to_snapshot(&mut snapshot, &summary);
@@ -1928,6 +2055,7 @@ mod tests {
         assert_eq!(snapshot.patch_event_count, 6);
         assert_eq!(snapshot.file_touch_count, 7);
         assert_eq!(snapshot.env_access_count, 8);
+        assert_eq!(snapshot.console_transcript_bytes, 9);
         assert_eq!(snapshot.latest_total_tokens, Some(42));
     }
 
@@ -1990,6 +2118,71 @@ mod tests {
             .unwrap();
         assert_eq!(env_count, 2);
         assert_eq!(secret, "secret");
+    }
+
+    #[test]
+    fn ingests_console_transcript_into_sqlite() {
+        let dir = tempdir().unwrap();
+        let transcript_path = dir.path().join("console.typescript");
+        fs::write(
+            &transcript_path,
+            "\u{1b}[2J\u{1b}[H> hello\nClaude says hi\n",
+        )
+        .unwrap();
+        let expected_len = fs::metadata(&transcript_path).unwrap().len() as usize;
+
+        let db_path = dir.path().join("events.sqlite");
+        let conn = Connection::open(&db_path).unwrap();
+        configure_db(&conn).unwrap();
+        init_schema(&conn).unwrap();
+        conn.execute(
+            "insert into runs (
+                run_id,
+                agent,
+                root,
+                command,
+                agent_args_json,
+                started_at_ms,
+                status,
+                analysis_json,
+                sandbox_plan_json
+            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                "run-1",
+                "claude",
+                "/tmp/project",
+                "claude",
+                "[]",
+                1i64,
+                "running",
+                "{}",
+                "{}",
+            ],
+        )
+        .unwrap();
+
+        let summary = ingest_console_transcript_file(&db_path, "run-1", &transcript_path).unwrap();
+        assert_eq!(summary.console_transcript_bytes, expected_len);
+
+        let stored_bytes: i64 = conn
+            .query_row(
+                "select byte_count from console_transcripts where run_id = 'run-1' limit 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let preview = console_transcript_preview(&conn, "run-1").unwrap();
+
+        assert_eq!(stored_bytes, expected_len as i64);
+        assert_eq!(preview.as_deref(), Some("> hello | Claude says hi"));
+    }
+
+    #[test]
+    fn transcript_preview_sanitizes_ansi_sequences() {
+        let preview = sanitize_transcript_preview(
+            "\u{1b}[2J\u{1b}[HOpenAI Codex\n\n\u{1b}[33mwarning\u{1b}[0m\n",
+        );
+        assert_eq!(preview, "OpenAI Codex | warning");
     }
 
     #[cfg(target_os = "linux")]

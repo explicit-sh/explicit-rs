@@ -440,6 +440,12 @@ Add SQLite-backed run metadata and a new launcher:
 - `explicit observe codex`
 - `explicit observe claude`
 
+This phase now also includes raw terminal transcript capture for observed runs:
+
+- `.nono/observability/<run-id>/console.typescript`
+- `console_transcripts` rows in SQLite
+- console byte counts and a short preview in `explicit observe report`
+
 ### Phase 3
 
 Add network metadata capture via `mitmdump`.

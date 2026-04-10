@@ -196,6 +196,7 @@ fn run() -> Result<ExitCode> {
                 args.block_network,
                 args.no_services,
                 None,
+                None,
             )?;
             Ok(status)
         }
