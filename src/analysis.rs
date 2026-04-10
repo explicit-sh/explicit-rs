@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_yaml::Value as YamlValue;
 use toml::Value as TomlValue;
 
-use crate::host_tools::host_command_paths;
+use crate::host_tools::{host_command_paths, host_command_support_dirs};
 use crate::registry;
 
 pub const SUPPORT_PACKAGES: &[&str] = &["git", "jq", "nono"];
@@ -712,14 +712,14 @@ fn build_sandbox_plan(root: &Path, builder: &Builder) -> Result<SandboxPlan> {
     read_write_dirs.insert(root.join(".claude"));
     read_write_dirs.insert(home.join(".codex"));
     read_write_dirs.insert(home.join(".claude"));
-    for path in macos_agent_read_write_paths(&home) {
+    for path in platform_agent_read_write_paths(&home) {
         if path.is_file() {
             read_write_files.insert(path);
         } else {
             read_write_dirs.insert(path);
         }
     }
-    for path in macos_agent_read_only_paths(&home) {
+    for path in platform_agent_read_only_paths(&home) {
         if path.is_file() {
             read_only_files.insert(path);
         } else {
@@ -750,6 +750,9 @@ fn build_sandbox_plan(root: &Path, builder: &Builder) -> Result<SandboxPlan> {
                 read_only_dirs.insert(parent.to_path_buf());
             }
         }
+        for path in host_command_support_dirs(command) {
+            read_only_dirs.insert(path);
+        }
     }
 
     if let Ok(shell) = std::env::var("SHELL") {
@@ -758,7 +761,13 @@ fn build_sandbox_plan(root: &Path, builder: &Builder) -> Result<SandboxPlan> {
         }
     }
 
-    for key in ["TMPDIR", "XDG_RUNTIME_DIR"] {
+    for key in [
+        "TMPDIR",
+        "XDG_RUNTIME_DIR",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_DATA_HOME",
+    ] {
         if let Ok(value) = std::env::var(key) {
             let path = PathBuf::from(value);
             read_write_dirs.insert(path);
@@ -768,6 +777,13 @@ fn build_sandbox_plan(root: &Path, builder: &Builder) -> Result<SandboxPlan> {
     if let Ok(sock) = std::env::var("SSH_AUTH_SOCK") {
         if let Some(parent) = Path::new(&sock).parent() {
             read_write_dirs.insert(parent.to_path_buf());
+        }
+    }
+    if let Ok(address) = std::env::var("DBUS_SESSION_BUS_ADDRESS") {
+        if let Some(path) = address.strip_prefix("unix:path=") {
+            if let Some(parent) = Path::new(path).parent() {
+                read_write_dirs.insert(parent.to_path_buf());
+            }
         }
     }
 
@@ -798,9 +814,58 @@ fn build_sandbox_plan(root: &Path, builder: &Builder) -> Result<SandboxPlan> {
     })
 }
 
+fn platform_agent_read_write_paths(home: &Path) -> Vec<PathBuf> {
+    let mut paths = generic_agent_read_write_paths(home);
+    paths.extend(macos_agent_read_write_paths(home));
+    paths.extend(linux_agent_read_write_paths(home));
+    paths
+}
+
+fn platform_agent_read_only_paths(home: &Path) -> Vec<PathBuf> {
+    let mut paths = generic_agent_read_only_paths(home);
+    paths.extend(macos_agent_read_only_paths(home));
+    paths.extend(linux_agent_read_only_paths(home));
+    paths
+}
+
+fn generic_agent_read_write_paths(home: &Path) -> Vec<PathBuf> {
+    vec![
+        home.join(".config"),
+        home.join(".cache"),
+        home.join(".local/share"),
+        home.join(".config/claude"),
+        home.join(".config/claude-code"),
+        home.join(".config/Anthropic"),
+        home.join(".config/codex"),
+        home.join(".cache/claude"),
+        home.join(".cache/claude-code"),
+        home.join(".cache/Anthropic"),
+        home.join(".cache/codex"),
+        home.join(".local/share/claude"),
+        home.join(".local/share/claude-code"),
+        home.join(".local/share/Anthropic"),
+        home.join(".local/share/codex"),
+        home.join(".npm"),
+        home.join(".pnpm-store"),
+        home.join(".bun"),
+        home.join(".local/share/pnpm"),
+        home.join(".local/share/npm"),
+    ]
+}
+
+fn generic_agent_read_only_paths(_home: &Path) -> Vec<PathBuf> {
+    Vec::new()
+}
+
 fn macos_agent_read_write_paths(home: &Path) -> Vec<PathBuf> {
     vec![
         home.join("Library/Keychains"),
+        home.join("Library/Application Support/Anthropic"),
+        home.join("Library/Application Support/Claude"),
+        home.join("Library/Application Support/claude-code"),
+        home.join("Library/Caches/com.anthropic.claude-code"),
+        home.join("Library/Caches/claude-code"),
+        home.join("Library/Logs/Claude"),
         PathBuf::from("/var/run"),
         PathBuf::from("/private/var/run"),
     ]
@@ -818,11 +883,19 @@ fn macos_agent_read_only_paths(home: &Path) -> Vec<PathBuf> {
     ]
 }
 
+fn linux_agent_read_write_paths(_home: &Path) -> Vec<PathBuf> {
+    Vec::new()
+}
+
+fn linux_agent_read_only_paths(_home: &Path) -> Vec<PathBuf> {
+    Vec::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         Analysis, SUPPORT_PACKAGES, SandboxPlan, fallback_javascript_test_commands,
-        macos_agent_read_only_paths, macos_agent_read_write_paths, script_is_placeholder,
+        platform_agent_read_only_paths, platform_agent_read_write_paths, script_is_placeholder,
     };
     use std::{collections::BTreeSet, path::PathBuf};
 
@@ -881,11 +954,13 @@ mod tests {
     }
 
     #[test]
-    fn adds_macos_agent_support_paths() {
+    fn adds_agent_support_paths() {
         let home = PathBuf::from("/Users/tester");
-        let read_write = macos_agent_read_write_paths(&home);
-        let read_only = macos_agent_read_only_paths(&home);
+        let read_write = platform_agent_read_write_paths(&home);
+        let read_only = platform_agent_read_only_paths(&home);
         assert!(read_write.contains(&home.join("Library/Keychains")));
+        assert!(read_write.contains(&home.join(".config")));
+        assert!(read_write.contains(&home.join(".npm")));
         assert!(read_write.contains(&PathBuf::from("/var/run")));
         assert!(read_only.contains(&home.join("Library/Preferences")));
         assert!(read_only.contains(&home.join("Library/Keychains/login.keychain-db")));
