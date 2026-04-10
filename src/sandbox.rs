@@ -29,12 +29,12 @@ pub fn run_sandbox_exec(
         serde_json::from_str(&fs::read_to_string(&plan_file).context("failed to read plan file")?)
             .context("failed to parse plan file")?;
 
+    let shell = choose_shell(&env_map, &command);
     let capabilities = build_capabilities(&plan)?;
     apply_sandbox(&capabilities)?;
 
     std::env::set_current_dir(&root)
         .with_context(|| format!("failed to enter {}", root.display()))?;
-    let shell = choose_shell(&env_map, &command);
     let error = Command::new(&shell.shell)
         .env_clear()
         .envs(&env_map)
@@ -44,11 +44,7 @@ pub fn run_sandbox_exec(
 }
 
 fn choose_shell(env_map: &BTreeMap<String, String>, command: &Option<String>) -> ShellSpec {
-    let shell_path = env_map
-        .get("SHELL")
-        .cloned()
-        .or_else(|| std::env::var("SHELL").ok())
-        .unwrap_or_else(|| "/bin/bash".to_string());
+    let shell_path = preferred_shell_path(env_map);
     let file_name = Path::new(&shell_path)
         .file_name()
         .and_then(|name| name.to_str())
@@ -83,6 +79,20 @@ fn choose_shell(env_map: &BTreeMap<String, String>, command: &Option<String>) ->
     }
 }
 
+fn preferred_shell_path(env_map: &BTreeMap<String, String>) -> String {
+    for candidate in ["/bin/bash", "/bin/zsh"] {
+        if Path::new(candidate).is_file() {
+            return candidate.to_string();
+        }
+    }
+
+    env_map
+        .get("SHELL")
+        .cloned()
+        .or_else(|| std::env::var("SHELL").ok())
+        .unwrap_or_else(|| "/bin/bash".to_string())
+}
+
 fn build_capabilities(plan: &SandboxPlan) -> Result<CapabilitySet> {
     let mut caps = CapabilitySet::new();
     for path in &plan.read_write_dirs {
@@ -111,5 +121,29 @@ fn apply_sandbox(caps: &CapabilitySet) -> Result<()> {
     {
         Sandbox::apply(caps)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{choose_shell, preferred_shell_path};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn prefers_known_system_shell_over_env_shell() {
+        let mut env_map = BTreeMap::new();
+        env_map.insert("SHELL".to_string(), "/opt/homebrew/bin/fish".to_string());
+
+        let shell = preferred_shell_path(&env_map);
+        assert!(shell == "/bin/bash" || shell == "/bin/zsh");
+    }
+
+    #[test]
+    fn command_mode_uses_non_interactive_bash_flags() {
+        let shell = choose_shell(&BTreeMap::new(), &Some("codex".to_string()));
+        assert_eq!(shell.args[0], "--noprofile");
+        assert_eq!(shell.args[1], "--norc");
+        assert_eq!(shell.args[2], "-c");
+        assert_eq!(shell.args[3], "codex");
     }
 }
