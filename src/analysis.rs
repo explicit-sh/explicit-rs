@@ -726,6 +726,13 @@ fn build_sandbox_plan(root: &Path, builder: &Builder) -> Result<SandboxPlan> {
             read_only_dirs.insert(path);
         }
     }
+    for path in referenced_instruction_paths(root)? {
+        if path.is_file() {
+            read_only_files.insert(path);
+        } else {
+            read_only_dirs.insert(path);
+        }
+    }
 
     for language in &builder.languages {
         for path in language.default_cache_dirs(&home) {
@@ -814,6 +821,37 @@ fn build_sandbox_plan(root: &Path, builder: &Builder) -> Result<SandboxPlan> {
     })
 }
 
+fn referenced_instruction_paths(root: &Path) -> Result<Vec<PathBuf>> {
+    let agents_path = root.join("AGENTS.md");
+    if !agents_path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let content = fs::read_to_string(&agents_path)
+        .with_context(|| format!("failed to read {}", agents_path.display()))?;
+    let pattern = Regex::new(r#"(?m)^\s*(?:[-*]\s*)?@(?P<path>\S+)\s*$"#)?;
+    let base_dir = agents_path.parent().unwrap_or(root);
+    let mut paths = BTreeSet::new();
+
+    for captures in pattern.captures_iter(&content) {
+        let Some(path_match) = captures.name("path") else {
+            continue;
+        };
+        let raw = path_match
+            .as_str()
+            .trim_matches(|ch| ch == '"' || ch == '\'');
+        let path = PathBuf::from(raw);
+        let resolved = if path.is_absolute() {
+            path
+        } else {
+            base_dir.join(path)
+        };
+        paths.insert(resolved);
+    }
+
+    Ok(paths.into_iter().collect())
+}
+
 fn platform_agent_read_write_paths(home: &Path) -> Vec<PathBuf> {
     let mut paths = generic_agent_read_write_paths(home);
     paths.extend(macos_agent_read_write_paths(home));
@@ -894,10 +932,12 @@ fn linux_agent_read_only_paths(_home: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Analysis, SUPPORT_PACKAGES, SandboxPlan, fallback_javascript_test_commands,
-        platform_agent_read_only_paths, platform_agent_read_write_paths, script_is_placeholder,
+        Analysis, Builder, SUPPORT_PACKAGES, SandboxPlan, build_sandbox_plan,
+        fallback_javascript_test_commands, platform_agent_read_only_paths,
+        platform_agent_read_write_paths, referenced_instruction_paths, script_is_placeholder,
     };
-    use std::{collections::BTreeSet, path::PathBuf};
+    use std::{collections::BTreeSet, fs, path::PathBuf};
+    use tempfile::tempdir;
 
     #[test]
     fn doctor_packages_hide_support_packages() {
@@ -966,5 +1006,35 @@ mod tests {
         assert!(read_only.contains(&home.join("Library/Keychains/login.keychain-db")));
         assert!(read_only.contains(&home.join("Library/Keychains/metadata.keychain-db")));
         assert!(read_only.contains(&PathBuf::from("/Library/Keychains")));
+    }
+
+    #[test]
+    fn resolves_referenced_instruction_paths_from_agents_file() {
+        let dir = tempdir().unwrap();
+        let nested = dir.path().join("docs/guide.md");
+        fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        fs::write(&nested, "hello").unwrap();
+        let absolute = dir.path().join("ABS.md");
+        fs::write(&absolute, "world").unwrap();
+        fs::write(
+            dir.path().join("AGENTS.md"),
+            format!("@docs/guide.md\n@{}\n", absolute.display()),
+        )
+        .unwrap();
+
+        let paths = referenced_instruction_paths(dir.path()).unwrap();
+        assert_eq!(paths, vec![absolute, nested]);
+    }
+
+    #[test]
+    fn sandbox_plan_includes_referenced_instruction_files() {
+        let dir = tempdir().unwrap();
+        let reference = dir.path().join("instructions/extra.md");
+        fs::create_dir_all(reference.parent().unwrap()).unwrap();
+        fs::write(&reference, "read me").unwrap();
+        fs::write(dir.path().join("AGENTS.md"), "@instructions/extra.md\n").unwrap();
+
+        let plan = build_sandbox_plan(dir.path(), &Builder::default()).unwrap();
+        assert!(plan.read_only_files.contains(&reference));
     }
 }
