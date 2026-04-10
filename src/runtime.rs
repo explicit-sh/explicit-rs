@@ -298,7 +298,7 @@ fn capture_devenv_env(
         }
     }
     merge_host_agent_paths(&mut env_map)?;
-    inject_tls_certificate_env(&mut env_map);
+    harmonize_tls_certificate_env(&mut env_map);
     env_map.insert(
         "HISTFILE".to_string(),
         root.join(".nono/bash_history").display().to_string(),
@@ -387,16 +387,47 @@ fn merge_host_agent_paths(env_map: &mut BTreeMap<String, String>) -> Result<()> 
     Ok(())
 }
 
-fn inject_tls_certificate_env(env_map: &mut BTreeMap<String, String>) {
-    let cert_path = Path::new("/etc/ssl/cert.pem");
-    if !cert_path.exists() {
-        return;
-    }
+fn harmonize_tls_certificate_env(env_map: &mut BTreeMap<String, String>) {
+    let cert_path = env_map
+        .get("SSL_CERT_FILE")
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .or_else(|| {
+            env_map
+                .get("NIX_SSL_CERT_FILE")
+                .filter(|value| !value.is_empty())
+                .cloned()
+        })
+        .or_else(|| {
+            let fallback = Path::new("/etc/ssl/certs/ca-certificates.crt");
+            fallback.exists().then(|| fallback.display().to_string())
+        });
 
-    let cert_path = cert_path.display().to_string();
-    env_map.insert("SSL_CERT_FILE".to_string(), cert_path.clone());
-    env_map.insert("CURL_CA_BUNDLE".to_string(), cert_path.clone());
-    env_map.insert("NIX_SSL_CERT_FILE".to_string(), cert_path);
+    let Some(cert_path) = cert_path else {
+        return;
+    };
+
+    if env_map
+        .get("SSL_CERT_FILE")
+        .map(|value| value.is_empty())
+        .unwrap_or(true)
+    {
+        env_map.insert("SSL_CERT_FILE".to_string(), cert_path.clone());
+    }
+    if env_map
+        .get("CURL_CA_BUNDLE")
+        .map(|value| value.is_empty())
+        .unwrap_or(true)
+    {
+        env_map.insert("CURL_CA_BUNDLE".to_string(), cert_path.clone());
+    }
+    if env_map
+        .get("NIX_SSL_CERT_FILE")
+        .map(|value| value.is_empty())
+        .unwrap_or(true)
+    {
+        env_map.insert("NIX_SSL_CERT_FILE".to_string(), cert_path);
+    }
 }
 fn active_process_summary(root_pid: u32) -> Option<String> {
     let output = Command::new("ps")
@@ -698,9 +729,11 @@ fn _write_sandbox_plan(path: &Path, plan: &SandboxPlan) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_devenv_stderr_line, humanize_process_command, parse_process_snapshot,
+        classify_devenv_stderr_line, harmonize_tls_certificate_env, humanize_process_command,
+        parse_process_snapshot,
         summarize_process_tree,
     };
+    use std::collections::BTreeMap;
 
     #[test]
     fn summarize_process_tree_prefers_interesting_leaf_processes() {
@@ -753,5 +786,49 @@ not-a-row
         )
         .expect("expected detail");
         assert_eq!(detail, "Downloading emulator-darwin_aarch64-14518053.zip");
+    }
+
+    #[test]
+    fn harmonize_tls_certificate_env_uses_nix_bundle_when_available() {
+        let mut env_map = BTreeMap::from([(
+            "NIX_SSL_CERT_FILE".to_string(),
+            "/etc/ssl/certs/ca-certificates.crt".to_string(),
+        )]);
+        harmonize_tls_certificate_env(&mut env_map);
+        assert_eq!(
+            env_map.get("SSL_CERT_FILE").map(String::as_str),
+            Some("/etc/ssl/certs/ca-certificates.crt")
+        );
+        assert_eq!(
+            env_map.get("CURL_CA_BUNDLE").map(String::as_str),
+            Some("/etc/ssl/certs/ca-certificates.crt")
+        );
+    }
+
+    #[test]
+    fn harmonize_tls_certificate_env_preserves_existing_ssl_cert_file() {
+        let mut env_map = BTreeMap::from([
+            (
+                "SSL_CERT_FILE".to_string(),
+                "/custom/ca-bundle.crt".to_string(),
+            ),
+            (
+                "NIX_SSL_CERT_FILE".to_string(),
+                "/etc/ssl/certs/ca-certificates.crt".to_string(),
+            ),
+        ]);
+        harmonize_tls_certificate_env(&mut env_map);
+        assert_eq!(
+            env_map.get("SSL_CERT_FILE").map(String::as_str),
+            Some("/custom/ca-bundle.crt")
+        );
+        assert_eq!(
+            env_map.get("CURL_CA_BUNDLE").map(String::as_str),
+            Some("/custom/ca-bundle.crt")
+        );
+        assert_eq!(
+            env_map.get("NIX_SSL_CERT_FILE").map(String::as_str),
+            Some("/etc/ssl/certs/ca-certificates.crt")
+        );
     }
 }

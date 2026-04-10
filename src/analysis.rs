@@ -88,7 +88,11 @@ impl ServiceRequirement {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxPlan {
     pub root: PathBuf,
+    #[serde(default)]
+    pub read_write_files: Vec<PathBuf>,
     pub read_write_dirs: Vec<PathBuf>,
+    #[serde(default)]
+    pub read_only_files: Vec<PathBuf>,
     pub read_only_dirs: Vec<PathBuf>,
     pub notes: Vec<String>,
 }
@@ -696,7 +700,9 @@ fn script_is_placeholder(script: &str) -> bool {
 
 fn build_sandbox_plan(root: &Path, builder: &Builder) -> Result<SandboxPlan> {
     let home = dirs::home_dir().context("failed to resolve home directory")?;
+    let mut read_write_files = BTreeSet::new();
     let mut read_write_dirs = BTreeSet::new();
+    let mut read_only_files = BTreeSet::new();
     let mut read_only_dirs = BTreeSet::new();
 
     read_write_dirs.insert(root.to_path_buf());
@@ -707,10 +713,18 @@ fn build_sandbox_plan(root: &Path, builder: &Builder) -> Result<SandboxPlan> {
     read_write_dirs.insert(home.join(".codex"));
     read_write_dirs.insert(home.join(".claude"));
     for path in macos_agent_read_write_paths(&home) {
-        read_write_dirs.insert(path);
+        if path.is_file() {
+            read_write_files.insert(path);
+        } else {
+            read_write_dirs.insert(path);
+        }
     }
     for path in macos_agent_read_only_paths(&home) {
-        read_only_dirs.insert(path);
+        if path.is_file() {
+            read_only_files.insert(path);
+        } else {
+            read_only_dirs.insert(path);
+        }
     }
 
     for language in &builder.languages {
@@ -757,7 +771,15 @@ fn build_sandbox_plan(root: &Path, builder: &Builder) -> Result<SandboxPlan> {
         }
     }
 
+    let read_write_files = read_write_files
+        .into_iter()
+        .filter(|path| path.exists())
+        .collect::<Vec<_>>();
     let read_write_dirs = read_write_dirs
+        .into_iter()
+        .filter(|path| path.exists())
+        .collect::<Vec<_>>();
+    let read_only_files = read_only_files
         .into_iter()
         .filter(|path| path.exists())
         .collect::<Vec<_>>();
@@ -768,7 +790,9 @@ fn build_sandbox_plan(root: &Path, builder: &Builder) -> Result<SandboxPlan> {
 
     Ok(SandboxPlan {
         root: root.to_path_buf(),
+        read_write_files,
         read_write_dirs,
+        read_only_files,
         read_only_dirs,
         notes: builder.notes.clone(),
     })
@@ -784,7 +808,11 @@ fn macos_agent_read_write_paths(home: &Path) -> Vec<PathBuf> {
 
 fn macos_agent_read_only_paths(home: &Path) -> Vec<PathBuf> {
     vec![
+        home.join("Library/Keychains/login.keychain-db"),
+        home.join("Library/Keychains/metadata.keychain-db"),
         home.join("Library/Preferences"),
+        PathBuf::from("/Library/Keychains/login.keychain-db"),
+        PathBuf::from("/Library/Keychains/metadata.keychain-db"),
         PathBuf::from("/Library/Keychains"),
         PathBuf::from("/System/Library/Keychains"),
     ]
@@ -823,7 +851,9 @@ mod tests {
             notes: Vec::new(),
             sandbox_plan: SandboxPlan {
                 root: PathBuf::from("/tmp/project"),
+                read_write_files: Vec::new(),
                 read_write_dirs: Vec::new(),
+                read_only_files: Vec::new(),
                 read_only_dirs: Vec::new(),
                 notes: Vec::new(),
             },
@@ -858,6 +888,8 @@ mod tests {
         assert!(read_write.contains(&home.join("Library/Keychains")));
         assert!(read_write.contains(&PathBuf::from("/var/run")));
         assert!(read_only.contains(&home.join("Library/Preferences")));
+        assert!(read_only.contains(&home.join("Library/Keychains/login.keychain-db")));
+        assert!(read_only.contains(&home.join("Library/Keychains/metadata.keychain-db")));
         assert!(read_only.contains(&PathBuf::from("/Library/Keychains")));
     }
 }

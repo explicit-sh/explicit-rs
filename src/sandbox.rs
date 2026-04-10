@@ -95,9 +95,19 @@ fn preferred_shell_path(env_map: &BTreeMap<String, String>) -> String {
 
 fn build_capabilities(plan: &SandboxPlan) -> Result<CapabilitySet> {
     let mut caps = CapabilitySet::new();
+    for path in &plan.read_write_files {
+        if path.exists() {
+            caps = caps.allow_file(path, AccessMode::ReadWrite)?;
+        }
+    }
     for path in &plan.read_write_dirs {
         if path.exists() {
             caps = caps.allow_path(path, AccessMode::ReadWrite)?;
+        }
+    }
+    for path in &plan.read_only_files {
+        if path.exists() {
+            caps = caps.allow_file(path, AccessMode::Read)?;
         }
     }
     for path in &plan.read_only_dirs {
