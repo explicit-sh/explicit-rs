@@ -1,13 +1,19 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::thread::JoinHandle;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::analysis::Analysis;
@@ -41,6 +47,25 @@ pub fn list_runs(root: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+pub fn attach_live_run(root: &Path) -> Result<bool> {
+    let socket_path = socket_path(root);
+    if !socket_path.exists() {
+        return Ok(false);
+    }
+
+    loop {
+        let snapshot = match fetch_live_snapshot(&socket_path) {
+            Ok(snapshot) => snapshot,
+            Err(_) => return Ok(false),
+        };
+        render_live_snapshot(&snapshot);
+        if snapshot.is_terminal() {
+            return Ok(true);
+        }
+        thread::sleep(Duration::from_millis(750));
+    }
 }
 
 pub fn print_report(root: &Path, run: Option<&str>, latest: bool) -> Result<()> {
@@ -150,6 +175,24 @@ pub fn print_report(root: &Path, run: Option<&str>, latest: bool) -> Result<()> 
     Ok(())
 }
 
+pub fn launch_live_agent(
+    root: &Path,
+    analysis: &Analysis,
+    agent: &str,
+    command: String,
+    block_network: bool,
+    no_services: bool,
+) -> Result<ExitCode> {
+    let server = LiveRunServer::start(
+        root,
+        LiveRunSnapshot::new(root, agent, &command, false, None, None),
+    )?;
+    server.update(|snapshot| snapshot.state = "running".to_string());
+    let status = runtime::launch_shell(root, analysis, Some(command), block_network, no_services)?;
+    server.finish(status);
+    Ok(status)
+}
+
 pub fn launch_observed_agent(
     root: &Path,
     analysis: &Analysis,
@@ -160,13 +203,26 @@ pub fn launch_observed_agent(
     no_services: bool,
 ) -> Result<ExitCode> {
     let run = ObservationRun::create(root, analysis, agent, &command, agent_args)?;
+    let server = LiveRunServer::start(
+        root,
+        LiveRunSnapshot::new(
+            root,
+            agent,
+            &command,
+            true,
+            Some(run.run_id.clone()),
+            Some(run.db_path.clone()),
+        ),
+    )?;
     let session_snapshot = if agent == "codex" {
         snapshot_session_files(&codex_sessions_root()?)?
     } else {
         BTreeMap::new()
     };
 
+    server.update(|snapshot| snapshot.state = "running".to_string());
     let status = runtime::launch_shell(root, analysis, Some(command), block_network, no_services)?;
+    server.update(|snapshot| snapshot.state = "ingesting".to_string());
 
     let summary = if agent == "codex" {
         let changed_files = changed_session_files(&codex_sessions_root()?, &session_snapshot)?;
@@ -175,6 +231,8 @@ pub fn launch_observed_agent(
         ImportSummary::default()
     };
 
+    server.update(|snapshot| apply_summary_to_snapshot(snapshot, &summary));
+    server.finish(status);
     run.finish(&status, &summary)?;
     print_summary(&run, &summary);
     Ok(status)
@@ -185,6 +243,33 @@ struct ObservationRun {
     run_id: String,
     root: PathBuf,
     db_path: PathBuf,
+}
+
+struct LiveRunServer {
+    socket_path: PathBuf,
+    snapshot: Arc<Mutex<LiveRunSnapshot>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LiveRunSnapshot {
+    root: String,
+    agent: String,
+    command: String,
+    observed: bool,
+    run_id: Option<String>,
+    db_path: Option<String>,
+    state: String,
+    started_at_ms: i64,
+    updated_at_ms: i64,
+    message_count: usize,
+    token_count_events: usize,
+    exec_command_count: usize,
+    web_search_count: usize,
+    patch_event_count: usize,
+    file_touch_count: usize,
+    latest_total_tokens: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -241,6 +326,95 @@ struct ImportSummary {
 struct SessionFileState {
     modified_ms: u128,
     len: u64,
+}
+
+impl LiveRunSnapshot {
+    fn new(
+        root: &Path,
+        agent: &str,
+        command: &str,
+        observed: bool,
+        run_id: Option<String>,
+        db_path: Option<PathBuf>,
+    ) -> Self {
+        let now = unix_millis() as i64;
+        Self {
+            root: root.display().to_string(),
+            agent: agent.to_string(),
+            command: command.to_string(),
+            observed,
+            run_id,
+            db_path: db_path.map(|value| value.display().to_string()),
+            state: "starting".to_string(),
+            started_at_ms: now,
+            updated_at_ms: now,
+            message_count: 0,
+            token_count_events: 0,
+            exec_command_count: 0,
+            web_search_count: 0,
+            patch_event_count: 0,
+            file_touch_count: 0,
+            latest_total_tokens: None,
+        }
+    }
+
+    fn is_terminal(&self) -> bool {
+        matches!(self.state.as_str(), "completed" | "failed")
+    }
+}
+
+impl LiveRunServer {
+    fn start(root: &Path, snapshot: LiveRunSnapshot) -> Result<Self> {
+        let socket_path = socket_path(root);
+        prepare_socket_path(&socket_path)?;
+        let listener = UnixListener::bind(&socket_path)
+            .with_context(|| format!("failed to bind {}", socket_path.display()))?;
+        listener
+            .set_nonblocking(true)
+            .with_context(|| format!("failed to mark {} nonblocking", socket_path.display()))?;
+
+        let snapshot = Arc::new(Mutex::new(snapshot));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_snapshot = Arc::clone(&snapshot);
+        let thread_stop = Arc::clone(&stop);
+        let thread =
+            thread::spawn(move || run_socket_server(listener, thread_snapshot, thread_stop));
+
+        Ok(Self {
+            socket_path,
+            snapshot,
+            stop,
+            thread: Some(thread),
+        })
+    }
+
+    fn update(&self, mutator: impl FnOnce(&mut LiveRunSnapshot)) {
+        if let Ok(mut snapshot) = self.snapshot.lock() {
+            mutator(&mut snapshot);
+            snapshot.updated_at_ms = unix_millis() as i64;
+        }
+    }
+
+    fn finish(&self, status: ExitCode) {
+        self.update(|snapshot| {
+            snapshot.state = if status == ExitCode::SUCCESS {
+                "completed".to_string()
+            } else {
+                "failed".to_string()
+            };
+        });
+    }
+}
+
+impl Drop for LiveRunServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = UnixStream::connect(&self.socket_path);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        let _ = fs::remove_file(&self.socket_path);
+    }
 }
 
 impl ObservationRun {
@@ -360,6 +534,108 @@ fn configure_db(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "foreign_keys", "ON")
         .context("failed to enable foreign keys")?;
     Ok(())
+}
+
+fn socket_path(root: &Path) -> PathBuf {
+    root.join(".explicit-observe.sock")
+}
+
+fn prepare_socket_path(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    match fetch_live_snapshot(path) {
+        Ok(_) => bail!(
+            "an explicit live run socket is already active at {}",
+            path.display()
+        ),
+        Err(_) => {
+            fs::remove_file(path)
+                .with_context(|| format!("failed to remove stale socket {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn run_socket_server(
+    listener: UnixListener,
+    snapshot: Arc<Mutex<LiveRunSnapshot>>,
+    stop: Arc<AtomicBool>,
+) {
+    while !stop.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                let payload = snapshot
+                    .lock()
+                    .ok()
+                    .and_then(|snapshot| serde_json::to_vec(&*snapshot).ok());
+                if let Some(payload) = payload {
+                    let _ = stream.write_all(&payload);
+                    let _ = stream.write_all(b"\n");
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+fn fetch_live_snapshot(socket_path: &Path) -> Result<LiveRunSnapshot> {
+    let stream = UnixStream::connect(socket_path)
+        .with_context(|| format!("failed to connect to {}", socket_path.display()))?;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .with_context(|| format!("failed to read from {}", socket_path.display()))?;
+    let snapshot: LiveRunSnapshot =
+        serde_json::from_str(line.trim()).context("failed to parse live run snapshot")?;
+    Ok(snapshot)
+}
+
+fn render_live_snapshot(snapshot: &LiveRunSnapshot) {
+    print!("\x1b[2J\x1b[H");
+    println!("Project: {}", snapshot.root);
+    println!("Agent: {}", snapshot.agent);
+    println!("Command: {}", truncate_preview(&snapshot.command));
+    println!(
+        "Observed: {}",
+        if snapshot.observed { "true" } else { "false" }
+    );
+    println!("State: {}", snapshot.state);
+    if let Some(run_id) = &snapshot.run_id {
+        println!("Run: {run_id}");
+    }
+    if let Some(db_path) = &snapshot.db_path {
+        println!("Database: {db_path}");
+    }
+    println!("Messages: {}", snapshot.message_count);
+    println!("Token events: {}", snapshot.token_count_events);
+    println!("Shell commands: {}", snapshot.exec_command_count);
+    println!("Web searches: {}", snapshot.web_search_count);
+    println!("Patch events: {}", snapshot.patch_event_count);
+    println!("Derived file touches: {}", snapshot.file_touch_count);
+    println!(
+        "Latest total tokens: {}",
+        snapshot
+            .latest_total_tokens
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    );
+    let _ = std::io::stdout().flush();
+}
+
+fn apply_summary_to_snapshot(snapshot: &mut LiveRunSnapshot, summary: &ImportSummary) {
+    snapshot.message_count = summary.message_count;
+    snapshot.token_count_events = summary.token_count_events;
+    snapshot.exec_command_count = summary.exec_command_count;
+    snapshot.web_search_count = summary.web_search_count;
+    snapshot.patch_event_count = summary.patch_event_count;
+    snapshot.file_touch_count = summary.file_touch_count;
+    snapshot.latest_total_tokens = summary.latest_total_tokens;
 }
 
 fn observability_root(root: &Path) -> PathBuf {
@@ -1264,12 +1540,14 @@ fn duration_to_millis(value: &Value) -> Option<u128> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ImportSummary, changed_session_files, collect_file_touches_from_parsed_cmd, configure_db,
-        ingest_codex_session_file, init_schema, snapshot_session_files, unique_run_id,
+        ImportSummary, LiveRunServer, LiveRunSnapshot, apply_summary_to_snapshot,
+        changed_session_files, collect_file_touches_from_parsed_cmd, configure_db,
+        fetch_live_snapshot, ingest_codex_session_file, init_schema, prepare_socket_path,
+        snapshot_session_files, socket_path, unique_run_id,
     };
     use rusqlite::Connection;
     use serde_json::json;
-    use std::fs;
+    use std::{fs, path::Path, process::ExitCode};
     use tempfile::tempdir;
 
     #[test]
@@ -1387,5 +1665,72 @@ mod tests {
         let first = unique_run_id("codex");
         let second = unique_run_id("codex");
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn applies_summary_to_live_snapshot() {
+        let mut snapshot = LiveRunSnapshot::new(
+            Path::new("/tmp/project"),
+            "codex",
+            "codex exec hello",
+            true,
+            Some("run-1".to_string()),
+            None,
+        );
+        let summary = ImportSummary {
+            session_count: 1,
+            message_count: 2,
+            token_count_events: 3,
+            exec_command_count: 4,
+            web_search_count: 5,
+            patch_event_count: 6,
+            file_touch_count: 7,
+            latest_total_tokens: Some(42),
+        };
+        apply_summary_to_snapshot(&mut snapshot, &summary);
+        assert_eq!(snapshot.message_count, 2);
+        assert_eq!(snapshot.token_count_events, 3);
+        assert_eq!(snapshot.exec_command_count, 4);
+        assert_eq!(snapshot.web_search_count, 5);
+        assert_eq!(snapshot.patch_event_count, 6);
+        assert_eq!(snapshot.file_touch_count, 7);
+        assert_eq!(snapshot.latest_total_tokens, Some(42));
+    }
+
+    #[test]
+    fn live_run_server_serves_snapshots_and_removes_socket_on_drop() {
+        let dir = tempdir().unwrap();
+        let socket = socket_path(dir.path());
+        let server = LiveRunServer::start(
+            dir.path(),
+            LiveRunSnapshot::new(dir.path(), "codex", "codex exec hello", false, None, None),
+        )
+        .unwrap();
+
+        let snapshot = fetch_live_snapshot(&socket).unwrap();
+        assert_eq!(snapshot.state, "starting");
+        assert_eq!(snapshot.agent, "codex");
+
+        server.update(|snapshot| snapshot.state = "running".to_string());
+        let snapshot = fetch_live_snapshot(&socket).unwrap();
+        assert_eq!(snapshot.state, "running");
+
+        server.finish(ExitCode::SUCCESS);
+        let snapshot = fetch_live_snapshot(&socket).unwrap();
+        assert_eq!(snapshot.state, "completed");
+
+        drop(server);
+        assert!(!socket.exists());
+    }
+
+    #[test]
+    fn prepare_socket_path_removes_stale_entries() {
+        let dir = tempdir().unwrap();
+        let socket = socket_path(dir.path());
+        fs::write(&socket, "stale").unwrap();
+
+        prepare_socket_path(&socket).unwrap();
+
+        assert!(!socket.exists());
     }
 }

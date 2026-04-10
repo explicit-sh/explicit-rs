@@ -43,6 +43,7 @@ explicit scan
 explicit apply
 explicit doctor
 explicit shell
+explicit observe
 explicit observe codex
 explicit observe list
 explicit observe report --latest
@@ -56,6 +57,7 @@ What each command does:
 - `apply`: updates `devenv.nix` wiring, rewrites `devenv.generated.nix`, and refreshes `.nono/` metadata and hooks
 - `doctor`: prints a readable summary of what was detected
 - `shell`: realizes the `devenv` environment and launches a sandboxed shell for agents or manual use
+- `observe`: attaches to a live agent run in the current project, or falls back to the latest saved report when no live socket exists
 - `observe codex`: launches Codex, then ingests the new Codex session JSONL into a run-scoped SQLite database
 - `observe list`: lists observed runs under the current project
 - `observe report`: prints a readable report for an observed run
@@ -71,6 +73,7 @@ cargo run -- scan
 cargo run -- apply
 cargo run -- doctor
 cargo run -- shell
+cargo run -- observe
 cargo run -- observe codex
 cargo run -- observe list
 cargo run -- observe report --latest
@@ -100,6 +103,7 @@ devenv shell
 explicit apply
 explicit doctor
 explicit shell --command codex
+explicit observe
 explicit observe codex
 explicit codex
 explicit claude
@@ -119,6 +123,7 @@ Examples:
 ```bash
 explicit shell --command codex
 explicit shell --command claude
+explicit observe
 explicit observe codex exec --skip-git-repo-check "say hello in one word"
 explicit observe list
 explicit observe report --latest
@@ -135,6 +140,18 @@ cargo run -- shell --command 'pwd; command -v cargo; cargo --version'
 ## Observability
 
 `explicit observe codex` adds a run-scoped SQLite event store on top of the existing sandbox.
+
+Plain `explicit codex` and `explicit claude` also publish a live run snapshot over a Unix socket in the project root:
+
+- `.explicit-observe.sock`
+
+That lets another CLI in the same folder attach with:
+
+```bash
+explicit observe
+```
+
+If a live socket exists, `explicit observe` renders the current run state from that socket. If there is no live run, it falls back to the latest saved observability report.
 
 It currently captures:
 
@@ -196,6 +213,7 @@ If no concrete lint or build command is detected, the hook remains advisory and 
 Files managed by the tool:
 
 - [devenv.generated.nix](/Users/onnimonni/Projects/devenv-nono-llm/devenv.generated.nix): generated language, package, and service settings
+- `.explicit-observe.sock`: live per-project run socket while an agent is active
 - `.nono/analysis.json`: raw scan result
 - `.nono/sandbox-plan.json`: resolved sandbox permissions
 - `.nono/guard-commands.json`: lint and build commands used by the stop hook

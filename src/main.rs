@@ -35,9 +35,7 @@ enum Command {
     Doctor(CommonArgs),
     #[command(about = "Launch a devenv-powered sandbox shell for agents or manual use.")]
     Shell(ShellArgs),
-    #[command(
-        about = "Launch an observed agent run and ingest Codex session telemetry into SQLite."
-    )]
+    #[command(about = "Attach to a live project run or inspect observed Codex telemetry.")]
     Observe(ObserveArgs),
     #[command(
         about = "Launch Codex inside the devenv + nono sandbox.",
@@ -81,8 +79,10 @@ struct AgentArgs {
 
 #[derive(Args, Debug, Clone)]
 struct ObserveArgs {
+    #[arg(long, default_value = ".")]
+    root: PathBuf,
     #[command(subcommand)]
-    command: ObserveCommand,
+    command: Option<ObserveCommand>,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -191,15 +191,23 @@ fn run() -> Result<ExitCode> {
             Ok(status)
         }
         Command::Observe(args) => match args.command {
-            ObserveCommand::Codex(args) => launch_observed_agent("codex", args),
-            ObserveCommand::List(args) => {
+            Some(ObserveCommand::Codex(args)) => launch_observed_agent("codex", args),
+            Some(ObserveCommand::List(args)) => {
                 let root = args.root.canonicalize().context("failed to resolve root")?;
                 observe::list_runs(&root)?;
                 Ok(ExitCode::SUCCESS)
             }
-            ObserveCommand::Report(args) => {
+            Some(ObserveCommand::Report(args)) => {
                 let root = args.root.canonicalize().context("failed to resolve root")?;
                 observe::print_report(&root, args.run.as_deref(), args.latest)?;
+                Ok(ExitCode::SUCCESS)
+            }
+            None => {
+                let root = args.root.canonicalize().context("failed to resolve root")?;
+                if observe::attach_live_run(&root)? {
+                    return Ok(ExitCode::SUCCESS);
+                }
+                observe::print_report(&root, None, true)?;
                 Ok(ExitCode::SUCCESS)
             }
         },
@@ -230,7 +238,7 @@ fn launch_agent(binary: &str, args: AgentArgs) -> Result<ExitCode> {
             false,
         );
     }
-    runtime::launch_shell(&root, &analysis, Some(command), false, false)
+    observe::launch_live_agent(&root, &analysis, binary, command, false, false)
 }
 
 fn launch_observed_agent(binary: &str, args: ObserveAgentArgs) -> Result<ExitCode> {
@@ -318,5 +326,14 @@ mod tests {
         ]);
         assert!(observe);
         assert_eq!(args, vec!["-m", "gpt-5.4"]);
+    }
+
+    #[test]
+    fn observe_without_subcommand_parses() {
+        let cli = Cli::try_parse_from(["explicit", "observe"]).expect("expected observe to parse");
+        let Command::Observe(args) = cli.command else {
+            panic!("expected observe command");
+        };
+        assert!(args.command.is_none());
     }
 }
