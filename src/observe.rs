@@ -218,7 +218,7 @@ pub fn launch_live_agent(
 ) -> Result<ExitCode> {
     let server = LiveRunServer::start(
         root,
-        LiveRunSnapshot::new(root, agent, &command, false, None, None),
+        LiveRunSnapshot::new(root, agent, &command, false, None, None, None),
     )?;
     server.update(|snapshot| snapshot.state = "running".to_string());
     let status = runtime::launch_shell(
@@ -253,6 +253,7 @@ pub fn launch_observed_agent(
             true,
             Some(run.run_id.clone()),
             Some(run.db_path.clone()),
+            Some(run.transcript_log_path.clone()),
         ),
     )?;
     let session_snapshot = if agent == "codex" {
@@ -325,6 +326,7 @@ struct LiveRunSnapshot {
     observed: bool,
     run_id: Option<String>,
     db_path: Option<String>,
+    transcript_path: Option<String>,
     state: String,
     started_at_ms: i64,
     updated_at_ms: i64,
@@ -415,6 +417,7 @@ impl LiveRunSnapshot {
         observed: bool,
         run_id: Option<String>,
         db_path: Option<PathBuf>,
+        transcript_path: Option<PathBuf>,
     ) -> Self {
         let now = unix_millis() as i64;
         Self {
@@ -424,6 +427,7 @@ impl LiveRunSnapshot {
             observed,
             run_id,
             db_path: db_path.map(|value| value.display().to_string()),
+            transcript_path: transcript_path.map(|value| value.display().to_string()),
             state: "starting".to_string(),
             started_at_ms: now,
             updated_at_ms: now,
@@ -721,6 +725,15 @@ fn render_live_snapshot(snapshot: &LiveRunSnapshot) {
     if let Some(db_path) = &snapshot.db_path {
         println!("Database: {db_path}");
     }
+    if let Some(transcript_path) = &snapshot.transcript_path {
+        println!("Transcript: {transcript_path}");
+        if let Some((byte_count, preview)) =
+            live_transcript_status(Path::new(transcript_path)).unwrap_or(None)
+        {
+            println!("Live console bytes: {byte_count}");
+            println!("Live console preview: {}", truncate_preview(&preview));
+        }
+    }
     println!("Messages: {}", snapshot.message_count);
     println!("Token events: {}", snapshot.token_count_events);
     println!("Shell commands: {}", snapshot.exec_command_count);
@@ -962,6 +975,20 @@ fn sanitize_transcript_preview(content: &str) -> String {
         .rev()
         .collect::<Vec<_>>()
         .join(" | ")
+}
+
+fn live_transcript_status(path: &Path) -> Result<Option<(usize, String)>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let raw = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    if raw.is_empty() {
+        return Ok(None);
+    }
+
+    let preview = sanitize_transcript_preview(&String::from_utf8_lossy(&raw));
+    Ok(Some((raw.len(), preview)))
 }
 
 fn truncate_preview(value: &str) -> String {
@@ -1899,8 +1926,9 @@ mod tests {
         ImportSummary, LiveRunServer, LiveRunSnapshot, apply_summary_to_snapshot,
         changed_session_files, collect_file_touches_from_parsed_cmd, configure_db,
         console_transcript_preview, fetch_live_snapshot, ingest_codex_session_file,
-        ingest_console_transcript_file, ingest_env_trace_file, init_schema, prepare_socket_path,
-        sanitize_transcript_preview, snapshot_session_files, socket_path, unique_run_id,
+        ingest_console_transcript_file, ingest_env_trace_file, init_schema, live_transcript_status,
+        prepare_socket_path, sanitize_transcript_preview, snapshot_session_files, socket_path,
+        unique_run_id,
     };
     use crate::env_trace;
     use rusqlite::Connection;
@@ -2033,6 +2061,7 @@ mod tests {
             "codex exec hello",
             true,
             Some("run-1".to_string()),
+            None,
             None,
         );
         let summary = ImportSummary {
@@ -2185,6 +2214,20 @@ mod tests {
         assert_eq!(preview, "OpenAI Codex | warning");
     }
 
+    #[test]
+    fn live_transcript_status_reports_preview_and_size() {
+        let dir = tempdir().unwrap();
+        let transcript = dir.path().join("console.typescript");
+        fs::write(&transcript, "\u{1b}[2JOpenAI Codex\nhello\n").unwrap();
+        let expected_len = fs::metadata(&transcript).unwrap().len() as usize;
+
+        let status = live_transcript_status(&transcript).unwrap();
+        assert_eq!(
+            status,
+            Some((expected_len, "OpenAI Codex | hello".to_string()))
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn preload_trace_captures_getenv_calls() {
@@ -2244,7 +2287,15 @@ int main(void) {
         let socket = socket_path(dir.path());
         let server = LiveRunServer::start(
             dir.path(),
-            LiveRunSnapshot::new(dir.path(), "codex", "codex exec hello", false, None, None),
+            LiveRunSnapshot::new(
+                dir.path(),
+                "codex",
+                "codex exec hello",
+                false,
+                None,
+                None,
+                None,
+            ),
         )
         .unwrap();
 
