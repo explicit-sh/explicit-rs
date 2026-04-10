@@ -13,6 +13,7 @@ use std::process::ExitCode;
 use analysis::Analysis;
 use anyhow::{Context, Result};
 use clap::{ArgAction, Args, Parser, Subcommand};
+use host_tools::preferred_command_path;
 use serde_json::json;
 
 #[derive(Parser, Debug)]
@@ -257,7 +258,11 @@ fn launch_observed_agent(binary: &str, args: ObserveAgentArgs) -> Result<ExitCod
 }
 
 fn build_agent_command(binary: &str, args: &[String]) -> String {
-    std::iter::once(binary.to_string())
+    let executable = preferred_command_path(binary)
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| binary.to_string());
+
+    std::iter::once(shell_escape(&executable))
         .chain(args.iter().map(|arg| shell_escape(arg)))
         .collect::<Vec<_>>()
         .join(" ")
@@ -298,7 +303,8 @@ mod tests {
             "codex",
             &[String::from("--prompt"), String::from("hello world")],
         );
-        assert_eq!(command, "codex --prompt 'hello world'");
+        assert!(command.ends_with(" --prompt 'hello world'"));
+        assert!(command.split_whitespace().next().unwrap().contains("codex"));
     }
 
     #[test]
