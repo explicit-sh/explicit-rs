@@ -18,14 +18,9 @@ pub fn trace_log_env_key() -> &'static str {
 }
 
 pub fn build_injection_env(log_path: &Path) -> Result<BTreeMap<String, String>> {
-    #[cfg(not(target_os = "linux"))]
-    let _ = log_path;
-
-    let env = BTreeMap::new();
-
     #[cfg(target_os = "linux")]
     {
-        let mut env = env;
+        let mut env = BTreeMap::new();
         let library = trace_library_path()?;
         env.insert(
             trace_log_env_key().to_string(),
@@ -35,9 +30,14 @@ pub fn build_injection_env(log_path: &Path) -> Result<BTreeMap<String, String>> 
             "LD_PRELOAD".to_string(),
             merge_preload_value("LD_PRELOAD", &library, " "),
         );
+        return Ok(env);
     }
 
-    Ok(env)
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = log_path;
+        Ok(BTreeMap::new())
+    }
 }
 
 #[cfg(any(target_os = "linux", test))]

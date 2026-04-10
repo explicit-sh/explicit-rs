@@ -25,6 +25,8 @@
             version = "0.1.0";
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
+            nativeBuildInputs = lib.optionals pkgs.stdenv.isLinux [ pkgs.pkg-config ];
+            buildInputs = lib.optionals pkgs.stdenv.isLinux [ pkgs.dbus ];
             meta.mainProgram = "explicit";
             postInstall = ''
               mkdir -p $out/lib
