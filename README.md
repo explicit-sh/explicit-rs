@@ -43,6 +43,9 @@ explicit scan
 explicit apply
 explicit doctor
 explicit shell
+explicit observe codex
+explicit observe list
+explicit observe report --latest
 explicit codex
 explicit claude
 ```
@@ -53,6 +56,9 @@ What each command does:
 - `apply`: updates `devenv.nix` wiring, rewrites `devenv.generated.nix`, and refreshes `.nono/` metadata and hooks
 - `doctor`: prints a readable summary of what was detected
 - `shell`: realizes the `devenv` environment and launches a sandboxed shell for agents or manual use
+- `observe codex`: launches Codex, then ingests the new Codex session JSONL into a run-scoped SQLite database
+- `observe list`: lists observed runs under the current project
+- `observe report`: prints a readable report for an observed run
 - `codex`: shorthand for launching `codex` inside the managed sandbox in the current project
 - `claude`: shorthand for launching `claude` inside the managed sandbox in the current project
 
@@ -65,6 +71,9 @@ cargo run -- scan
 cargo run -- apply
 cargo run -- doctor
 cargo run -- shell
+cargo run -- observe codex
+cargo run -- observe list
+cargo run -- observe report --latest
 cargo run -- codex
 cargo run -- claude
 ```
@@ -91,6 +100,7 @@ devenv shell
 explicit apply
 explicit doctor
 explicit shell --command codex
+explicit observe codex
 explicit codex
 explicit claude
 ```
@@ -109,7 +119,11 @@ Examples:
 ```bash
 explicit shell --command codex
 explicit shell --command claude
+explicit observe codex exec --skip-git-repo-check "say hello in one word"
+explicit observe list
+explicit observe report --latest
 explicit codex
+explicit codex --observe
 explicit claude
 explicit codex -m gpt-5.4
 explicit claude -- --help
@@ -117,6 +131,41 @@ cargo run -- shell --command 'pwd; command -v cargo; cargo --version'
 ```
 
 `explicit codex ...` and `explicit claude ...` pass everything after the subcommand directly to the agent binary. If you need sandbox-specific controls such as `--root`, `--block-network`, or `--no-services`, use `explicit shell --command ...` instead.
+
+## Observability
+
+`explicit observe codex` adds a run-scoped SQLite event store on top of the existing sandbox.
+
+It currently captures:
+
+- model input and output from Codex session JSONL
+- token usage events
+- shell tool calls and outputs
+- web search events
+- patch apply events
+- derived file touches from parsed shell commands and patch metadata
+
+Observed runs are written under:
+
+- `.nono/observability/<run-id>/events.sqlite`
+
+You can inspect recorded runs with:
+
+```bash
+explicit observe list
+explicit observe report --latest
+explicit observe report --run <run-id>
+```
+
+You can also use the shorthand:
+
+```bash
+explicit codex --observe
+```
+
+This uses the same sandbox as `explicit codex`, then ingests the new Codex session after the run exits.
+
+The current observability implementation does not yet do full MITM network capture or kernel-level file tracing. The exploration and planned next layers are documented in [docs/observability.md](/Users/onnimonni/Projects/devenv-nono-llm/docs/observability.md).
 
 The sandbox is intentionally narrow. It allows:
 
@@ -151,6 +200,7 @@ Files managed by the tool:
 - `.nono/sandbox-plan.json`: resolved sandbox permissions
 - `.nono/guard-commands.json`: lint and build commands used by the stop hook
 - `.nono/stop-guard.sh`: hook implementation
+- `.nono/observability/<run-id>/events.sqlite`: observed Codex run data
 
 [devenv.nix](/Users/onnimonni/Projects/devenv-nono-llm/devenv.nix) is treated as the user-owned entrypoint. `explicit` only ensures the generated import exists and leaves the rest of the file under user control.
 

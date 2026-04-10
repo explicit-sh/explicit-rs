@@ -298,6 +298,7 @@ fn capture_devenv_env(
         }
     }
     merge_host_agent_paths(&mut env_map)?;
+    inject_tls_certificate_env(&mut env_map);
     env_map.insert(
         "HISTFILE".to_string(),
         root.join(".nono/bash_history").display().to_string(),
@@ -384,6 +385,18 @@ fn merge_host_agent_paths(env_map: &mut BTreeMap<String, String>) -> Result<()> 
     }
 
     Ok(())
+}
+
+fn inject_tls_certificate_env(env_map: &mut BTreeMap<String, String>) {
+    let cert_path = Path::new("/etc/ssl/cert.pem");
+    if !cert_path.exists() {
+        return;
+    }
+
+    let cert_path = cert_path.display().to_string();
+    env_map.insert("SSL_CERT_FILE".to_string(), cert_path.clone());
+    env_map.insert("CURL_CA_BUNDLE".to_string(), cert_path.clone());
+    env_map.insert("NIX_SSL_CERT_FILE".to_string(), cert_path);
 }
 fn active_process_summary(root_pid: u32) -> Option<String> {
     let output = Command::new("ps")

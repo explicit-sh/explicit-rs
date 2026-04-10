@@ -2,6 +2,7 @@ mod analysis;
 mod devenv_file;
 mod hooks;
 mod host_tools;
+mod observe;
 mod registry;
 mod runtime;
 mod sandbox;
@@ -34,6 +35,10 @@ enum Command {
     Doctor(CommonArgs),
     #[command(about = "Launch a devenv-powered sandbox shell for agents or manual use.")]
     Shell(ShellArgs),
+    #[command(
+        about = "Launch an observed agent run and ingest Codex session telemetry into SQLite."
+    )]
+    Observe(ObserveArgs),
     #[command(
         about = "Launch Codex inside the devenv + nono sandbox.",
         disable_help_flag = true,
@@ -72,6 +77,48 @@ struct ShellArgs {
 struct AgentArgs {
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     args: Vec<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+struct ObserveArgs {
+    #[command(subcommand)]
+    command: ObserveCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum ObserveCommand {
+    #[command(
+        about = "Launch Codex and save model, token, shell, and patch telemetry to SQLite.",
+        disable_help_flag = true,
+        disable_help_subcommand = true
+    )]
+    Codex(ObserveAgentArgs),
+    #[command(about = "List observed runs under the current project.")]
+    List(CommonArgs),
+    #[command(about = "Print a report for an observed run.")]
+    Report(ObserveReportArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+struct ObserveAgentArgs {
+    #[arg(long, default_value = ".")]
+    root: PathBuf,
+    #[arg(long, action = ArgAction::SetTrue)]
+    block_network: bool,
+    #[arg(long, action = ArgAction::SetTrue)]
+    no_services: bool,
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    args: Vec<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+struct ObserveReportArgs {
+    #[arg(long, default_value = ".")]
+    root: PathBuf,
+    #[arg(long)]
+    run: Option<String>,
+    #[arg(long, action = ArgAction::SetTrue)]
+    latest: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -143,6 +190,19 @@ fn run() -> Result<ExitCode> {
             )?;
             Ok(status)
         }
+        Command::Observe(args) => match args.command {
+            ObserveCommand::Codex(args) => launch_observed_agent("codex", args),
+            ObserveCommand::List(args) => {
+                let root = args.root.canonicalize().context("failed to resolve root")?;
+                observe::list_runs(&root)?;
+                Ok(ExitCode::SUCCESS)
+            }
+            ObserveCommand::Report(args) => {
+                let root = args.root.canonicalize().context("failed to resolve root")?;
+                observe::print_report(&root, args.run.as_deref(), args.latest)?;
+                Ok(ExitCode::SUCCESS)
+            }
+        },
         Command::Codex(args) => launch_agent("codex", args),
         Command::Claude(args) => launch_agent("claude", args),
         Command::SandboxExec(args) => {
@@ -157,8 +217,35 @@ fn launch_agent(binary: &str, args: AgentArgs) -> Result<ExitCode> {
         .canonicalize()
         .context("failed to resolve root")?;
     let analysis = Analysis::analyze(&root)?;
-    let command = build_agent_command(binary, &args.args);
+    let (observe, passthrough_args) = extract_observe_flag(args.args);
+    let command = build_agent_command(binary, &passthrough_args);
+    if observe {
+        return observe::launch_observed_agent(
+            &root,
+            &analysis,
+            binary,
+            command,
+            &passthrough_args,
+            false,
+            false,
+        );
+    }
     runtime::launch_shell(&root, &analysis, Some(command), false, false)
+}
+
+fn launch_observed_agent(binary: &str, args: ObserveAgentArgs) -> Result<ExitCode> {
+    let root = args.root.canonicalize().context("failed to resolve root")?;
+    let analysis = Analysis::analyze(&root)?;
+    let command = build_agent_command(binary, &args.args);
+    observe::launch_observed_agent(
+        &root,
+        &analysis,
+        binary,
+        command,
+        &args.args,
+        args.block_network,
+        args.no_services,
+    )
 }
 
 fn build_agent_command(binary: &str, args: &[String]) -> String {
@@ -179,9 +266,22 @@ fn shell_escape(value: &str) -> String {
     format!("'{}'", value.replace('\'', r#"'"'"'"#))
 }
 
+fn extract_observe_flag(args: Vec<String>) -> (bool, Vec<String>) {
+    let mut observe = false;
+    let mut passthrough_args = Vec::new();
+    for arg in args {
+        if arg == "--observe" {
+            observe = true;
+            continue;
+        }
+        passthrough_args.push(arg);
+    }
+    (observe, passthrough_args)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, build_agent_command, shell_escape};
+    use super::{Cli, Command, build_agent_command, extract_observe_flag, shell_escape};
     use clap::Parser;
 
     #[test]
@@ -207,5 +307,16 @@ mod tests {
             panic!("expected codex command");
         };
         assert_eq!(args.args, vec!["-m", "gpt-5.4", "--help"]);
+    }
+
+    #[test]
+    fn extracts_observe_flag_from_agent_arguments() {
+        let (observe, args) = extract_observe_flag(vec![
+            "--observe".to_string(),
+            "-m".to_string(),
+            "gpt-5.4".to_string(),
+        ]);
+        assert!(observe);
+        assert_eq!(args, vec!["-m", "gpt-5.4"]);
     }
 }
