@@ -36,13 +36,13 @@ jobs:
         run: cargo fmt --check
 
       - name: Run wrapper delegate resolution test
-        run: cargo test host_tools::tests::preferred_command_path_uses_wrapper_delegate --lib -- --exact
+        run: cargo test --bin explicit host_tools::tests::preferred_command_path_uses_wrapper_delegate -- --exact
 
       - name: Run shebang interpreter resolution test
-        run: cargo test host_tools::tests::host_command_paths_include_shebang_interpreter --lib -- --exact
+        run: cargo test --bin explicit host_tools::tests::host_command_paths_include_shebang_interpreter -- --exact
 
       - name: Run npm package-root resolution test
-        run: cargo test host_tools::tests::host_command_support_dirs_include_npm_package_root --lib -- --exact
+        run: cargo test --bin explicit host_tools::tests::host_command_support_dirs_include_npm_package_root -- --exact
 
       - name: Run test suite
         run: cargo test --locked
