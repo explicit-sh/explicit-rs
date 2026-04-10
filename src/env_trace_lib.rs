@@ -18,9 +18,9 @@ const ALT_SECURE_GETENV_NAME: &[u8] = b"__secure_getenv\0";
 
 static REAL_GETENV: OnceLock<GetenvFn> = OnceLock::new();
 #[cfg(target_os = "linux")]
-static REAL_SECURE_GETENV: OnceLock<GetenvFn> = OnceLock::new();
+static REAL_SECURE_GETENV: OnceLock<Option<GetenvFn>> = OnceLock::new();
 #[cfg(target_os = "linux")]
-static REAL_ALT_SECURE_GETENV: OnceLock<GetenvFn> = OnceLock::new();
+static REAL_ALT_SECURE_GETENV: OnceLock<Option<GetenvFn>> = OnceLock::new();
 static LOG_FD: OnceLock<Option<RawFd>> = OnceLock::new();
 
 thread_local! {
