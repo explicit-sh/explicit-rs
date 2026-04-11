@@ -65,7 +65,6 @@ pub fn run_project_checks(
     let mode = VerifyMode::from_flags(stop_hook, git_hook);
     let hook_client = detect_stop_hook_client(mode);
     let checks = project_checks(analysis);
-    let mut failures = project_policy_failures(root, analysis)?;
     let total_checks = checks.len() + project_policy_check_count(analysis);
 
     if total_checks == 0 {
@@ -77,6 +76,10 @@ pub fn run_project_checks(
 
     if mode == VerifyMode::User {
         eprintln!("Running {} project checks...", total_checks);
+    }
+
+    if let Some(failure) = first_project_policy_failure(root, analysis)? {
+        return report_single_failure(root, mode, hook_client, failure);
     }
 
     for check in &checks {
@@ -94,28 +97,28 @@ pub fn run_project_checks(
             exit_code: output.status.code(),
             summary: summarize_failure(check.kind, &check.command, &output),
         };
-        if mode == VerifyMode::User {
-            eprintln!("fail {:<7} {}", failure.kind, failure.subject);
-            eprintln!("  reason: {}", failure.summary);
-        }
-        failures.push(failure);
+        return report_single_failure(root, mode, hook_client, failure);
     }
 
-    if failures.is_empty() {
-        if mode == VerifyMode::User {
-            eprintln!("All project checks passed ({} total).", total_checks);
-        }
-        return Ok(ExitCode::SUCCESS);
+    if mode == VerifyMode::User {
+        eprintln!("All project checks passed ({} total).", total_checks);
     }
+    Ok(ExitCode::SUCCESS)
+}
 
+fn report_single_failure(
+    root: &Path,
+    mode: VerifyMode,
+    hook_client: StopHookClient,
+    failure: CheckFailure,
+) -> Result<ExitCode> {
     if mode == VerifyMode::StopHook && hook_client == StopHookClient::Claude {
-        print_claude_stop_block_json(&failures)?;
+        print_claude_stop_block_json(&failure)?;
         return Ok(ExitCode::SUCCESS);
     }
-
     let _ = io::stdout().flush();
     let _ = io::stderr().flush();
-    print_failure_report(root, mode, &failures);
+    print_failure_report(root, mode, &failure);
     Ok(ExitCode::from(2))
 }
 
@@ -156,16 +159,32 @@ fn project_policy_check_count(analysis: &Analysis) -> usize {
     count
 }
 
-fn project_policy_failures(root: &Path, analysis: &Analysis) -> Result<Vec<CheckFailure>> {
-    let mut failures = Vec::new();
-
+fn first_project_policy_failure(root: &Path, analysis: &Analysis) -> Result<Option<CheckFailure>> {
     if analysis.repository.is_git_repository && !analysis.repository.has_readme() {
-        failures.push(CheckFailure {
+        return Ok(Some(CheckFailure {
             kind: "docs",
             subject: "README.md".to_string(),
             exit_code: None,
             summary: "git repositories must include a top-level README.md".to_string(),
-        });
+        }));
+    }
+
+    if analysis.repository.is_public_github_repository() && !analysis.repository.has_license() {
+        return Ok(Some(CheckFailure {
+            kind: "license",
+            subject: "LICENSE".to_string(),
+            exit_code: None,
+            summary: "public GitHub repositories must include a LICENSE file".to_string(),
+        }));
+    }
+
+    if analysis.repository.is_public_github_repository() && !analysis.repository.has_workflows() {
+        return Ok(Some(CheckFailure {
+            kind: "ci",
+            subject: ".github/workflows".to_string(),
+            exit_code: None,
+            summary: "public GitHub repositories must include GitHub Actions workflows".to_string(),
+        }));
     }
 
     let workflow_audit = if analysis.repository.has_workflows()
@@ -179,63 +198,48 @@ fn project_policy_failures(root: &Path, analysis: &Analysis) -> Result<Vec<Check
     if let Some(audit) = workflow_audit.as_ref()
         && !audit.syntax_errors.is_empty()
     {
-        failures.push(CheckFailure {
+        return Ok(Some(CheckFailure {
             kind: "ci",
             subject: ".github/workflows".to_string(),
             exit_code: None,
             summary: format!(
                 "GitHub Actions workflow syntax is invalid: {}",
-                audit.syntax_errors.join("; ")
+                audit
+                    .syntax_errors
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "unknown workflow syntax error".to_string())
             ),
-        });
+        }));
     }
 
-    if analysis.repository.is_public_github_repository() {
-        if !analysis.repository.has_license() {
-            failures.push(CheckFailure {
-                kind: "license",
-                subject: "LICENSE".to_string(),
-                exit_code: None,
-                summary: "public GitHub repositories must include a LICENSE file".to_string(),
-            });
-        }
-
-        if !analysis.repository.has_workflows() {
-            failures.push(CheckFailure {
+    if analysis.repository.is_public_github_repository()
+        && let Some(audit) = workflow_audit.as_ref()
+        && audit.syntax_errors.is_empty()
+    {
+        if !audit.has_automatic_trigger {
+            return Ok(Some(CheckFailure {
                 kind: "ci",
                 subject: ".github/workflows".to_string(),
                 exit_code: None,
-                summary: "public GitHub repositories must include GitHub Actions workflows"
-                    .to_string(),
-            });
-        } else if let Some(audit) = workflow_audit.as_ref()
-            && audit.syntax_errors.is_empty()
-        {
-            if !audit.has_automatic_trigger {
-                failures.push(CheckFailure {
-                    kind: "ci",
-                    subject: ".github/workflows".to_string(),
-                    exit_code: None,
-                    summary: "GitHub Actions must run automatically on push, pull_request, pull_request_target, or merge_group".to_string(),
-                });
-            }
+                summary: "GitHub Actions must run automatically on push, pull_request, pull_request_target, or merge_group".to_string(),
+            }));
+        }
 
-            let missing_commands = missing_workflow_commands(analysis, &audit.run_steps);
-            if !missing_commands.is_empty() {
-                failures.push(CheckFailure {
-                    kind: "ci",
-                    subject: "GitHub Actions coverage".to_string(),
-                    exit_code: None,
-                    summary: format!(
-                        "GitHub Actions do not run these detected checks automatically: {}",
-                        missing_commands.join(", ")
-                    ),
-                });
-            }
+        let missing_commands = missing_workflow_commands(analysis, &audit.run_steps);
+        if let Some(command) = missing_commands.first() {
+            return Ok(Some(CheckFailure {
+                kind: "ci",
+                subject: command.clone(),
+                exit_code: None,
+                summary: format!(
+                    "GitHub Actions do not run the detected check automatically: {command}"
+                ),
+            }));
         }
     }
 
-    Ok(failures)
+    Ok(None)
 }
 
 fn audit_workflows(root: &Path, workflow_files: &[String]) -> Result<WorkflowAudit> {
@@ -552,7 +556,7 @@ fn normalize_summary(line: &str) -> String {
     value
 }
 
-fn print_failure_report(root: &Path, mode: VerifyMode, failures: &[CheckFailure]) {
+fn print_failure_report(root: &Path, mode: VerifyMode, failure: &CheckFailure) {
     match mode {
         VerifyMode::User => {
             eprintln!();
@@ -566,13 +570,11 @@ fn print_failure_report(root: &Path, mode: VerifyMode, failures: &[CheckFailure]
         }
     }
 
-    for failure in failures {
-        match failure.exit_code {
-            Some(code) => eprintln!(" - {} [{}]: {}", failure.kind, code, failure.subject),
-            None => eprintln!(" - {}: {}", failure.kind, failure.subject),
-        }
-        eprintln!("   {}", failure.summary);
+    match failure.exit_code {
+        Some(code) => eprintln!(" - {} [{}]: {}", failure.kind, code, failure.subject),
+        None => eprintln!(" - {}: {}", failure.kind, failure.subject),
     }
+    eprintln!("   {}", failure.summary);
     eprintln!();
     eprintln!(
         "Run `explicit verify --root {}` after fixing the project.",
@@ -583,8 +585,8 @@ fn print_failure_report(root: &Path, mode: VerifyMode, failures: &[CheckFailure]
     }
 }
 
-fn print_claude_stop_block_json(failures: &[CheckFailure]) -> Result<()> {
-    let reason = build_stop_reason(failures);
+fn print_claude_stop_block_json(failure: &CheckFailure) -> Result<()> {
+    let reason = build_stop_reason(failure);
     println!(
         "{}",
         serde_json::to_string(&serde_json::json!({
@@ -595,23 +597,10 @@ fn print_claude_stop_block_json(failures: &[CheckFailure]) -> Result<()> {
     Ok(())
 }
 
-fn build_stop_reason(failures: &[CheckFailure]) -> String {
-    let mut items = failures
-        .iter()
-        .take(2)
-        .map(|failure| {
-            format!(
-                "{} `{}`: {}",
-                failure.kind, failure.subject, failure.summary
-            )
-        })
-        .collect::<Vec<_>>();
-    if failures.len() > 2 {
-        items.push(format!("{} more failing checks", failures.len() - 2));
-    }
+fn build_stop_reason(failure: &CheckFailure) -> String {
     format!(
-        "Project checks are still failing. Continue working until they pass: {}.",
-        items.join("; ")
+        "Project checks are still failing. Continue working until this passes: {} `{}`: {}.",
+        failure.kind, failure.subject, failure.summary
     )
 }
 
@@ -654,8 +643,8 @@ fn should_use_devenv(root: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        VerifyMode, build_stop_reason, missing_workflow_commands, normalize_summary,
-        project_checks, project_policy_failures, should_use_devenv, summarize_failure,
+        VerifyMode, build_stop_reason, first_project_policy_failure, missing_workflow_commands,
+        normalize_summary, project_checks, should_use_devenv, summarize_failure,
         tokens_are_subsequence, workflow_runs_command,
     };
     use crate::analysis::{
@@ -743,23 +732,14 @@ mod tests {
 
     #[test]
     fn builds_short_stop_reason() {
-        let reason = build_stop_reason(&[
-            super::CheckFailure {
-                kind: "lint",
-                subject: "cargo fmt --check".to_string(),
-                exit_code: Some(1),
-                summary: "formatting changes are required".to_string(),
-            },
-            super::CheckFailure {
-                kind: "test",
-                subject: "cargo test".to_string(),
-                exit_code: Some(1),
-                summary: "test result: FAILED".to_string(),
-            },
-        ]);
+        let reason = build_stop_reason(&super::CheckFailure {
+            kind: "lint",
+            subject: "cargo fmt --check".to_string(),
+            exit_code: Some(1),
+            summary: "formatting changes are required".to_string(),
+        });
         assert!(reason.contains("Project checks are still failing"));
         assert!(reason.contains("cargo fmt --check"));
-        assert!(reason.contains("cargo test"));
     }
 
     #[test]
@@ -785,12 +765,12 @@ mod tests {
             ..RepositoryMetadata::default()
         };
 
-        let failures = project_policy_failures(dir.path(), &analysis).unwrap();
-        assert!(failures.iter().any(|failure| {
-            failure.kind == "docs"
-                && failure.subject == "README.md"
-                && failure.summary.contains("README.md")
-        }));
+        let failure = first_project_policy_failure(dir.path(), &analysis)
+            .unwrap()
+            .expect("expected readme failure");
+        assert_eq!(failure.kind, "docs");
+        assert_eq!(failure.subject, "README.md");
+        assert!(failure.summary.contains("README.md"));
     }
 
     #[test]
@@ -805,12 +785,11 @@ mod tests {
             ..RepositoryMetadata::default()
         };
 
-        let failures = project_policy_failures(dir.path(), &analysis).unwrap();
-        assert!(
-            failures
-                .iter()
-                .any(|failure| failure.kind == "license" && failure.subject == "LICENSE")
-        );
+        let failure = first_project_policy_failure(dir.path(), &analysis)
+            .unwrap()
+            .expect("expected license failure");
+        assert_eq!(failure.kind, "license");
+        assert_eq!(failure.subject, "LICENSE");
     }
 
     #[test]
@@ -843,12 +822,12 @@ jobs:
             ..RepositoryMetadata::default()
         };
 
-        let failures = project_policy_failures(dir.path(), &analysis).unwrap();
-        assert!(failures.iter().any(|failure| {
-            failure.kind == "ci"
-                && failure.subject == "GitHub Actions coverage"
-                && failure.summary.contains("lint-a")
-        }));
+        let failure = first_project_policy_failure(dir.path(), &analysis)
+            .unwrap()
+            .expect("expected workflow coverage failure");
+        assert_eq!(failure.kind, "ci");
+        assert_eq!(failure.subject, "lint-a");
+        assert!(failure.summary.contains("lint-a"));
     }
 
     #[test]
@@ -867,12 +846,37 @@ jobs:
             ..RepositoryMetadata::default()
         };
 
-        let failures = project_policy_failures(dir.path(), &analysis).unwrap();
-        assert!(failures.iter().any(|failure| {
-            failure.kind == "ci"
-                && failure.subject == ".github/workflows"
-                && failure.summary.contains("syntax is invalid")
-        }));
+        let failure = first_project_policy_failure(dir.path(), &analysis)
+            .unwrap()
+            .expect("expected workflow syntax failure");
+        assert_eq!(failure.kind, "ci");
+        assert_eq!(failure.subject, ".github/workflows");
+        assert!(failure.summary.contains("syntax is invalid"));
+    }
+
+    #[test]
+    fn prioritizes_repository_prerequisites_one_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut analysis = analysis_with_checks();
+        analysis.repository = RepositoryMetadata {
+            is_git_repository: true,
+            github: Some(GitHubRepository {
+                slug: "example/demo".to_string(),
+                visibility: GitHubVisibility::Public,
+            }),
+            ..RepositoryMetadata::default()
+        };
+
+        let failure = first_project_policy_failure(dir.path(), &analysis)
+            .unwrap()
+            .expect("expected first failure");
+        assert_eq!(failure.subject, "README.md");
+
+        analysis.repository.readme_path = Some("README.md".to_string());
+        let failure = first_project_policy_failure(dir.path(), &analysis)
+            .unwrap()
+            .expect("expected second failure");
+        assert_eq!(failure.subject, "LICENSE");
     }
 
     #[test]

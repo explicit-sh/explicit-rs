@@ -232,6 +232,8 @@ For example, if a project exposes `cargo fmt --check`, `cargo clippy`, `cargo bu
 - public GitHub repositories must include GitHub Actions workflows that run automatically and cover the detected lint, build, and test commands
 - existing GitHub Actions workflows are syntax-checked, using `actionlint` when it is available in the environment and a YAML/shape validator as fallback
 
+Verification is intentionally sequential. It reports only the highest-priority failing item on each run, so agents get one concrete thing to fix before the next blocker is revealed.
+
 If no concrete lint, build, or test command is detected, the hook remains advisory and allows exit.
 
 ## Generated Files
