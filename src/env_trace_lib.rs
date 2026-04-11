@@ -54,12 +54,22 @@ impl Drop for TraceGuard {
 }
 
 #[unsafe(no_mangle)]
+/// # Safety
+///
+/// This function matches the C ABI for `getenv` and may only be called by code
+/// that passes a valid, null-terminated environment variable name pointer or a
+/// null pointer, exactly like the libc contract.
 pub unsafe extern "C" fn getenv(name: *const c_char) -> *mut c_char {
     unsafe { intercept_getenv(resolve_real_getenv(), "getenv", name) }
 }
 
 #[cfg(target_os = "linux")]
 #[unsafe(no_mangle)]
+/// # Safety
+///
+/// This function matches the C ABI for `secure_getenv` and may only be called by
+/// code that passes a valid, null-terminated environment variable name pointer
+/// or a null pointer, exactly like the libc contract.
 pub unsafe extern "C" fn secure_getenv(name: *const c_char) -> *mut c_char {
     let real = resolve_real_secure_getenv().unwrap_or_else(resolve_real_getenv);
     unsafe { intercept_getenv(real, "secure_getenv", name) }
@@ -67,6 +77,11 @@ pub unsafe extern "C" fn secure_getenv(name: *const c_char) -> *mut c_char {
 
 #[cfg(target_os = "linux")]
 #[unsafe(no_mangle)]
+/// # Safety
+///
+/// This function matches the C ABI for `__secure_getenv` and may only be called
+/// by code that passes a valid, null-terminated environment variable name
+/// pointer or a null pointer, exactly like the libc contract.
 pub unsafe extern "C" fn __secure_getenv(name: *const c_char) -> *mut c_char {
     let real = resolve_real_alt_secure_getenv()
         .or_else(resolve_real_secure_getenv)
@@ -154,9 +169,7 @@ fn log_fd() -> Option<RawFd> {
         }
 
         let path = unsafe { c_string_to_owned(path_ptr.cast_const()) };
-        let Some(c_path) = std::ffi::CString::new(path).ok() else {
-            return None;
-        };
+        let c_path = std::ffi::CString::new(path).ok()?;
 
         let fd = unsafe {
             libc::open(

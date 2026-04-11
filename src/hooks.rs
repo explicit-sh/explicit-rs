@@ -65,8 +65,8 @@ fn write_guard_commands(root: &Path, analysis: &Analysis) -> Result<()> {
         commands,
         notes: &analysis.notes,
     };
-    fs::write(
-        root.join(".nono/guard-commands.json"),
+    write_if_changed(
+        &root.join(".nono/guard-commands.json"),
         serde_json::to_string_pretty(&payload)?,
     )
     .context("failed to write .nono/guard-commands.json")?;
@@ -75,8 +75,8 @@ fn write_guard_commands(root: &Path, analysis: &Analysis) -> Result<()> {
 
 fn write_explicit_bin_path(root: &Path) -> Result<()> {
     let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
-    fs::write(
-        root.join(EXPLICIT_BIN_PATH.trim_start_matches("./")),
+    write_if_changed(
+        &root.join(EXPLICIT_BIN_PATH.trim_start_matches("./")),
         current_exe.display().to_string(),
     )
     .context("failed to write .nono/explicit-bin")?;
@@ -232,7 +232,8 @@ fn is_managed_pre_push_hook(path: &Path) -> Result<bool> {
 }
 
 fn write_executable_script(path: &Path, script: &str) -> Result<()> {
-    fs::write(path, script).with_context(|| format!("failed to write {}", path.display()))?;
+    write_if_changed(path, script)
+        .with_context(|| format!("failed to write {}", path.display()))?;
     let mut permissions = fs::metadata(path)
         .with_context(|| format!("failed to read {}", path.display()))?
         .permissions();
@@ -268,7 +269,7 @@ fn write_claude_settings(root: &Path) -> Result<()> {
             }]
         }]),
     );
-    fs::write(&path, serde_json::to_string_pretty(&payload)?)
+    write_if_changed(&path, serde_json::to_string_pretty(&payload)?)
         .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
 }
@@ -291,7 +292,7 @@ fn write_codex_hooks(root: &Path) -> Result<()> {
             }]
         }]),
     );
-    fs::write(&path, serde_json::to_string_pretty(&payload)?)
+    write_if_changed(&path, serde_json::to_string_pretty(&payload)?)
         .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
 }
@@ -308,9 +309,17 @@ fn write_codex_config(root: &Path) -> Result<()> {
         .as_table_mut()
         .context("codex config features entry is not a TOML table")?;
     features.insert("codex_hooks".to_string(), TomlValue::Boolean(true));
-    fs::write(&path, toml::to_string_pretty(&payload)?)
+    write_if_changed(&path, toml::to_string_pretty(&payload)?)
         .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
+}
+
+fn write_if_changed(path: &Path, content: impl AsRef<[u8]>) -> Result<()> {
+    let content = content.as_ref();
+    if fs::read(path).ok().as_deref() == Some(content) {
+        return Ok(());
+    }
+    fs::write(path, content).with_context(|| format!("failed to write {}", path.display()))
 }
 
 fn read_json_object_or_empty(path: &Path) -> Result<JsonValue> {

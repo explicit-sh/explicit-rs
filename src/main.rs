@@ -217,12 +217,14 @@ fn run() -> Result<ExitCode> {
             let status = runtime::launch_shell(
                 &root,
                 &analysis,
-                args.command,
-                args.block_network,
-                args.no_services,
-                args.dangerously_use_end_of_life_versions,
-                None,
-                None,
+                runtime::LaunchShellOptions {
+                    command: args.command.as_deref(),
+                    block_network: args.block_network,
+                    no_services: args.no_services,
+                    dangerously_use_end_of_life_versions: args.dangerously_use_end_of_life_versions,
+                    extra_env: None,
+                    transcript_path: None,
+                },
             )?;
             Ok(status)
         }
@@ -268,12 +270,14 @@ fn launch_agent(binary: &str, args: AgentArgs) -> Result<ExitCode> {
         return observe::launch_observed_agent(
             &root,
             &analysis,
-            binary,
-            command,
-            &passthrough_args,
-            false,
-            false,
-            args.dangerously_use_end_of_life_versions,
+            observe::ObservedAgentOptions {
+                agent: binary,
+                command,
+                agent_args: &passthrough_args,
+                block_network: false,
+                no_services: false,
+                dangerously_use_end_of_life_versions: args.dangerously_use_end_of_life_versions,
+            },
         );
     }
     observe::launch_live_agent(
@@ -294,12 +298,14 @@ fn launch_observed_agent(binary: &str, args: ObserveAgentArgs) -> Result<ExitCod
     observe::launch_observed_agent(
         &root,
         &analysis,
-        binary,
-        command,
-        &args.args,
-        args.block_network,
-        args.no_services,
-        args.dangerously_use_end_of_life_versions,
+        observe::ObservedAgentOptions {
+            agent: binary,
+            command,
+            agent_args: &args.args,
+            block_network: args.block_network,
+            no_services: args.no_services,
+            dangerously_use_end_of_life_versions: args.dangerously_use_end_of_life_versions,
+        },
     )
 }
 

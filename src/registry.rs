@@ -13,6 +13,51 @@ use crate::analysis::{LanguageRequirement, ServiceRequirement};
 const REGISTRY_TOML: &str = include_str!("../registry.toml");
 
 #[derive(Debug, Clone, Default)]
+pub(crate) struct ProjectContext {
+    package_json: Option<JsonValue>,
+    composer_json: Option<JsonValue>,
+    pyproject: Option<TomlValue>,
+    dependency_sets: BTreeMap<&'static str, BTreeSet<String>>,
+}
+
+impl ProjectContext {
+    pub(crate) fn load(root: &Path) -> Result<Self> {
+        let package_json = read_optional_json(root.join("package.json"))?;
+        let composer_json = read_optional_json(root.join("composer.json"))?;
+        let pyproject = read_optional_toml(root.join("pyproject.toml"))?;
+        let dependency_sets = collect_dependency_sets(
+            root,
+            package_json.as_ref(),
+            pyproject.as_ref(),
+            composer_json.as_ref(),
+        )?;
+
+        Ok(Self {
+            package_json,
+            composer_json,
+            pyproject,
+            dependency_sets,
+        })
+    }
+
+    pub(crate) fn package_json(&self) -> Option<&JsonValue> {
+        self.package_json.as_ref()
+    }
+
+    pub(crate) fn composer_json(&self) -> Option<&JsonValue> {
+        self.composer_json.as_ref()
+    }
+
+    pub(crate) fn pyproject(&self) -> Option<&TomlValue> {
+        self.pyproject.as_ref()
+    }
+
+    pub(crate) fn dependencies(&self, ecosystem: &'static str) -> Option<&BTreeSet<String>> {
+        self.dependency_sets.get(ecosystem)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct RegistryMatches {
     pub languages: Vec<LanguageRequirement>,
     pub packages: Vec<String>,
@@ -122,13 +167,21 @@ fn parse_registry() -> Result<RegistrySpec> {
     Ok(spec)
 }
 
+#[cfg(test)]
 pub fn detect_registry_matches(root: &Path) -> Result<RegistryMatches> {
+    let context = ProjectContext::load(root)?;
+    detect_registry_matches_with_context(root, &context)
+}
+
+pub(crate) fn detect_registry_matches_with_context(
+    root: &Path,
+    context: &ProjectContext,
+) -> Result<RegistryMatches> {
     let registry = parse_registry()?;
-    let dependency_sets = collect_dependency_sets(root)?;
     let mut matches = RegistryAccumulator::default();
 
     for rule in &registry.rules {
-        if rule_matches(rule, root, &dependency_sets)? {
+        if rule_matches(rule, root, &context.dependency_sets)? {
             matches.apply_rule(rule);
         }
     }
@@ -136,15 +189,33 @@ pub fn detect_registry_matches(root: &Path) -> Result<RegistryMatches> {
     Ok(matches.into_matches())
 }
 
-fn collect_dependency_sets(root: &Path) -> Result<BTreeMap<&'static str, BTreeSet<String>>> {
+fn collect_dependency_sets(
+    root: &Path,
+    package_json: Option<&JsonValue>,
+    pyproject: Option<&TomlValue>,
+    composer_json: Option<&JsonValue>,
+) -> Result<BTreeMap<&'static str, BTreeSet<String>>> {
     let mut sets = BTreeMap::new();
-    sets.insert("javascript", collect_package_json_dependencies(root)?);
-    sets.insert("python", collect_python_dependencies(root)?);
+    sets.insert(
+        "javascript",
+        package_json
+            .map(collect_package_json_dependencies_from_payload)
+            .unwrap_or_default(),
+    );
+    sets.insert(
+        "python",
+        collect_python_dependencies_with_pyproject(root, pyproject)?,
+    );
     sets.insert("ruby", collect_ruby_dependencies(root)?);
     sets.insert("elixir", collect_mix_dependencies(root)?);
     sets.insert("rust", collect_cargo_dependencies(root)?);
     sets.insert("go", collect_go_dependencies(root)?);
-    sets.insert("php", collect_composer_dependencies(root)?);
+    sets.insert(
+        "php",
+        composer_json
+            .map(collect_composer_dependencies_from_payload)
+            .unwrap_or_default(),
+    );
     Ok(sets)
 }
 
@@ -191,17 +262,7 @@ fn rule_matches(
     }
 }
 
-fn collect_package_json_dependencies(root: &Path) -> Result<BTreeSet<String>> {
-    let path = root.join("package.json");
-    if !path.exists() {
-        return Ok(BTreeSet::new());
-    }
-
-    let payload: JsonValue = serde_json::from_str(
-        &fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?,
-    )
-    .with_context(|| format!("failed to parse {}", path.display()))?;
-
+fn collect_package_json_dependencies_from_payload(payload: &JsonValue) -> BTreeSet<String> {
     let mut dependencies = BTreeSet::new();
     for field in [
         "dependencies",
@@ -217,45 +278,49 @@ fn collect_package_json_dependencies(root: &Path) -> Result<BTreeSet<String>> {
         }
     }
 
-    Ok(dependencies)
+    dependencies
 }
 
+#[cfg(test)]
 pub(crate) fn collect_python_dependencies(root: &Path) -> Result<BTreeSet<String>> {
+    let pyproject = read_optional_toml(root.join("pyproject.toml"))?;
+    collect_python_dependencies_with_pyproject(root, pyproject.as_ref())
+}
+
+fn collect_python_dependencies_with_pyproject(
+    root: &Path,
+    pyproject: Option<&TomlValue>,
+) -> Result<BTreeSet<String>> {
     let mut dependencies = BTreeSet::new();
 
     for path in python_dependency_files(root)? {
-        if let Some(extension) = path.extension().and_then(|value| value.to_str()) {
-            if extension == "txt" || extension == "in" {
-                let contents = fs::read_to_string(&path)
-                    .with_context(|| format!("failed to read {}", path.display()))?;
-                for line in contents.lines() {
-                    if let Some(name) = normalize_requirement_name(line) {
-                        dependencies.insert(name);
-                    }
+        if let Some(extension) = path.extension().and_then(|value| value.to_str())
+            && (extension == "txt" || extension == "in")
+        {
+            let contents = fs::read_to_string(&path)
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            for line in contents.lines() {
+                if let Some(name) = normalize_requirement_name(line) {
+                    dependencies.insert(name);
                 }
             }
         }
     }
 
-    let pyproject = root.join("pyproject.toml");
-    if pyproject.exists() {
-        let contents = fs::read_to_string(&pyproject)
-            .with_context(|| format!("failed to read {}", pyproject.display()))?;
-        let value = toml::from_str::<TomlValue>(&contents)
-            .with_context(|| format!("failed to parse {}", pyproject.display()))?;
-        collect_pyproject_dependencies(&value, &mut dependencies);
+    if let Some(value) = pyproject {
+        collect_pyproject_dependencies(value, &mut dependencies);
     }
 
     let uv_lock = root.join("uv.lock");
     if uv_lock.exists() {
         let contents = fs::read_to_string(&uv_lock)
             .with_context(|| format!("failed to read {}", uv_lock.display()))?;
-        if let Ok(value) = toml::from_str::<TomlValue>(&contents) {
-            if let Some(packages) = value.get("package").and_then(TomlValue::as_array) {
-                for package in packages {
-                    if let Some(name) = package.get("name").and_then(TomlValue::as_str) {
-                        dependencies.insert(name.to_lowercase());
-                    }
+        if let Ok(value) = toml::from_str::<TomlValue>(&contents)
+            && let Some(packages) = value.get("package").and_then(TomlValue::as_array)
+        {
+            for package in packages {
+                if let Some(name) = package.get("name").and_then(TomlValue::as_str) {
+                    dependencies.insert(name.to_lowercase());
                 }
             }
         }
@@ -300,10 +365,10 @@ fn python_dependency_files(root: &Path) -> Result<Vec<PathBuf>> {
             if !path.is_file() {
                 continue;
             }
-            if let Some(name) = path.file_name().and_then(|value| value.to_str()) {
-                if name.ends_with(".txt") || name.ends_with(".in") {
-                    files.push(path);
-                }
+            if let Some(name) = path.file_name().and_then(|value| value.to_str())
+                && (name.ends_with(".txt") || name.ends_with(".in"))
+            {
+                files.push(path);
             }
         }
     }
@@ -419,7 +484,7 @@ fn normalize_requirement_name(raw: &str) -> Option<String> {
         .unwrap_or(without_direct_url)
         .trim();
     let name = without_extras
-        .split(|ch: char| matches!(ch, ' ' | '<' | '>' | '=' | '!' | '~'))
+        .split([' ', '<', '>', '=', '!', '~'])
         .next()
         .unwrap_or(without_extras)
         .trim();
@@ -498,12 +563,12 @@ fn collect_cargo_dependencies(root: &Path) -> Result<BTreeSet<String>> {
     if cargo_lock.exists() {
         let contents = fs::read_to_string(&cargo_lock)
             .with_context(|| format!("failed to read {}", cargo_lock.display()))?;
-        if let Ok(value) = toml::from_str::<TomlValue>(&contents) {
-            if let Some(packages) = value.get("package").and_then(TomlValue::as_array) {
-                for package in packages {
-                    if let Some(name) = package.get("name").and_then(TomlValue::as_str) {
-                        dependencies.insert(name.to_lowercase());
-                    }
+        if let Ok(value) = toml::from_str::<TomlValue>(&contents)
+            && let Some(packages) = value.get("package").and_then(TomlValue::as_array)
+        {
+            for package in packages {
+                if let Some(name) = package.get("name").and_then(TomlValue::as_str) {
+                    dependencies.insert(name.to_lowercase());
                 }
             }
         }
@@ -569,17 +634,7 @@ fn collect_go_dependencies(root: &Path) -> Result<BTreeSet<String>> {
     Ok(dependencies)
 }
 
-pub(crate) fn collect_composer_dependencies(root: &Path) -> Result<BTreeSet<String>> {
-    let path = root.join("composer.json");
-    if !path.exists() {
-        return Ok(BTreeSet::new());
-    }
-
-    let payload: JsonValue = serde_json::from_str(
-        &fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?,
-    )
-    .with_context(|| format!("failed to parse {}", path.display()))?;
-
+fn collect_composer_dependencies_from_payload(payload: &JsonValue) -> BTreeSet<String> {
     let mut dependencies = BTreeSet::new();
     for field in ["require", "require-dev"] {
         let Some(entries) = payload.get(field).and_then(JsonValue::as_object) else {
@@ -590,7 +645,29 @@ pub(crate) fn collect_composer_dependencies(root: &Path) -> Result<BTreeSet<Stri
         }
     }
 
-    Ok(dependencies)
+    dependencies
+}
+
+fn read_optional_json(path: PathBuf) -> Result<Option<JsonValue>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let payload = serde_json::from_str(
+        &fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?,
+    )
+    .with_context(|| format!("failed to parse {}", path.display()))?;
+    Ok(Some(payload))
+}
+
+fn read_optional_toml(path: PathBuf) -> Result<Option<TomlValue>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let payload = toml::from_str(
+        &fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?,
+    )
+    .with_context(|| format!("failed to parse {}", path.display()))?;
+    Ok(Some(payload))
 }
 
 #[cfg(test)]

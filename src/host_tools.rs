@@ -52,10 +52,10 @@ fn expand_command_path(path_env: Option<&OsStr>, path: &Path) -> Vec<PathBuf> {
             continue;
         }
 
-        if let Ok(real_path) = fs::canonicalize(&current) {
-            if queued.insert(real_path.clone()) {
-                pending.push(real_path);
-            }
+        if let Ok(real_path) = fs::canonicalize(&current)
+            && queued.insert(real_path.clone())
+        {
+            pending.push(real_path);
         }
 
         for delegate in wrapper_delegate_paths(&current)

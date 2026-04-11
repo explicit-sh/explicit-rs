@@ -12,7 +12,7 @@ use serde_yaml::Value as YamlValue;
 use toml::Value as TomlValue;
 
 use crate::host_tools::{host_command_paths, host_command_support_dirs};
-use crate::registry;
+use crate::registry::{self, ProjectContext};
 
 pub const SUPPORT_PACKAGES: &[&str] = &["git", "jq", "nono"];
 
@@ -293,16 +293,17 @@ impl Builder {
 impl Analysis {
     pub fn analyze(root: &Path) -> Result<Self> {
         let mut builder = Builder::default();
+        let project_context = ProjectContext::load(root)?;
         for package in SUPPORT_PACKAGES {
             builder.add_package(*package);
         }
 
         analyze_onefetch(root, &mut builder);
         analyze_manifests(root, &mut builder)?;
-        analyze_common_files(root, &mut builder)?;
+        analyze_common_files(root, &mut builder, &project_context)?;
         analyze_compose_services(root, &mut builder)?;
-        apply_registry_matches(root, &mut builder)?;
-        let detected_versions = detect_runtime_versions(root, &builder)?;
+        apply_registry_matches(root, &mut builder, &project_context)?;
+        let detected_versions = detect_runtime_versions(root, &builder, &project_context)?;
 
         if builder.lint_commands.is_empty()
             && builder.build_commands.is_empty()
@@ -394,21 +395,23 @@ fn analyze_manifests(root: &Path, builder: &mut Builder) -> Result<()> {
     Ok(())
 }
 
-fn analyze_common_files(root: &Path, builder: &mut Builder) -> Result<()> {
-    let package_json = root.join("package.json");
-    if package_json.exists() {
+fn analyze_common_files(
+    root: &Path,
+    builder: &mut Builder,
+    context: &ProjectContext,
+) -> Result<()> {
+    if let Some(payload) = context.package_json() {
         builder.add_marker("package.json");
         builder.add_language(LanguageRequirement::JavaScript);
         builder.add_package("nodejs");
-        let payload: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(&package_json).context("failed to read package.json")?,
-        )
-        .context("failed to parse package.json")?;
         let package_manager = payload
             .get("packageManager")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
-        let package_dependencies = package_json_dependencies(&payload);
+        let package_dependencies = context
+            .dependencies("javascript")
+            .cloned()
+            .unwrap_or_default();
         if package_dependencies.contains("react-native") {
             builder.add_marker("react-native");
         }
@@ -526,20 +529,15 @@ fn analyze_common_files(root: &Path, builder: &mut Builder) -> Result<()> {
         if root.join(".rubocop.yml").exists() {
             builder.add_lint("bundle exec rubocop");
         }
-        for command in detect_ruby_test_commands(root)? {
+        for command in detect_ruby_test_commands(root, context.dependencies("ruby"))? {
             builder.add_test(command);
         }
     }
 
-    if root.join("composer.json").exists() {
+    if let Some(payload) = context.composer_json() {
         builder.add_marker("composer.json");
         builder.add_language(LanguageRequirement::Php);
         builder.add_package("composer");
-        let payload: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(root.join("composer.json"))
-                .context("failed to read composer.json")?,
-        )
-        .context("failed to parse composer.json")?;
         if payload
             .get("scripts")
             .and_then(serde_json::Value::as_object)
@@ -548,7 +546,7 @@ fn analyze_common_files(root: &Path, builder: &mut Builder) -> Result<()> {
         {
             builder.add_test("composer test");
         } else {
-            let dependencies = registry::collect_composer_dependencies(root)?;
+            let dependencies = context.dependencies("php").cloned().unwrap_or_default();
             if dependencies.contains("pestphp/pest") {
                 builder.add_test("vendor/bin/pest");
             } else if dependencies.contains("phpunit/phpunit")
@@ -589,7 +587,7 @@ fn analyze_common_files(root: &Path, builder: &mut Builder) -> Result<()> {
         || root.join("poetry.lock").exists()
     {
         builder.add_language(LanguageRequirement::Python);
-        let python_dependencies = registry::collect_python_dependencies(root)?;
+        let python_dependencies = context.dependencies("python").cloned().unwrap_or_default();
         let mut has_pytest_tooling =
             root.join("pytest.ini").exists() || root.join("conftest.py").exists();
         builder.add_marker(if root.join("pyproject.toml").exists() {
@@ -602,31 +600,28 @@ fn analyze_common_files(root: &Path, builder: &mut Builder) -> Result<()> {
             "poetry.lock"
         });
         builder.add_package("python3");
-        if root.join("pyproject.toml").exists() {
-            let pyproject = fs::read_to_string(root.join("pyproject.toml")).unwrap_or_default();
-            if let Ok(value) = toml::from_str::<TomlValue>(&pyproject) {
-                let tool = value.get("tool").and_then(TomlValue::as_table);
-                if tool.and_then(|t| t.get("pytest")).is_some() {
-                    has_pytest_tooling = true;
-                }
-                let dependencies = value
-                    .get("project")
-                    .and_then(|v| v.get("dependencies"))
-                    .and_then(TomlValue::as_array)
-                    .map(|deps| {
-                        deps.iter()
-                            .filter_map(TomlValue::as_str)
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                if tool.and_then(|t| t.get("ruff")).is_some()
-                    || dependencies
-                        .iter()
-                        .any(|dep| dep.to_lowercase().contains("ruff"))
-                {
-                    builder.add_package("ruff");
-                    builder.add_lint("ruff check .");
-                }
+        if let Some(value) = context.pyproject() {
+            let tool = value.get("tool").and_then(TomlValue::as_table);
+            if tool.and_then(|t| t.get("pytest")).is_some() {
+                has_pytest_tooling = true;
+            }
+            let dependencies = value
+                .get("project")
+                .and_then(|v| v.get("dependencies"))
+                .and_then(TomlValue::as_array)
+                .map(|deps| {
+                    deps.iter()
+                        .filter_map(TomlValue::as_str)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if tool.and_then(|t| t.get("ruff")).is_some()
+                || dependencies
+                    .iter()
+                    .any(|dep| dep.to_lowercase().contains("ruff"))
+            {
+                builder.add_package("ruff");
+                builder.add_lint("ruff check .");
             }
         }
         if has_pytest_tooling
@@ -664,8 +659,12 @@ fn analyze_common_files(root: &Path, builder: &mut Builder) -> Result<()> {
     Ok(())
 }
 
-fn apply_registry_matches(root: &Path, builder: &mut Builder) -> Result<()> {
-    let matches = registry::detect_registry_matches(root)?;
+fn apply_registry_matches(
+    root: &Path,
+    builder: &mut Builder,
+    context: &ProjectContext,
+) -> Result<()> {
+    let matches = registry::detect_registry_matches_with_context(root, context)?;
     for language in matches.languages {
         builder.add_language(language);
     }
@@ -725,56 +724,60 @@ fn analyze_compose_services(root: &Path, builder: &mut Builder) -> Result<()> {
     Ok(())
 }
 
-fn detect_runtime_versions(root: &Path, builder: &Builder) -> Result<Vec<DetectedVersion>> {
+fn detect_runtime_versions(
+    root: &Path,
+    builder: &Builder,
+    context: &ProjectContext,
+) -> Result<Vec<DetectedVersion>> {
     let tool_versions = parse_tool_versions(root)?;
     let mise_tools = parse_mise_tools(root)?;
     let mut detected = Vec::new();
 
-    if root.join("package.json").exists()
-        || builder.languages.contains(&LanguageRequirement::JavaScript)
+    if (root.join("package.json").exists()
+        || builder.languages.contains(&LanguageRequirement::JavaScript))
+        && let Some(version) =
+            detect_nodejs_version(root, &tool_versions, &mise_tools, context.package_json())?
     {
-        if let Some(version) = detect_nodejs_version(root, &tool_versions, &mise_tools)? {
-            detected.push(version);
-        }
+        detected.push(version);
     }
 
-    if root.join("Gemfile").exists()
+    if (root.join("Gemfile").exists()
         || root.join("Bundlefile").exists()
-        || builder.languages.contains(&LanguageRequirement::Ruby)
+        || builder.languages.contains(&LanguageRequirement::Ruby))
+        && let Some(version) = detect_ruby_version(root, &tool_versions, &mise_tools)?
     {
-        if let Some(version) = detect_ruby_version(root, &tool_versions, &mise_tools)? {
-            detected.push(version);
-        }
+        detected.push(version);
     }
 
-    if root.join("pyproject.toml").exists()
+    if (root.join("pyproject.toml").exists()
         || root.join("requirements.txt").exists()
         || root.join("uv.lock").exists()
         || root.join("poetry.lock").exists()
-        || builder.languages.contains(&LanguageRequirement::Python)
+        || builder.languages.contains(&LanguageRequirement::Python))
+        && let Some(version) =
+            detect_python_version(root, &tool_versions, &mise_tools, context.pyproject())?
     {
-        if let Some(version) = detect_python_version(root, &tool_versions, &mise_tools)? {
-            detected.push(version);
-        }
+        detected.push(version);
     }
 
-    if root.join("go.mod").exists() || builder.languages.contains(&LanguageRequirement::Go) {
-        if let Some(version) = detect_go_version(root, &tool_versions, &mise_tools)? {
-            detected.push(version);
-        }
-    }
-
-    if root.join("Cargo.toml").exists() || builder.languages.contains(&LanguageRequirement::Rust) {
-        if let Some(version) = detect_rust_version(root, &tool_versions, &mise_tools)? {
-            detected.push(version);
-        }
-    }
-
-    if root.join("composer.json").exists() || builder.languages.contains(&LanguageRequirement::Php)
+    if (root.join("go.mod").exists() || builder.languages.contains(&LanguageRequirement::Go))
+        && let Some(version) = detect_go_version(root, &tool_versions, &mise_tools)?
     {
-        if let Some(version) = detect_php_version(root, &tool_versions, &mise_tools)? {
-            detected.push(version);
-        }
+        detected.push(version);
+    }
+
+    if (root.join("Cargo.toml").exists() || builder.languages.contains(&LanguageRequirement::Rust))
+        && let Some(version) = detect_rust_version(root, &tool_versions, &mise_tools)?
+    {
+        detected.push(version);
+    }
+
+    if (root.join("composer.json").exists()
+        || builder.languages.contains(&LanguageRequirement::Php))
+        && let Some(version) =
+            detect_php_version(root, &tool_versions, &mise_tools, context.composer_json())?
+    {
+        detected.push(version);
     }
 
     if root.join("mix.exs").exists() || builder.languages.contains(&LanguageRequirement::Elixir) {
@@ -786,15 +789,14 @@ fn detect_runtime_versions(root: &Path, builder: &Builder) -> Result<Vec<Detecte
         }
     }
 
-    if root.join("pom.xml").exists()
+    if (root.join("pom.xml").exists()
         || root.join("build.gradle").exists()
         || root.join("build.gradle.kts").exists()
         || root.join("gradlew").exists()
-        || builder.languages.contains(&LanguageRequirement::Java)
+        || builder.languages.contains(&LanguageRequirement::Java))
+        && let Some(version) = detect_java_version(root, &tool_versions, &mise_tools)?
     {
-        if let Some(version) = detect_java_version(root, &tool_versions, &mise_tools)? {
-            detected.push(version);
-        }
+        detected.push(version);
     }
 
     detected.sort_by_key(|entry| (entry.runtime, entry.source.clone()));
@@ -805,6 +807,7 @@ fn detect_nodejs_version(
     root: &Path,
     tool_versions: &BTreeMap<String, String>,
     mise_tools: &BTreeMap<String, String>,
+    package_json: Option<&serde_json::Value>,
 ) -> Result<Option<DetectedVersion>> {
     if let Some(version) = read_version_file(root.join(".node-version"))? {
         return Ok(Some(DetectedVersion {
@@ -843,28 +846,21 @@ fn detect_nodejs_version(
         }));
     }
 
-    let package_json = root.join("package.json");
-    if package_json.exists() {
-        let payload: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(&package_json)
-                .with_context(|| format!("failed to read {}", package_json.display()))?,
-        )
-        .with_context(|| format!("failed to parse {}", package_json.display()))?;
-        if let Some(version) = payload
+    if let Some(payload) = package_json
+        && let Some(version) = payload
             .get("engines")
             .and_then(|engines| engines.get("node"))
             .and_then(serde_json::Value::as_str)
             .map(clean_version_value)
             .filter(|value| !value.is_empty())
-        {
-            return Ok(Some(DetectedVersion {
-                runtime: RuntimeKind::Nodejs,
-                version,
-                source: "package.json#engines.node".to_string(),
-                kind: VersionKind::Constraint,
-                config_lines: Vec::new(),
-            }));
-        }
+    {
+        return Ok(Some(DetectedVersion {
+            runtime: RuntimeKind::Nodejs,
+            version,
+            source: "package.json#engines.node".to_string(),
+            kind: VersionKind::Constraint,
+            config_lines: Vec::new(),
+        }));
     }
 
     Ok(None)
@@ -929,6 +925,7 @@ fn detect_python_version(
     root: &Path,
     tool_versions: &BTreeMap<String, String>,
     mise_tools: &BTreeMap<String, String>,
+    pyproject: Option<&TomlValue>,
 ) -> Result<Option<DetectedVersion>> {
     if let Some(version) = read_version_file(root.join(".python-version"))? {
         return Ok(Some(simple_version_pin(
@@ -955,41 +952,34 @@ fn detect_python_version(
         )));
     }
     let runtime_txt = root.join("runtime.txt");
-    if runtime_txt.exists() {
-        if let Some(version) = read_version_file(&runtime_txt)?
+    if runtime_txt.exists()
+        && let Some(version) = read_version_file(&runtime_txt)?
             .map(|value| value.trim_start_matches("python-").to_string())
             .filter(|value| !value.is_empty())
-        {
-            return Ok(Some(simple_version_pin(
-                RuntimeKind::Python,
-                version,
-                "runtime.txt",
-                "languages.python.version",
-            )));
-        }
+    {
+        return Ok(Some(simple_version_pin(
+            RuntimeKind::Python,
+            version,
+            "runtime.txt",
+            "languages.python.version",
+        )));
     }
 
-    let pyproject = root.join("pyproject.toml");
-    if pyproject.exists() {
-        let contents = fs::read_to_string(&pyproject)
-            .with_context(|| format!("failed to read {}", pyproject.display()))?;
-        let value = toml::from_str::<TomlValue>(&contents)
-            .with_context(|| format!("failed to parse {}", pyproject.display()))?;
-        if let Some(version) = value
+    if let Some(value) = pyproject
+        && let Some(version) = value
             .get("project")
             .and_then(|project| project.get("requires-python"))
             .and_then(TomlValue::as_str)
             .map(clean_version_value)
             .filter(|value| !value.is_empty())
-        {
-            return Ok(Some(DetectedVersion {
-                runtime: RuntimeKind::Python,
-                version,
-                source: "pyproject.toml#project.requires-python".to_string(),
-                kind: VersionKind::Constraint,
-                config_lines: Vec::new(),
-            }));
-        }
+    {
+        return Ok(Some(DetectedVersion {
+            runtime: RuntimeKind::Python,
+            version,
+            source: "pyproject.toml#project.requires-python".to_string(),
+            kind: VersionKind::Constraint,
+            config_lines: Vec::new(),
+        }));
     }
 
     Ok(None)
@@ -1091,16 +1081,16 @@ fn detect_rust_version(
     }
 
     let toolchain = root.join("rust-toolchain");
-    if toolchain.exists() {
-        if let Some(channel) = read_version_file(&toolchain)?.filter(|value| !value.is_empty()) {
-            return Ok(Some(DetectedVersion {
-                runtime: RuntimeKind::Rust,
-                version: channel,
-                source: "rust-toolchain".to_string(),
-                kind: VersionKind::ToolchainFile,
-                config_lines: vec!["languages.rust.toolchainFile = ./rust-toolchain;".to_string()],
-            }));
-        }
+    if toolchain.exists()
+        && let Some(channel) = read_version_file(&toolchain)?.filter(|value| !value.is_empty())
+    {
+        return Ok(Some(DetectedVersion {
+            runtime: RuntimeKind::Rust,
+            version: channel,
+            source: "rust-toolchain".to_string(),
+            kind: VersionKind::ToolchainFile,
+            config_lines: vec!["languages.rust.toolchainFile = ./rust-toolchain;".to_string()],
+        }));
     }
 
     if let Some(version) = tool_version(tool_versions, &["rust"]) {
@@ -1152,6 +1142,7 @@ fn detect_php_version(
     root: &Path,
     tool_versions: &BTreeMap<String, String>,
     mise_tools: &BTreeMap<String, String>,
+    composer_json: Option<&serde_json::Value>,
 ) -> Result<Option<DetectedVersion>> {
     if let Some(version) = read_version_file(root.join(".php-version"))? {
         return Ok(Some(simple_version_pin(
@@ -1178,13 +1169,7 @@ fn detect_php_version(
         )));
     }
 
-    let composer = root.join("composer.json");
-    if composer.exists() {
-        let payload: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(&composer)
-                .with_context(|| format!("failed to read {}", composer.display()))?,
-        )
-        .with_context(|| format!("failed to parse {}", composer.display()))?;
+    if let Some(payload) = composer_json {
         if let Some(version) = payload
             .get("config")
             .and_then(|config| config.get("platform"))
@@ -1570,8 +1555,11 @@ fn discover_make_targets(path: &Path) -> Result<BTreeSet<String>> {
     Ok(targets)
 }
 
-fn detect_ruby_test_commands(root: &Path) -> Result<Vec<String>> {
-    let dependencies = registry::collect_ruby_dependencies(root)?;
+fn detect_ruby_test_commands(
+    root: &Path,
+    dependencies: Option<&BTreeSet<String>>,
+) -> Result<Vec<String>> {
+    let dependencies = dependencies.cloned().unwrap_or_else(BTreeSet::new);
     let has_rspec = dependencies.contains("rspec")
         || dependencies.contains("rspec-rails")
         || root.join(".rspec").exists()
@@ -1590,24 +1578,6 @@ fn detect_ruby_test_commands(root: &Path) -> Result<Vec<String>> {
     }
 
     Ok(Vec::new())
-}
-
-fn package_json_dependencies(payload: &serde_json::Value) -> BTreeSet<String> {
-    let mut dependencies = BTreeSet::new();
-    for field in [
-        "dependencies",
-        "devDependencies",
-        "optionalDependencies",
-        "peerDependencies",
-    ] {
-        let Some(entries) = payload.get(field).and_then(serde_json::Value::as_object) else {
-            continue;
-        };
-        for dependency in entries.keys() {
-            dependencies.insert(dependency.to_lowercase());
-        }
-    }
-    dependencies
 }
 
 fn fallback_javascript_test_commands(
@@ -1708,10 +1678,10 @@ fn build_sandbox_plan(root: &Path, builder: &Builder) -> Result<SandboxPlan> {
         }
     }
 
-    if let Ok(shell) = std::env::var("SHELL") {
-        if let Some(parent) = Path::new(&shell).parent() {
-            read_only_dirs.insert(parent.to_path_buf());
-        }
+    if let Ok(shell) = std::env::var("SHELL")
+        && let Some(parent) = Path::new(&shell).parent()
+    {
+        read_only_dirs.insert(parent.to_path_buf());
     }
 
     for key in [
@@ -1727,17 +1697,16 @@ fn build_sandbox_plan(root: &Path, builder: &Builder) -> Result<SandboxPlan> {
         }
     }
 
-    if let Ok(sock) = std::env::var("SSH_AUTH_SOCK") {
-        if let Some(parent) = Path::new(&sock).parent() {
-            read_write_dirs.insert(parent.to_path_buf());
-        }
+    if let Ok(sock) = std::env::var("SSH_AUTH_SOCK")
+        && let Some(parent) = Path::new(&sock).parent()
+    {
+        read_write_dirs.insert(parent.to_path_buf());
     }
-    if let Ok(address) = std::env::var("DBUS_SESSION_BUS_ADDRESS") {
-        if let Some(path) = address.strip_prefix("unix:path=") {
-            if let Some(parent) = Path::new(path).parent() {
-                read_write_dirs.insert(parent.to_path_buf());
-            }
-        }
+    if let Ok(address) = std::env::var("DBUS_SESSION_BUS_ADDRESS")
+        && let Some(path) = address.strip_prefix("unix:path=")
+        && let Some(parent) = Path::new(path).parent()
+    {
+        read_write_dirs.insert(parent.to_path_buf());
     }
 
     let read_write_files = read_write_files

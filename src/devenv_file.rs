@@ -80,8 +80,11 @@ pub fn ensure_devenv_yaml(root: &Path, analysis: &crate::analysis::Analysis) -> 
         YamlValue::Bool(true),
     );
 
-    fs::write(&path, serde_yaml::to_string(&payload)?)
-        .with_context(|| format!("failed to write {}", path.display()))?;
+    let rendered = serde_yaml::to_string(&payload)?;
+    if fs::read_to_string(&path).ok().as_deref() != Some(rendered.as_str()) {
+        fs::write(&path, rendered)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
     Ok(())
 }
 
@@ -489,10 +492,10 @@ fn format_with_nixfmt(source: &str) -> Option<String> {
         Err(_) => return None,
     };
 
-    if let Some(stdin) = child.stdin.as_mut() {
-        if stdin.write_all(source.as_bytes()).is_err() {
-            return None;
-        }
+    if let Some(stdin) = child.stdin.as_mut()
+        && stdin.write_all(source.as_bytes()).is_err()
+    {
+        return None;
     }
 
     let output = child.wait_with_output().ok()?;

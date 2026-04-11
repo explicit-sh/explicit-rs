@@ -20,6 +20,15 @@ use crate::analysis::Analysis;
 use crate::env_trace;
 use crate::runtime;
 
+pub struct ObservedAgentOptions<'a> {
+    pub agent: &'a str,
+    pub command: String,
+    pub agent_args: &'a [String],
+    pub block_network: bool,
+    pub no_services: bool,
+    pub dangerously_use_end_of_life_versions: bool,
+}
+
 pub fn list_runs(root: &Path) -> Result<()> {
     let mut runs = load_run_rows(root)?;
     runs.sort_by(|left, right| right.started_at_ms.cmp(&left.started_at_ms));
@@ -225,12 +234,14 @@ pub fn launch_live_agent(
     let status = runtime::launch_shell(
         root,
         analysis,
-        Some(command),
-        block_network,
-        no_services,
-        dangerously_use_end_of_life_versions,
-        None,
-        None,
+        runtime::LaunchShellOptions {
+            command: Some(&command),
+            block_network,
+            no_services,
+            dangerously_use_end_of_life_versions,
+            extra_env: None,
+            transcript_path: None,
+        },
     )?;
     server.finish(status);
     Ok(status)
@@ -239,27 +250,28 @@ pub fn launch_live_agent(
 pub fn launch_observed_agent(
     root: &Path,
     analysis: &Analysis,
-    agent: &str,
-    command: String,
-    agent_args: &[String],
-    block_network: bool,
-    no_services: bool,
-    dangerously_use_end_of_life_versions: bool,
+    options: ObservedAgentOptions<'_>,
 ) -> Result<ExitCode> {
-    let run = ObservationRun::create(root, analysis, agent, &command, agent_args)?;
+    let run = ObservationRun::create(
+        root,
+        analysis,
+        options.agent,
+        &options.command,
+        options.agent_args,
+    )?;
     let server = LiveRunServer::start(
         root,
         LiveRunSnapshot::new(
             root,
-            agent,
-            &command,
+            options.agent,
+            &options.command,
             true,
             Some(run.run_id.clone()),
             Some(run.db_path.clone()),
             Some(run.transcript_log_path.clone()),
         ),
     )?;
-    let session_snapshot = if agent == "codex" {
+    let session_snapshot = if options.agent == "codex" {
         snapshot_session_files(&codex_sessions_root()?)?
     } else {
         BTreeMap::new()
@@ -270,17 +282,19 @@ pub fn launch_observed_agent(
     let status = runtime::launch_shell(
         root,
         analysis,
-        Some(command),
-        block_network,
-        no_services,
-        dangerously_use_end_of_life_versions,
-        Some(&trace_env),
-        Some(&run.transcript_log_path),
+        runtime::LaunchShellOptions {
+            command: Some(&options.command),
+            block_network: options.block_network,
+            no_services: options.no_services,
+            dangerously_use_end_of_life_versions: options.dangerously_use_end_of_life_versions,
+            extra_env: Some(&trace_env),
+            transcript_path: Some(&run.transcript_log_path),
+        },
     )?;
     server.update(|snapshot| snapshot.state = "ingesting".to_string());
 
     let mut summary = ImportSummary::default();
-    if agent == "codex" {
+    if options.agent == "codex" {
         let changed_files = changed_session_files(&codex_sessions_root()?, &session_snapshot)?;
         summary.merge(ingest_codex_sessions(
             &run.db_path,
@@ -405,6 +419,26 @@ struct ImportSummary {
     env_access_count: usize,
     console_transcript_bytes: usize,
     latest_total_tokens: Option<i64>,
+}
+
+struct MessageInsert<'a> {
+    run_id: &'a str,
+    session_id: &'a str,
+    turn_id: Option<&'a str>,
+    role: &'a str,
+    phase: Option<&'a str>,
+    content: &'a str,
+    timestamp: &'a str,
+}
+
+struct FileTouchInsert<'a> {
+    run_id: &'a str,
+    session_id: &'a str,
+    turn_id: Option<&'a str>,
+    timestamp: &'a str,
+    path: &'a str,
+    op: &'a str,
+    source: &'a str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1505,32 +1539,36 @@ fn ingest_codex_event(
         "user_message" => {
             insert_message(
                 conn,
-                run_id,
-                session_id,
-                payload.get("turn_id").and_then(Value::as_str),
-                "user",
-                None,
-                payload
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
-                timestamp,
+                MessageInsert {
+                    run_id,
+                    session_id,
+                    turn_id: payload.get("turn_id").and_then(Value::as_str),
+                    role: "user",
+                    phase: None,
+                    content: payload
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    timestamp,
+                },
             )?;
             summary.message_count += 1;
         }
         "agent_message" => {
             insert_message(
                 conn,
-                run_id,
-                session_id,
-                payload.get("turn_id").and_then(Value::as_str),
-                "assistant",
-                payload.get("phase").and_then(Value::as_str),
-                payload
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
-                timestamp,
+                MessageInsert {
+                    run_id,
+                    session_id,
+                    turn_id: payload.get("turn_id").and_then(Value::as_str),
+                    role: "assistant",
+                    phase: payload.get("phase").and_then(Value::as_str),
+                    content: payload
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    timestamp,
+                },
             )?;
             summary.message_count += 1;
         }
@@ -1560,16 +1598,7 @@ fn ingest_codex_event(
     Ok(())
 }
 
-fn insert_message(
-    conn: &Connection,
-    run_id: &str,
-    session_id: &str,
-    turn_id: Option<&str>,
-    role: &str,
-    phase: Option<&str>,
-    content: &str,
-    timestamp: &str,
-) -> Result<()> {
+fn insert_message(conn: &Connection, row: MessageInsert<'_>) -> Result<()> {
     conn.execute(
         "insert into messages (
             run_id,
@@ -1580,7 +1609,15 @@ fn insert_message(
             content,
             created_at
         ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![run_id, session_id, turn_id, role, phase, content, timestamp],
+        params![
+            row.run_id,
+            row.session_id,
+            row.turn_id,
+            row.role,
+            row.phase,
+            row.content,
+            row.timestamp
+        ],
     )
     .context("failed to insert message")?;
     Ok(())
@@ -1799,13 +1836,15 @@ fn insert_exec_file_touches(
     for (path, op) in touches {
         insert_file_touch(
             conn,
-            run_id,
-            session_id,
-            payload.get("turn_id").and_then(Value::as_str),
-            timestamp,
-            &path,
-            &op,
-            "exec_command",
+            FileTouchInsert {
+                run_id,
+                session_id,
+                turn_id: payload.get("turn_id").and_then(Value::as_str),
+                timestamp,
+                path: &path,
+                op: &op,
+                source: "exec_command",
+            },
         )?;
         summary.file_touch_count += 1;
     }
@@ -1831,29 +1870,22 @@ fn insert_patch_file_touches(
             .unwrap_or("patch");
         insert_file_touch(
             conn,
-            run_id,
-            session_id,
-            payload.get("turn_id").and_then(Value::as_str),
-            timestamp,
-            path,
-            op,
-            "patch_apply",
+            FileTouchInsert {
+                run_id,
+                session_id,
+                turn_id: payload.get("turn_id").and_then(Value::as_str),
+                timestamp,
+                path,
+                op,
+                source: "patch_apply",
+            },
         )?;
         summary.file_touch_count += 1;
     }
     Ok(())
 }
 
-fn insert_file_touch(
-    conn: &Connection,
-    run_id: &str,
-    session_id: &str,
-    turn_id: Option<&str>,
-    timestamp: &str,
-    path: &str,
-    op: &str,
-    source: &str,
-) -> Result<()> {
+fn insert_file_touch(conn: &Connection, row: FileTouchInsert<'_>) -> Result<()> {
     conn.execute(
         "insert into file_touches (
             run_id,
@@ -1864,7 +1896,15 @@ fn insert_file_touch(
             op,
             source
         ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![run_id, session_id, turn_id, timestamp, path, op, source],
+        params![
+            row.run_id,
+            row.session_id,
+            row.turn_id,
+            row.timestamp,
+            row.path,
+            row.op,
+            row.source
+        ],
     )
     .context("failed to insert file touch")?;
     Ok(())
@@ -1934,7 +1974,6 @@ mod tests {
         prepare_socket_path, sanitize_transcript_preview, snapshot_session_files, socket_path,
         unique_run_id,
     };
-    use crate::env_trace;
     use rusqlite::Connection;
     use serde_json::json;
     use std::{fs, path::Path, process::ExitCode};

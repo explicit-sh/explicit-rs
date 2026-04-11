@@ -1,5 +1,7 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
@@ -10,6 +12,9 @@ use crate::analysis::DetectedVersion;
 
 const EOL_DB_TOML: &str = include_str!("../eol_db.toml");
 const REMOTE_CACHE_TTL: Duration = Duration::from_secs(60 * 60 * 24);
+static EMBEDDED_DB: OnceLock<EolDatabase> = OnceLock::new();
+static HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
+static REMOTE_PRODUCTS: OnceLock<Mutex<BTreeMap<String, ProductSnapshot>>> = OnceLock::new();
 
 #[derive(Debug, Deserialize)]
 struct EolDatabase {
@@ -75,12 +80,35 @@ pub fn ensure_supported_runtime_versions(
     allow_end_of_life: bool,
 ) -> Result<()> {
     let mut failures = Vec::new();
+    let mut skipped = Vec::new();
     for version in versions {
+        if version.runtime.eol_product_slug().is_empty() {
+            skipped.push(format!(
+                "{} {} from {} was not checked because this runtime does not have lifecycle mapping support yet.",
+                version.runtime.display_name(),
+                version.version,
+                version.source
+            ));
+            continue;
+        }
         let Some(status) = resolve_status(version)? else {
+            skipped.push(format!(
+                "{} {} from {} was not checked because no end-of-life entry matched its release cycle.",
+                version.runtime.display_name(),
+                version.version,
+                version.source
+            ));
             continue;
         };
         if status.is_eol {
             failures.push(format_failure(version, &status));
+        }
+    }
+
+    if !skipped.is_empty() {
+        eprintln!("Lifecycle checks skipped:");
+        for item in &skipped {
+            eprintln!("  - {item}");
         }
     }
 
@@ -133,7 +161,7 @@ fn resolve_status(version: &DetectedVersion) -> Result<Option<ResolvedStatus>> {
         return Ok(None);
     };
 
-    let db = parse_embedded_db()?;
+    let db = parse_embedded_db();
     if let Some(status) =
         find_cycle(&db.products, slug, &cycle).map(|cycle_snapshot| ResolvedStatus {
             label: product_label(&db.products, slug)
@@ -163,8 +191,10 @@ fn resolve_status(version: &DetectedVersion) -> Result<Option<ResolvedStatus>> {
     )
 }
 
-fn parse_embedded_db() -> Result<EolDatabase> {
-    toml::from_str(EOL_DB_TOML).context("failed to parse embedded end-of-life database")
+fn parse_embedded_db() -> &'static EolDatabase {
+    EMBEDDED_DB.get_or_init(|| {
+        toml::from_str(EOL_DB_TOML).expect("embedded end-of-life database must parse")
+    })
 }
 
 fn find_cycle<'a>(
@@ -186,16 +216,25 @@ fn product_label(products: &[ProductSnapshot], slug: &str) -> Option<String> {
 }
 
 fn fetch_remote_product(slug: &str) -> Result<ProductSnapshot> {
+    if let Some(snapshot) = remote_product_cache()
+        .lock()
+        .expect("remote product cache mutex poisoned")
+        .get(slug)
+        .cloned()
+    {
+        return Ok(snapshot);
+    }
+
     if let Some(cached) = read_cached_product(slug)? {
+        remote_product_cache()
+            .lock()
+            .expect("remote product cache mutex poisoned")
+            .insert(slug.to_string(), cached.clone());
         return Ok(cached);
     }
 
     let url = format!("https://endoflife.date/api/v1/products/{slug}/");
-    let client = Client::builder()
-        .timeout(Duration::from_secs(3))
-        .build()
-        .context("failed to build endoflife.date client")?;
-    let response = client
+    let response = eol_client()
         .get(&url)
         .send()
         .with_context(|| format!("failed to query {url}"))?
@@ -221,6 +260,10 @@ fn fetch_remote_product(slug: &str) -> Result<ProductSnapshot> {
             .collect(),
     };
     write_cached_product(slug, &snapshot)?;
+    remote_product_cache()
+        .lock()
+        .expect("remote product cache mutex poisoned")
+        .insert(slug.to_string(), snapshot.clone());
     Ok(snapshot)
 }
 
@@ -265,6 +308,19 @@ fn cache_is_stale(path: &Path) -> Result<bool> {
     Ok(age > REMOTE_CACHE_TTL)
 }
 
+fn eol_client() -> &'static Client {
+    HTTP_CLIENT.get_or_init(|| {
+        Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .expect("endoflife.date client must build")
+    })
+}
+
+fn remote_product_cache() -> &'static Mutex<BTreeMap<String, ProductSnapshot>> {
+    REMOTE_PRODUCTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ApiDocument, EOL_DB_TOML, ensure_supported_runtime_versions, parse_embedded_db};
@@ -272,7 +328,7 @@ mod tests {
 
     #[test]
     fn embedded_database_loads() {
-        let db = parse_embedded_db().unwrap();
+        let db = parse_embedded_db();
         assert!(db.products.iter().any(|product| product.slug == "nodejs"));
     }
 

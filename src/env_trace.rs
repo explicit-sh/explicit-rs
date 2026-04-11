@@ -9,10 +9,10 @@ use std::path::PathBuf;
 #[cfg(any(target_os = "linux", test))]
 use anyhow::{Context, bail};
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 const TRACE_LOG_ENV: &str = "EXPLICIT_ENV_TRACE_LOG";
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 pub fn trace_log_env_key() -> &'static str {
     TRACE_LOG_ENV
 }
@@ -40,7 +40,7 @@ pub fn build_injection_env(log_path: &Path) -> Result<BTreeMap<String, String>> 
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 pub fn trace_library_path() -> Result<PathBuf> {
     let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
     trace_library_path_from_exe(&current_exe)
@@ -73,7 +73,7 @@ fn trace_library_path_from_exe(current_exe: &Path) -> Result<PathBuf> {
         if candidate.is_file() {
             return candidate
                 .canonicalize()
-                .or_else(|_| Ok::<PathBuf, std::io::Error>(candidate))
+                .or(Ok::<PathBuf, std::io::Error>(candidate))
                 .context("failed to canonicalize trace library path");
         }
     }

@@ -19,10 +19,20 @@ use crate::eol;
 use crate::hooks::write_stop_hook_assets;
 use crate::host_tools::host_command_paths;
 
+#[derive(Debug, Clone, Default)]
+pub struct LaunchShellOptions<'a> {
+    pub command: Option<&'a str>,
+    pub block_network: bool,
+    pub no_services: bool,
+    pub dangerously_use_end_of_life_versions: bool,
+    pub extra_env: Option<&'a BTreeMap<String, String>>,
+    pub transcript_path: Option<&'a Path>,
+}
+
 pub fn apply_project(root: &Path, analysis: &Analysis) -> Result<()> {
     ensure_devenv_file(root)?;
     ensure_devenv_yaml(root, analysis)?;
-    fs::write(
+    write_if_changed(
         root.join(GENERATED_DEPS_FILE),
         render_generated_nix(analysis),
     )
@@ -33,18 +43,27 @@ pub fn apply_project(root: &Path, analysis: &Analysis) -> Result<()> {
             .with_context(|| format!("failed to remove {}", legacy_generated.display()))?;
     }
     fs::create_dir_all(root.join(".nono")).context("failed to create .nono directory")?;
-    fs::write(
+    write_if_changed(
         root.join(".nono/analysis.json"),
         serde_json::to_string_pretty(analysis)?,
     )
     .context("failed to write .nono/analysis.json")?;
-    fs::write(
+    write_if_changed(
         root.join(".nono/sandbox-plan.json"),
         serde_json::to_string_pretty(&analysis.sandbox_plan)?,
     )
     .context("failed to write .nono/sandbox-plan.json")?;
     write_stop_hook_assets(root, analysis)?;
     Ok(())
+}
+
+fn write_if_changed(path: impl AsRef<Path>, content: impl AsRef<[u8]>) -> Result<()> {
+    let path = path.as_ref();
+    let content = content.as_ref();
+    if fs::read(path).ok().as_deref() == Some(content) {
+        return Ok(());
+    }
+    fs::write(path, content).with_context(|| format!("failed to write {}", path.display()))
 }
 
 pub fn print_doctor(analysis: &Analysis) -> Result<()> {
@@ -151,27 +170,22 @@ pub fn print_doctor(analysis: &Analysis) -> Result<()> {
 pub fn launch_shell(
     root: &Path,
     analysis: &Analysis,
-    command: Option<String>,
-    block_network: bool,
-    no_services: bool,
-    dangerously_use_end_of_life_versions: bool,
-    extra_env: Option<&BTreeMap<String, String>>,
-    transcript_path: Option<&Path>,
+    options: LaunchShellOptions<'_>,
 ) -> Result<ExitCode> {
     print_version_summary(analysis);
     eol::ensure_supported_runtime_versions(
         &analysis.detected_versions,
-        dangerously_use_end_of_life_versions,
+        options.dangerously_use_end_of_life_versions,
     )?;
     apply_project(root, analysis)?;
-    let total_steps = if !no_services && !analysis.services.is_empty() {
+    let total_steps = if !options.no_services && !analysis.services.is_empty() {
         3
     } else {
         2
     };
 
     let mut env_map = capture_devenv_env(root, 1, total_steps)?;
-    if !no_services && !analysis.services.is_empty() {
+    if !options.no_services && !analysis.services.is_empty() {
         run_devenv_up(root, 2, total_steps)?;
     }
 
@@ -181,21 +195,21 @@ pub fn launch_shell(
     let plan_file = runtime_dir.join("shell-plan.json");
 
     let mut plan = analysis.sandbox_plan.clone();
-    if block_network {
+    if options.block_network {
         plan.notes
             .push("network access blocked for this shell invocation".to_string());
     }
 
-    if let Some(extra_env) = extra_env {
+    if let Some(extra_env) = options.extra_env {
         env_map.extend(extra_env.clone());
     }
 
-    fs::write(&env_file, serde_json::to_string_pretty(&env_map)?)
+    write_if_changed(&env_file, serde_json::to_string_pretty(&env_map)?)
         .context("failed to write shell env file")?;
-    fs::write(&plan_file, serde_json::to_string_pretty(&plan)?)
+    write_if_changed(&plan_file, serde_json::to_string_pretty(&plan)?)
         .context("failed to write shell plan file")?;
 
-    let launch_step = if !no_services && !analysis.services.is_empty() {
+    let launch_step = if !options.no_services && !analysis.services.is_empty() {
         3
     } else {
         2
@@ -208,10 +222,10 @@ pub fn launch_shell(
         root,
         &env_file,
         &plan_file,
-        command.as_deref(),
-        transcript_path,
+        options.command,
+        options.transcript_path,
     );
-    if block_network {
+    if options.block_network {
         child.env("DEVENV_NONO_BLOCK_NETWORK", "1");
     } else {
         child.env_remove("DEVENV_NONO_BLOCK_NETWORK");
