@@ -17,8 +17,8 @@ Given a project directory, `explicit`:
 - scans common project markers such as `package.json`, `Cargo.toml`, `go.mod`, `mix.exs`, `Gemfile`, `composer.json`, `pyproject.toml`, `requirements.txt`, `Makefile`, Gradle files, Maven files, and Compose files
 - detects likely languages, packages, lint commands, build commands, and local services
 - detects likely test commands and common test frameworks
-- ensures [devenv.nix](/Users/onnimonni/Projects/devenv-nono-llm/devenv.nix) imports [devenv.generated.nix](/Users/onnimonni/Projects/devenv-nono-llm/devenv.generated.nix)
-- regenerates [devenv.generated.nix](/Users/onnimonni/Projects/devenv-nono-llm/devenv.generated.nix) from the detected requirements
+- ensures [devenv.nix](/Users/onnimonni/Projects/devenv-nono-llm/devenv.nix) imports [explicit.generated.deps.nix](/Users/onnimonni/Projects/devenv-nono-llm/explicit.generated.deps.nix)
+- regenerates [explicit.generated.deps.nix](/Users/onnimonni/Projects/devenv-nono-llm/explicit.generated.deps.nix) from the detected requirements
 - writes analysis output to `.nono/analysis.json` and `.nono/sandbox-plan.json`
 - writes a shared stop hook used by Claude and Codex
 - installs a managed `pre-push` git hook when the project is a git repo
@@ -56,7 +56,7 @@ explicit claude
 What each command does:
 
 - `scan`: prints the detected requirements as JSON
-- `apply`: updates `devenv.nix` wiring, rewrites `devenv.generated.nix`, and refreshes `.nono/` metadata and hooks
+- `apply`: updates `devenv.nix` wiring, rewrites `explicit.generated.deps.nix`, and refreshes `.nono/` metadata and hooks
 - `doctor`: prints a readable summary of what was detected
 - `verify`: runs the detected lint, build, and test commands with short failure summaries
 - `shell`: realizes the `devenv` environment and launches a sandboxed shell for agents or manual use
@@ -224,7 +224,7 @@ If no concrete lint, build, or test command is detected, the hook remains adviso
 
 Files managed by the tool:
 
-- [devenv.generated.nix](/Users/onnimonni/Projects/devenv-nono-llm/devenv.generated.nix): generated language, package, and service settings
+- [explicit.generated.deps.nix](/Users/onnimonni/Projects/devenv-nono-llm/explicit.generated.deps.nix): generated language, package, and service settings
 - `.explicit-observe.sock`: live per-project run socket while an agent is active
 - `.nono/analysis.json`: raw scan result
 - `.nono/sandbox-plan.json`: resolved sandbox permissions

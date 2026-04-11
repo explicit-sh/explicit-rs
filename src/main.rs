@@ -185,7 +185,7 @@ fn run() -> Result<ExitCode> {
                     "managed_files": [
                         "devenv.nix",
                         "devenv.yaml",
-                        "devenv.generated.nix",
+                        "explicit.generated.deps.nix",
                         ".nono/analysis.json",
                         ".nono/sandbox-plan.json"
                     ]

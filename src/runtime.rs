@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::analysis::{Analysis, SandboxPlan};
-use crate::devenv_file::{ensure_devenv_file, ensure_devenv_yaml, render_generated_nix};
+use crate::devenv_file::{
+    GENERATED_DEPS_FILE, ensure_devenv_file, ensure_devenv_yaml, render_generated_nix,
+};
 use crate::hooks::write_stop_hook_assets;
 use crate::host_tools::host_command_paths;
 
@@ -20,10 +22,15 @@ pub fn apply_project(root: &Path, analysis: &Analysis) -> Result<()> {
     ensure_devenv_file(root)?;
     ensure_devenv_yaml(root, analysis)?;
     fs::write(
-        root.join("devenv.generated.nix"),
+        root.join(GENERATED_DEPS_FILE),
         render_generated_nix(analysis),
     )
-    .context("failed to write devenv.generated.nix")?;
+    .with_context(|| format!("failed to write {GENERATED_DEPS_FILE}"))?;
+    let legacy_generated = root.join("devenv.generated.nix");
+    if legacy_generated.exists() {
+        fs::remove_file(&legacy_generated)
+            .with_context(|| format!("failed to remove {}", legacy_generated.display()))?;
+    }
     fs::create_dir_all(root.join(".nono")).context("failed to create .nono directory")?;
     fs::write(
         root.join(".nono/analysis.json"),

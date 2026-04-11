@@ -1,7 +1,7 @@
 { pkgs, lib, ... }:
 
 {
-  imports = [ ./devenv.generated.nix ];
+  imports = [ ./explicit.generated.deps.nix ];
 
   packages = [
     pkgs.git

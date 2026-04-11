@@ -68,7 +68,7 @@ fn apply_detects_node_make_and_generates_hooks() {
 
     run_tool(root);
 
-    let generated = fs::read_to_string(root.join("devenv.generated.nix")).unwrap();
+    let generated = fs::read_to_string(root.join("explicit.generated.deps.nix")).unwrap();
     assert!(generated.contains("languages.javascript.enable = true;"));
     assert!(generated.contains("pkgs.nodejs"));
     assert!(generated.contains("pkgs.pnpm"));
@@ -240,7 +240,7 @@ DEPENDENCIES
 
     run_tool(root);
 
-    let generated = fs::read_to_string(root.join("devenv.generated.nix")).unwrap();
+    let generated = fs::read_to_string(root.join("explicit.generated.deps.nix")).unwrap();
     assert!(generated.contains("languages.ruby.enable = true;"));
     assert!(generated.contains("pkgs.bundler"));
     assert!(generated.contains("pkgs.pkg-config"));
@@ -280,7 +280,7 @@ dependencies = [
 
     run_tool(root);
 
-    let generated = fs::read_to_string(root.join("devenv.generated.nix")).unwrap();
+    let generated = fs::read_to_string(root.join("explicit.generated.deps.nix")).unwrap();
     assert!(generated.contains("languages.python.enable = true;"));
     assert!(generated.contains("languages.rust.enable = true;"));
     assert!(generated.contains("pkgs.python3"));
@@ -333,7 +333,7 @@ fn apply_detects_nextjs_native_dependencies_and_services() {
 
     run_tool(root);
 
-    let generated = fs::read_to_string(root.join("devenv.generated.nix")).unwrap();
+    let generated = fs::read_to_string(root.join("explicit.generated.deps.nix")).unwrap();
     assert!(generated.contains("languages.javascript.enable = true;"));
     assert!(generated.contains("pkgs.nodejs"));
     assert!(generated.contains("pkgs.pnpm"));
@@ -380,7 +380,7 @@ fn apply_detects_react_native_project_requirements() {
 
     run_tool(root);
 
-    let generated = fs::read_to_string(root.join("devenv.generated.nix")).unwrap();
+    let generated = fs::read_to_string(root.join("explicit.generated.deps.nix")).unwrap();
     assert!(generated.contains("languages.javascript.enable = true;"));
     assert!(generated.contains("languages.java.enable = true;"));
     assert!(generated.contains("pkgs.nodejs"));
@@ -457,9 +457,10 @@ end
 
     run_tool(root);
 
-    let generated = fs::read_to_string(root.join("devenv.generated.nix")).unwrap();
+    let generated = fs::read_to_string(root.join("explicit.generated.deps.nix")).unwrap();
     assert!(generated.contains("languages.elixir.enable = true;"));
     assert!(generated.contains("languages.rust.enable = true;"));
+    assert!(generated.contains("Enabling Rust because Rustler-backed NIFs need a Rust toolchain."));
     assert!(generated.contains("pkgs.postgresql"));
     assert!(generated.contains("services.postgres.enable = true;"));
     assert!(generated.contains("services.redis.enable = true;"));
