@@ -363,6 +363,7 @@ mod tests {
             markers: Vec::new(),
             manifests: Vec::new(),
             detected_languages: Vec::new(),
+            detected_versions: Vec::new(),
             language_hints: Vec::new(),
             packages: Vec::new(),
             services: Vec::new(),

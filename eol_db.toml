@@ -1,0 +1,389 @@
+generated_at = "2026-04-11"
+
+[[products]]
+slug = "nodejs"
+label = "Node.js"
+
+[[products.cycles]]
+name = "25"
+is_eol = false
+is_maintained = true
+eol_from = "2026-06-01"
+latest = "25.9.0"
+
+[[products.cycles]]
+name = "24"
+is_eol = false
+is_maintained = true
+eol_from = "2028-04-30"
+latest = "24.14.1"
+
+[[products.cycles]]
+name = "23"
+is_eol = true
+is_maintained = false
+eol_from = "2025-06-01"
+latest = "23.11.1"
+
+[[products.cycles]]
+name = "22"
+is_eol = false
+is_maintained = true
+eol_from = "2027-04-30"
+latest = "22.22.2"
+
+[[products.cycles]]
+name = "21"
+is_eol = true
+is_maintained = false
+eol_from = "2024-06-01"
+latest = "21.7.3"
+
+[[products.cycles]]
+name = "20"
+is_eol = false
+is_maintained = true
+eol_from = "2026-04-30"
+latest = "20.20.2"
+
+[[products.cycles]]
+name = "18"
+is_eol = true
+is_maintained = true
+eol_from = "2025-04-30"
+latest = "18.20.8"
+
+[[products.cycles]]
+name = "16"
+is_eol = true
+is_maintained = true
+eol_from = "2023-09-11"
+latest = "16.20.2"
+
+[[products]]
+slug = "python"
+label = "Python"
+
+[[products.cycles]]
+name = "3.14"
+is_eol = false
+is_maintained = true
+eol_from = "2030-10-31"
+latest = "3.14.4"
+
+[[products.cycles]]
+name = "3.13"
+is_eol = false
+is_maintained = true
+eol_from = "2029-10-31"
+latest = "3.13.13"
+
+[[products.cycles]]
+name = "3.12"
+is_eol = false
+is_maintained = true
+eol_from = "2028-10-31"
+latest = "3.12.13"
+
+[[products.cycles]]
+name = "3.11"
+is_eol = false
+is_maintained = true
+eol_from = "2027-10-31"
+latest = "3.11.15"
+
+[[products.cycles]]
+name = "3.10"
+is_eol = false
+is_maintained = true
+eol_from = "2026-10-31"
+latest = "3.10.20"
+
+[[products.cycles]]
+name = "3.9"
+is_eol = true
+is_maintained = false
+eol_from = "2025-10-31"
+latest = "3.9.25"
+
+[[products.cycles]]
+name = "3.8"
+is_eol = true
+is_maintained = false
+eol_from = "2024-10-07"
+latest = "3.8.20"
+
+[[products.cycles]]
+name = "3.7"
+is_eol = true
+is_maintained = false
+eol_from = "2023-06-27"
+latest = "3.7.17"
+
+[[products]]
+slug = "ruby"
+label = "Ruby"
+
+[[products.cycles]]
+name = "4.0"
+is_eol = false
+is_maintained = true
+eol_from = "2029-03-31"
+latest = "4.0.2"
+
+[[products.cycles]]
+name = "3.4"
+is_eol = false
+is_maintained = true
+eol_from = "2028-03-31"
+latest = "3.4.9"
+
+[[products.cycles]]
+name = "3.3"
+is_eol = false
+is_maintained = true
+eol_from = "2027-03-31"
+latest = "3.3.11"
+
+[[products.cycles]]
+name = "3.2"
+is_eol = true
+is_maintained = false
+eol_from = "2026-03-31"
+latest = "3.2.11"
+
+[[products.cycles]]
+name = "3.1"
+is_eol = true
+is_maintained = false
+eol_from = "2025-03-31"
+latest = "3.1.7"
+
+[[products.cycles]]
+name = "3.0"
+is_eol = true
+is_maintained = false
+eol_from = "2024-04-23"
+latest = "3.0.7"
+
+[[products.cycles]]
+name = "2.7"
+is_eol = true
+is_maintained = false
+eol_from = "2023-03-31"
+latest = "2.7.8"
+
+[[products]]
+slug = "go"
+label = "Go"
+
+[[products.cycles]]
+name = "1.26"
+is_eol = false
+is_maintained = true
+latest = "1.26.2"
+
+[[products.cycles]]
+name = "1.25"
+is_eol = false
+is_maintained = true
+latest = "1.25.9"
+
+[[products.cycles]]
+name = "1.24"
+is_eol = true
+is_maintained = false
+eol_from = "2026-02-11"
+latest = "1.24.13"
+
+[[products.cycles]]
+name = "1.23"
+is_eol = true
+is_maintained = false
+eol_from = "2025-08-12"
+latest = "1.23.12"
+
+[[products.cycles]]
+name = "1.22"
+is_eol = true
+is_maintained = false
+eol_from = "2025-02-11"
+latest = "1.22.12"
+
+[[products.cycles]]
+name = "1.21"
+is_eol = true
+is_maintained = false
+eol_from = "2024-08-13"
+latest = "1.21.13"
+
+[[products]]
+slug = "rust"
+label = "Rust"
+
+[[products.cycles]]
+name = "1.94"
+is_eol = false
+is_maintained = true
+latest = "1.94.1"
+
+[[products.cycles]]
+name = "1.93"
+is_eol = true
+is_maintained = false
+eol_from = "2026-03-06"
+latest = "1.93.1"
+
+[[products.cycles]]
+name = "1.92"
+is_eol = true
+is_maintained = false
+eol_from = "2026-01-22"
+latest = "1.92.0"
+
+[[products.cycles]]
+name = "1.91"
+is_eol = true
+is_maintained = false
+eol_from = "2025-12-11"
+latest = "1.91.1"
+
+[[products.cycles]]
+name = "1.90"
+is_eol = true
+is_maintained = false
+eol_from = "2025-10-30"
+latest = "1.90.0"
+
+[[products.cycles]]
+name = "1.89"
+is_eol = true
+is_maintained = false
+eol_from = "2025-09-18"
+latest = "1.89.0"
+
+[[products]]
+slug = "php"
+label = "PHP"
+
+[[products.cycles]]
+name = "8.5"
+is_eol = false
+is_maintained = true
+eol_from = "2029-12-31"
+latest = "8.5.5"
+
+[[products.cycles]]
+name = "8.4"
+is_eol = false
+is_maintained = true
+eol_from = "2028-12-31"
+latest = "8.4.20"
+
+[[products.cycles]]
+name = "8.3"
+is_eol = false
+is_maintained = true
+eol_from = "2027-12-31"
+latest = "8.3.30"
+
+[[products.cycles]]
+name = "8.2"
+is_eol = false
+is_maintained = true
+eol_from = "2026-12-31"
+latest = "8.2.30"
+
+[[products.cycles]]
+name = "8.1"
+is_eol = true
+is_maintained = false
+eol_from = "2025-12-31"
+latest = "8.1.34"
+
+[[products.cycles]]
+name = "8.0"
+is_eol = true
+is_maintained = false
+eol_from = "2023-11-26"
+latest = "8.0.30"
+
+[[products]]
+slug = "elixir"
+label = "Elixir"
+
+[[products.cycles]]
+name = "1.19"
+is_eol = false
+is_maintained = true
+latest = "1.19.5"
+
+[[products.cycles]]
+name = "1.18"
+is_eol = false
+is_maintained = true
+latest = "1.18.4"
+
+[[products.cycles]]
+name = "1.17"
+is_eol = false
+is_maintained = true
+latest = "1.17.3"
+
+[[products.cycles]]
+name = "1.16"
+is_eol = false
+is_maintained = true
+latest = "1.16.3"
+
+[[products.cycles]]
+name = "1.15"
+is_eol = false
+is_maintained = true
+latest = "1.15.8"
+
+[[products.cycles]]
+name = "1.14"
+is_eol = true
+is_maintained = false
+eol_from = "2025-10-16"
+latest = "1.14.5"
+
+[[products]]
+slug = "erlang"
+label = "Erlang/OTP"
+
+[[products.cycles]]
+name = "28"
+is_eol = false
+is_maintained = true
+eol_from = "2028-05-20"
+latest = "28.4.2"
+
+[[products.cycles]]
+name = "27"
+is_eol = false
+is_maintained = true
+eol_from = "2027-05-20"
+latest = "27.3.4.10"
+
+[[products.cycles]]
+name = "26"
+is_eol = false
+is_maintained = true
+eol_from = "2026-05-15"
+latest = "26.2.5.19"
+
+[[products.cycles]]
+name = "25"
+is_eol = true
+is_maintained = false
+eol_from = "2025-05-17"
+latest = "25.3.2.21"
+
+[[products.cycles]]
+name = "24"
+is_eol = true
+is_maintained = false
+eol_from = "2024-05-10"
+latest = "24.3.4.17"

@@ -8,7 +8,9 @@ use rnix::Root;
 use rnix::ast::{self, HasEntry};
 use serde_yaml::{Mapping as YamlMapping, Value as YamlValue};
 
-use crate::analysis::{Analysis, LanguageRequirement, ServiceRequirement};
+use crate::analysis::{
+    Analysis, DetectedVersion, LanguageRequirement, RuntimeKind, ServiceRequirement, VersionKind,
+};
 
 pub const GENERATED_DEPS_FILE: &str = "explicit.generated.deps.nix";
 const MANAGED_IMPORT: &str = "./explicit.generated.deps.nix";
@@ -232,6 +234,12 @@ pub fn render_generated_nix(analysis: &Analysis) -> String {
         lines.push(format!("  # {}", reason_for_language(analysis, *language)));
         lines.push(format!("  {}", language.devenv_option()));
     }
+    for version in &analysis.detected_versions {
+        for config_line in &version.config_lines {
+            lines.push(format!("  # {}", reason_for_version_pin(version)));
+            lines.push(format!("  {config_line}"));
+        }
+    }
     for service in &analysis.services {
         lines.push(format!("  # {}", reason_for_service(analysis, *service)));
         lines.push(format!("  {}", service.devenv_option()));
@@ -336,6 +344,42 @@ fn reason_for_nix_option(analysis: &Analysis, option: &str) -> String {
     }
 
     "Enabled because the detected project requires this devenv option.".to_string()
+}
+
+fn reason_for_version_pin(version: &DetectedVersion) -> String {
+    let source = &version.source;
+    let label = version.runtime.display_name();
+    match version.runtime {
+        RuntimeKind::Nodejs => format!(
+            "Pinning Node.js from {source} so the JavaScript runtime matches the project version {}.",
+            version.version
+        ),
+        RuntimeKind::Java => format!(
+            "Selecting the JDK from {source} so Java tooling matches the project version {}.",
+            version.version
+        ),
+        RuntimeKind::Ruby => {
+            if source == ".ruby-version" {
+                "Respecting .ruby-version so devenv uses the same Ruby version as the project."
+                    .to_string()
+            } else {
+                format!("Pinning Ruby from {source} to {}.", version.version)
+            }
+        }
+        RuntimeKind::Rust => {
+            if version.kind == VersionKind::ToolchainFile {
+                format!(
+                    "Respecting {source} so Rust uses the project's declared toolchain configuration."
+                )
+            } else {
+                format!("Pinning Rust from {source} to {}.", version.version)
+            }
+        }
+        _ => format!(
+            "Pinning {label} from {source} so devenv matches the project version {}.",
+            version.version
+        ),
+    }
 }
 
 fn first_matching_note(analysis: &Analysis, aliases: &[String]) -> Option<String> {
@@ -508,6 +552,7 @@ mod tests {
             markers: vec!["mix.exs".to_string()],
             manifests: Vec::new(),
             detected_languages: vec![LanguageRequirement::Elixir, LanguageRequirement::Rust],
+            detected_versions: Vec::new(),
             language_hints: Vec::new(),
             packages: vec!["git".to_string(), "postgresql".to_string()],
             services: vec![ServiceRequirement::Postgres],

@@ -17,6 +17,7 @@ nono = "0.31.0"
 onefetch = "2.27.1"
 onefetch-manifest = "2.27.1"
 regex = "1.12.2"
+reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 rnix = "0.14.0"
 rusqlite = { version = "0.37.0", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }

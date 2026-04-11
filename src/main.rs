@@ -1,6 +1,7 @@
 mod analysis;
 mod devenv_file;
 mod env_trace;
+mod eol;
 mod hooks;
 mod host_tools;
 mod observe;
@@ -74,6 +75,8 @@ struct ShellArgs {
     block_network: bool,
     #[arg(long, action = ArgAction::SetTrue)]
     no_services: bool,
+    #[arg(long, action = ArgAction::SetTrue)]
+    dangerously_use_end_of_life_versions: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -88,6 +91,8 @@ struct VerifyArgs {
 
 #[derive(Args, Debug, Clone)]
 struct AgentArgs {
+    #[arg(long, action = ArgAction::SetTrue)]
+    dangerously_use_end_of_life_versions: bool,
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     args: Vec<String>,
 }
@@ -128,6 +133,8 @@ struct ObserveAgentArgs {
     block_network: bool,
     #[arg(long, action = ArgAction::SetTrue)]
     no_services: bool,
+    #[arg(long, action = ArgAction::SetTrue)]
+    dangerously_use_end_of_life_versions: bool,
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     args: Vec<String>,
 }
@@ -213,6 +220,7 @@ fn run() -> Result<ExitCode> {
                 args.command,
                 args.block_network,
                 args.no_services,
+                args.dangerously_use_end_of_life_versions,
                 None,
                 None,
             )?;
@@ -265,9 +273,18 @@ fn launch_agent(binary: &str, args: AgentArgs) -> Result<ExitCode> {
             &passthrough_args,
             false,
             false,
+            args.dangerously_use_end_of_life_versions,
         );
     }
-    observe::launch_live_agent(&root, &analysis, binary, command, false, false)
+    observe::launch_live_agent(
+        &root,
+        &analysis,
+        binary,
+        command,
+        false,
+        false,
+        args.dangerously_use_end_of_life_versions,
+    )
 }
 
 fn launch_observed_agent(binary: &str, args: ObserveAgentArgs) -> Result<ExitCode> {
@@ -282,6 +299,7 @@ fn launch_observed_agent(binary: &str, args: ObserveAgentArgs) -> Result<ExitCod
         &args.args,
         args.block_network,
         args.no_services,
+        args.dangerously_use_end_of_life_versions,
     )
 }
 

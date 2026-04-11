@@ -17,11 +17,13 @@ Given a project directory, `explicit`:
 - scans common project markers such as `package.json`, `Cargo.toml`, `go.mod`, `mix.exs`, `Gemfile`, `composer.json`, `pyproject.toml`, `requirements.txt`, `Makefile`, Gradle files, Maven files, and Compose files
 - detects likely languages, packages, lint commands, build commands, and local services
 - detects likely test commands and common test frameworks
+- detects runtime versions from idiomatic project files such as `.node-version`, `.nvmrc`, `.ruby-version`, `.python-version`, `rust-toolchain.toml`, `go.mod`, `.tool-versions`, `mise.toml`, `.java-version`, and `.php-version`
 - ensures [devenv.nix](/Users/onnimonni/Projects/devenv-nono-llm/devenv.nix) imports [explicit.generated.deps.nix](/Users/onnimonni/Projects/devenv-nono-llm/explicit.generated.deps.nix)
-- regenerates [explicit.generated.deps.nix](/Users/onnimonni/Projects/devenv-nono-llm/explicit.generated.deps.nix) from the detected requirements
+- regenerates [explicit.generated.deps.nix](/Users/onnimonni/Projects/devenv-nono-llm/explicit.generated.deps.nix) from the detected requirements, including per-line comments explaining why each language, package, version pin, service, or option was added
 - writes analysis output to `.nono/analysis.json` and `.nono/sandbox-plan.json`
 - writes a shared stop hook used by Claude and Codex
 - installs a managed `pre-push` git hook when the project is a git repo
+- blocks shell and agent launch when a detected runtime version is end-of-life according to the embedded `endoflife.date` snapshot, unless you pass `--dangerously-use-end-of-life-versions`
 - launches a `devenv` shell, starts detected services, and re-execs into a `nono` sandbox
 
 ## Why The Name
@@ -58,6 +60,7 @@ What each command does:
 - `scan`: prints the detected requirements as JSON
 - `apply`: updates `devenv.nix` wiring, rewrites `explicit.generated.deps.nix`, and refreshes `.nono/` metadata and hooks
 - `doctor`: prints a readable summary of what was detected
+- `doctor` includes detected runtime versions and where they came from
 - `verify`: runs the detected lint, build, and test commands with short failure summaries
 - `shell`: realizes the `devenv` environment and launches a sandboxed shell for agents or manual use
 - `observe`: attaches to a live agent run in the current project, or falls back to the latest saved report when no live socket exists
@@ -119,15 +122,17 @@ explicit claude
 The `shell` command does four things in order:
 
 1. runs `apply`
-2. captures the environment from `devenv shell`
-3. starts detected services with `devenv up --detach` when needed
-4. launches a `nono` sandbox with only the required paths allowed
+2. prints detected runtime versions and checks them against the embedded end-of-life database
+3. captures the environment from `devenv shell`
+4. starts detected services with `devenv up --detach` when needed
+5. launches a `nono` sandbox with only the required paths allowed
 
 Examples:
 
 ```bash
 explicit shell --command codex
 explicit shell --command claude
+explicit shell --dangerously-use-end-of-life-versions --command codex
 explicit observe
 explicit observe codex exec --skip-git-repo-check "say hello in one word"
 explicit observe claude -- --help
@@ -142,6 +147,8 @@ cargo run -- shell --command 'pwd; command -v cargo; cargo --version'
 ```
 
 `explicit codex ...` and `explicit claude ...` pass everything after the subcommand directly to the agent binary. If you need sandbox-specific controls such as `--root`, `--block-network`, or `--no-services`, use `explicit shell --command ...` instead.
+
+`explicit shell`, `explicit codex`, `explicit claude`, and the observed agent variants also accept `--dangerously-use-end-of-life-versions` if you intentionally need to keep working with a runtime that the embedded `endoflife.date` snapshot marks as unsupported.
 
 ## Observability
 

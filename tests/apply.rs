@@ -577,3 +577,46 @@ fn verify_blocks_stop_when_detected_checks_fail() {
     assert!(stderr.contains("make build"));
     assert!(stderr.contains("release build exploded"));
 }
+
+#[test]
+fn doctor_reports_detected_runtime_versions() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"demo","packageManager":"pnpm@9.0.0"}"#,
+    )
+    .unwrap();
+    fs::write(root.join(".node-version"), "20.18.0\n").unwrap();
+
+    let output = run_doctor(root);
+    assert!(output.contains("Language versions: nodejs 20.18.0 (.node-version)"));
+}
+
+#[test]
+fn apply_pins_detected_language_versions_in_generated_nix() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+
+    fs::write(root.join("Gemfile"), "source \"https://rubygems.org\"\n").unwrap();
+    fs::write(root.join(".ruby-version"), "3.3.6\n").unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("rust-toolchain.toml"),
+        "[toolchain]\nchannel = \"1.84.0\"\n",
+    )
+    .unwrap();
+
+    run_tool(root);
+
+    let generated = fs::read_to_string(root.join("explicit.generated.deps.nix")).unwrap();
+    assert!(generated.contains("languages.ruby.versionFile = ./.ruby-version;"));
+    assert!(generated.contains("languages.rust.toolchainFile = ./rust-toolchain.toml;"));
+    assert!(generated.contains("Respecting .ruby-version"));
+    assert!(generated.contains("Respecting rust-toolchain.toml"));
+}

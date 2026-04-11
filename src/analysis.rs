@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -69,6 +69,110 @@ impl LanguageRequirement {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum RuntimeKind {
+    Elixir,
+    Erlang,
+    Go,
+    Java,
+    Nodejs,
+    Php,
+    Python,
+    Ruby,
+    Rust,
+}
+
+impl RuntimeKind {
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Elixir => "elixir",
+            Self::Erlang => "erlang",
+            Self::Go => "go",
+            Self::Java => "java",
+            Self::Nodejs => "nodejs",
+            Self::Php => "php",
+            Self::Python => "python",
+            Self::Ruby => "ruby",
+            Self::Rust => "rust",
+        }
+    }
+
+    pub fn eol_product_slug(self) -> &'static str {
+        match self {
+            Self::Elixir => "elixir",
+            Self::Erlang => "erlang",
+            Self::Go => "go",
+            Self::Java => "",
+            Self::Nodejs => "nodejs",
+            Self::Php => "php",
+            Self::Python => "python",
+            Self::Ruby => "ruby",
+            Self::Rust => "rust",
+        }
+    }
+
+    pub fn cycle_from_version(self, version: &str) -> Option<String> {
+        let cleaned = clean_version_value(version);
+        let mut numeric_segments = cleaned
+            .split(['.', '-'])
+            .filter_map(|segment| {
+                let digits = segment
+                    .chars()
+                    .take_while(|ch| ch.is_ascii_digit())
+                    .collect::<String>();
+                if digits.is_empty() {
+                    None
+                } else {
+                    Some(digits)
+                }
+            })
+            .collect::<Vec<_>>();
+        if numeric_segments.is_empty() {
+            return None;
+        }
+        match self {
+            Self::Nodejs | Self::Java | Self::Erlang => numeric_segments.drain(..1).next(),
+            Self::Elixir | Self::Go | Self::Php | Self::Python | Self::Ruby | Self::Rust => {
+                if numeric_segments.len() == 1 {
+                    Some(numeric_segments.remove(0))
+                } else {
+                    Some(format!("{}.{}", numeric_segments[0], numeric_segments[1]))
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VersionKind {
+    Exact,
+    Constraint,
+    ToolchainFile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DetectedVersion {
+    pub runtime: RuntimeKind,
+    pub version: String,
+    pub source: String,
+    pub kind: VersionKind,
+    #[serde(default)]
+    pub config_lines: Vec<String>,
+}
+
+impl DetectedVersion {
+    pub fn summary(&self) -> String {
+        format!(
+            "{} {} ({})",
+            self.runtime.display_name(),
+            self.version,
+            self.source
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ServiceRequirement {
     Mysql,
     Postgres,
@@ -103,6 +207,7 @@ pub struct Analysis {
     pub markers: Vec<String>,
     pub manifests: Vec<String>,
     pub detected_languages: Vec<LanguageRequirement>,
+    pub detected_versions: Vec<DetectedVersion>,
     pub language_hints: Vec<String>,
     pub packages: Vec<String>,
     pub services: Vec<ServiceRequirement>,
@@ -197,6 +302,7 @@ impl Analysis {
         analyze_common_files(root, &mut builder)?;
         analyze_compose_services(root, &mut builder)?;
         apply_registry_matches(root, &mut builder)?;
+        let detected_versions = detect_runtime_versions(root, &builder)?;
 
         if builder.lint_commands.is_empty()
             && builder.build_commands.is_empty()
@@ -214,6 +320,7 @@ impl Analysis {
             markers: builder.markers.into_iter().collect(),
             manifests: builder.manifests.into_iter().collect(),
             detected_languages: builder.languages.iter().copied().collect(),
+            detected_versions,
             language_hints: builder.language_hints.into_iter().collect(),
             packages: builder.packages.into_iter().collect(),
             services: builder.services.iter().copied().collect(),
@@ -232,6 +339,13 @@ impl Analysis {
             .iter()
             .map(String::as_str)
             .filter(|package| !SUPPORT_PACKAGES.contains(package))
+            .collect()
+    }
+
+    pub fn doctor_versions(&self) -> Vec<String> {
+        self.detected_versions
+            .iter()
+            .map(DetectedVersion::summary)
             .collect()
     }
 }
@@ -611,6 +725,834 @@ fn analyze_compose_services(root: &Path, builder: &mut Builder) -> Result<()> {
     Ok(())
 }
 
+fn detect_runtime_versions(root: &Path, builder: &Builder) -> Result<Vec<DetectedVersion>> {
+    let tool_versions = parse_tool_versions(root)?;
+    let mise_tools = parse_mise_tools(root)?;
+    let mut detected = Vec::new();
+
+    if root.join("package.json").exists()
+        || builder.languages.contains(&LanguageRequirement::JavaScript)
+    {
+        if let Some(version) = detect_nodejs_version(root, &tool_versions, &mise_tools)? {
+            detected.push(version);
+        }
+    }
+
+    if root.join("Gemfile").exists()
+        || root.join("Bundlefile").exists()
+        || builder.languages.contains(&LanguageRequirement::Ruby)
+    {
+        if let Some(version) = detect_ruby_version(root, &tool_versions, &mise_tools)? {
+            detected.push(version);
+        }
+    }
+
+    if root.join("pyproject.toml").exists()
+        || root.join("requirements.txt").exists()
+        || root.join("uv.lock").exists()
+        || root.join("poetry.lock").exists()
+        || builder.languages.contains(&LanguageRequirement::Python)
+    {
+        if let Some(version) = detect_python_version(root, &tool_versions, &mise_tools)? {
+            detected.push(version);
+        }
+    }
+
+    if root.join("go.mod").exists() || builder.languages.contains(&LanguageRequirement::Go) {
+        if let Some(version) = detect_go_version(root, &tool_versions, &mise_tools)? {
+            detected.push(version);
+        }
+    }
+
+    if root.join("Cargo.toml").exists() || builder.languages.contains(&LanguageRequirement::Rust) {
+        if let Some(version) = detect_rust_version(root, &tool_versions, &mise_tools)? {
+            detected.push(version);
+        }
+    }
+
+    if root.join("composer.json").exists() || builder.languages.contains(&LanguageRequirement::Php)
+    {
+        if let Some(version) = detect_php_version(root, &tool_versions, &mise_tools)? {
+            detected.push(version);
+        }
+    }
+
+    if root.join("mix.exs").exists() || builder.languages.contains(&LanguageRequirement::Elixir) {
+        if let Some(version) = detect_elixir_version(root, &tool_versions, &mise_tools)? {
+            detected.push(version);
+        }
+        if let Some(version) = detect_erlang_version(root, &tool_versions, &mise_tools)? {
+            detected.push(version);
+        }
+    }
+
+    if root.join("pom.xml").exists()
+        || root.join("build.gradle").exists()
+        || root.join("build.gradle.kts").exists()
+        || root.join("gradlew").exists()
+        || builder.languages.contains(&LanguageRequirement::Java)
+    {
+        if let Some(version) = detect_java_version(root, &tool_versions, &mise_tools)? {
+            detected.push(version);
+        }
+    }
+
+    detected.sort_by_key(|entry| (entry.runtime, entry.source.clone()));
+    Ok(detected)
+}
+
+fn detect_nodejs_version(
+    root: &Path,
+    tool_versions: &BTreeMap<String, String>,
+    mise_tools: &BTreeMap<String, String>,
+) -> Result<Option<DetectedVersion>> {
+    if let Some(version) = read_version_file(root.join(".node-version"))? {
+        return Ok(Some(DetectedVersion {
+            runtime: RuntimeKind::Nodejs,
+            version: version.clone(),
+            source: ".node-version".to_string(),
+            kind: numeric_version_kind(&version),
+            config_lines: nodejs_config_lines(&version),
+        }));
+    }
+    if let Some(version) = read_version_file(root.join(".nvmrc"))? {
+        return Ok(Some(DetectedVersion {
+            runtime: RuntimeKind::Nodejs,
+            version: version.clone(),
+            source: ".nvmrc".to_string(),
+            kind: numeric_version_kind(&version),
+            config_lines: nodejs_config_lines(&version),
+        }));
+    }
+    if let Some(version) = tool_version(tool_versions, &["nodejs", "node"]) {
+        return Ok(Some(DetectedVersion {
+            runtime: RuntimeKind::Nodejs,
+            version: version.clone(),
+            source: ".tool-versions".to_string(),
+            kind: numeric_version_kind(&version),
+            config_lines: nodejs_config_lines(&version),
+        }));
+    }
+    if let Some(version) = tool_version(mise_tools, &["nodejs", "node"]) {
+        return Ok(Some(DetectedVersion {
+            runtime: RuntimeKind::Nodejs,
+            version: version.clone(),
+            source: "mise.toml".to_string(),
+            kind: numeric_version_kind(&version),
+            config_lines: nodejs_config_lines(&version),
+        }));
+    }
+
+    let package_json = root.join("package.json");
+    if package_json.exists() {
+        let payload: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&package_json)
+                .with_context(|| format!("failed to read {}", package_json.display()))?,
+        )
+        .with_context(|| format!("failed to parse {}", package_json.display()))?;
+        if let Some(version) = payload
+            .get("engines")
+            .and_then(|engines| engines.get("node"))
+            .and_then(serde_json::Value::as_str)
+            .map(clean_version_value)
+            .filter(|value| !value.is_empty())
+        {
+            return Ok(Some(DetectedVersion {
+                runtime: RuntimeKind::Nodejs,
+                version,
+                source: "package.json#engines.node".to_string(),
+                kind: VersionKind::Constraint,
+                config_lines: Vec::new(),
+            }));
+        }
+    }
+
+    Ok(None)
+}
+
+fn detect_ruby_version(
+    root: &Path,
+    tool_versions: &BTreeMap<String, String>,
+    mise_tools: &BTreeMap<String, String>,
+) -> Result<Option<DetectedVersion>> {
+    if let Some(version) = read_version_file(root.join(".ruby-version"))? {
+        return Ok(Some(DetectedVersion {
+            runtime: RuntimeKind::Ruby,
+            version,
+            source: ".ruby-version".to_string(),
+            kind: VersionKind::Exact,
+            config_lines: vec!["languages.ruby.versionFile = ./.ruby-version;".to_string()],
+        }));
+    }
+    if let Some(version) = tool_version(tool_versions, &["ruby"]) {
+        return Ok(Some(simple_version_pin(
+            RuntimeKind::Ruby,
+            version,
+            ".tool-versions",
+            "languages.ruby.version",
+        )));
+    }
+    if let Some(version) = tool_version(mise_tools, &["ruby"]) {
+        return Ok(Some(simple_version_pin(
+            RuntimeKind::Ruby,
+            version,
+            "mise.toml",
+            "languages.ruby.version",
+        )));
+    }
+
+    let gemfile = root.join("Gemfile");
+    if gemfile.exists() {
+        let contents = fs::read_to_string(&gemfile)
+            .with_context(|| format!("failed to read {}", gemfile.display()))?;
+        let ruby_directive = Regex::new(r#"(?m)^\s*ruby\s+["']([^"']+)["']"#)?;
+        if let Some(version) = ruby_directive
+            .captures(&contents)
+            .and_then(|captures| captures.get(1))
+            .map(|value| clean_version_value(value.as_str()))
+            .filter(|value| !value.is_empty())
+        {
+            return Ok(Some(DetectedVersion {
+                runtime: RuntimeKind::Ruby,
+                version,
+                source: "Gemfile#ruby".to_string(),
+                kind: VersionKind::Constraint,
+                config_lines: Vec::new(),
+            }));
+        }
+    }
+
+    Ok(None)
+}
+
+fn detect_python_version(
+    root: &Path,
+    tool_versions: &BTreeMap<String, String>,
+    mise_tools: &BTreeMap<String, String>,
+) -> Result<Option<DetectedVersion>> {
+    if let Some(version) = read_version_file(root.join(".python-version"))? {
+        return Ok(Some(simple_version_pin(
+            RuntimeKind::Python,
+            version,
+            ".python-version",
+            "languages.python.version",
+        )));
+    }
+    if let Some(version) = tool_version(tool_versions, &["python"]) {
+        return Ok(Some(simple_version_pin(
+            RuntimeKind::Python,
+            version,
+            ".tool-versions",
+            "languages.python.version",
+        )));
+    }
+    if let Some(version) = tool_version(mise_tools, &["python"]) {
+        return Ok(Some(simple_version_pin(
+            RuntimeKind::Python,
+            version,
+            "mise.toml",
+            "languages.python.version",
+        )));
+    }
+    let runtime_txt = root.join("runtime.txt");
+    if runtime_txt.exists() {
+        if let Some(version) = read_version_file(&runtime_txt)?
+            .map(|value| value.trim_start_matches("python-").to_string())
+            .filter(|value| !value.is_empty())
+        {
+            return Ok(Some(simple_version_pin(
+                RuntimeKind::Python,
+                version,
+                "runtime.txt",
+                "languages.python.version",
+            )));
+        }
+    }
+
+    let pyproject = root.join("pyproject.toml");
+    if pyproject.exists() {
+        let contents = fs::read_to_string(&pyproject)
+            .with_context(|| format!("failed to read {}", pyproject.display()))?;
+        let value = toml::from_str::<TomlValue>(&contents)
+            .with_context(|| format!("failed to parse {}", pyproject.display()))?;
+        if let Some(version) = value
+            .get("project")
+            .and_then(|project| project.get("requires-python"))
+            .and_then(TomlValue::as_str)
+            .map(clean_version_value)
+            .filter(|value| !value.is_empty())
+        {
+            return Ok(Some(DetectedVersion {
+                runtime: RuntimeKind::Python,
+                version,
+                source: "pyproject.toml#project.requires-python".to_string(),
+                kind: VersionKind::Constraint,
+                config_lines: Vec::new(),
+            }));
+        }
+    }
+
+    Ok(None)
+}
+
+fn detect_go_version(
+    root: &Path,
+    tool_versions: &BTreeMap<String, String>,
+    mise_tools: &BTreeMap<String, String>,
+) -> Result<Option<DetectedVersion>> {
+    if let Some(version) = read_version_file(root.join(".go-version"))? {
+        return Ok(Some(simple_version_pin(
+            RuntimeKind::Go,
+            version,
+            ".go-version",
+            "languages.go.version",
+        )));
+    }
+
+    let go_mod = root.join("go.mod");
+    if go_mod.exists() {
+        let contents = fs::read_to_string(&go_mod)
+            .with_context(|| format!("failed to read {}", go_mod.display()))?;
+        let toolchain = Regex::new(r"(?m)^toolchain\s+go([0-9][^\s]*)\s*$")?;
+        if let Some(version) = toolchain
+            .captures(&contents)
+            .and_then(|captures| captures.get(1))
+            .map(|value| clean_version_value(value.as_str()))
+            .filter(|value| !value.is_empty())
+        {
+            return Ok(Some(simple_version_pin(
+                RuntimeKind::Go,
+                version,
+                "go.mod#toolchain",
+                "languages.go.version",
+            )));
+        }
+        let go_directive = Regex::new(r"(?m)^go\s+([0-9][^\s]*)\s*$")?;
+        if let Some(version) = go_directive
+            .captures(&contents)
+            .and_then(|captures| captures.get(1))
+            .map(|value| clean_version_value(value.as_str()))
+            .filter(|value| !value.is_empty())
+        {
+            return Ok(Some(simple_version_pin(
+                RuntimeKind::Go,
+                version,
+                "go.mod#go",
+                "languages.go.version",
+            )));
+        }
+    }
+
+    if let Some(version) = tool_version(tool_versions, &["golang", "go"]) {
+        return Ok(Some(simple_version_pin(
+            RuntimeKind::Go,
+            version,
+            ".tool-versions",
+            "languages.go.version",
+        )));
+    }
+    if let Some(version) = tool_version(mise_tools, &["golang", "go"]) {
+        return Ok(Some(simple_version_pin(
+            RuntimeKind::Go,
+            version,
+            "mise.toml",
+            "languages.go.version",
+        )));
+    }
+
+    Ok(None)
+}
+
+fn detect_rust_version(
+    root: &Path,
+    tool_versions: &BTreeMap<String, String>,
+    mise_tools: &BTreeMap<String, String>,
+) -> Result<Option<DetectedVersion>> {
+    let toolchain_toml = root.join("rust-toolchain.toml");
+    if toolchain_toml.exists() {
+        let contents = fs::read_to_string(&toolchain_toml)
+            .with_context(|| format!("failed to read {}", toolchain_toml.display()))?;
+        let value = toml::from_str::<TomlValue>(&contents)
+            .with_context(|| format!("failed to parse {}", toolchain_toml.display()))?;
+        let channel = value
+            .get("toolchain")
+            .and_then(|toolchain| toolchain.get("channel"))
+            .and_then(TomlValue::as_str)
+            .map(clean_version_value)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "configured in rust-toolchain.toml".to_string());
+        return Ok(Some(DetectedVersion {
+            runtime: RuntimeKind::Rust,
+            version: channel,
+            source: "rust-toolchain.toml".to_string(),
+            kind: VersionKind::ToolchainFile,
+            config_lines: vec!["languages.rust.toolchainFile = ./rust-toolchain.toml;".to_string()],
+        }));
+    }
+
+    let toolchain = root.join("rust-toolchain");
+    if toolchain.exists() {
+        if let Some(channel) = read_version_file(&toolchain)?.filter(|value| !value.is_empty()) {
+            return Ok(Some(DetectedVersion {
+                runtime: RuntimeKind::Rust,
+                version: channel,
+                source: "rust-toolchain".to_string(),
+                kind: VersionKind::ToolchainFile,
+                config_lines: vec!["languages.rust.toolchainFile = ./rust-toolchain;".to_string()],
+            }));
+        }
+    }
+
+    if let Some(version) = tool_version(tool_versions, &["rust"]) {
+        return Ok(Some(DetectedVersion {
+            runtime: RuntimeKind::Rust,
+            version: version.clone(),
+            source: ".tool-versions".to_string(),
+            kind: numeric_version_kind(&version),
+            config_lines: rust_config_lines(&version),
+        }));
+    }
+    if let Some(version) = tool_version(mise_tools, &["rust"]) {
+        return Ok(Some(DetectedVersion {
+            runtime: RuntimeKind::Rust,
+            version: version.clone(),
+            source: "mise.toml".to_string(),
+            kind: numeric_version_kind(&version),
+            config_lines: rust_config_lines(&version),
+        }));
+    }
+
+    let cargo_toml = root.join("Cargo.toml");
+    if cargo_toml.exists() {
+        let contents = fs::read_to_string(&cargo_toml)
+            .with_context(|| format!("failed to read {}", cargo_toml.display()))?;
+        let value = toml::from_str::<TomlValue>(&contents)
+            .with_context(|| format!("failed to parse {}", cargo_toml.display()))?;
+        if let Some(version) = value
+            .get("package")
+            .and_then(|package| package.get("rust-version"))
+            .and_then(TomlValue::as_str)
+            .map(clean_version_value)
+            .filter(|value| !value.is_empty())
+        {
+            return Ok(Some(DetectedVersion {
+                runtime: RuntimeKind::Rust,
+                version,
+                source: "Cargo.toml#package.rust-version".to_string(),
+                kind: VersionKind::Constraint,
+                config_lines: Vec::new(),
+            }));
+        }
+    }
+
+    Ok(None)
+}
+
+fn detect_php_version(
+    root: &Path,
+    tool_versions: &BTreeMap<String, String>,
+    mise_tools: &BTreeMap<String, String>,
+) -> Result<Option<DetectedVersion>> {
+    if let Some(version) = read_version_file(root.join(".php-version"))? {
+        return Ok(Some(simple_version_pin(
+            RuntimeKind::Php,
+            version,
+            ".php-version",
+            "languages.php.version",
+        )));
+    }
+    if let Some(version) = tool_version(tool_versions, &["php"]) {
+        return Ok(Some(simple_version_pin(
+            RuntimeKind::Php,
+            version,
+            ".tool-versions",
+            "languages.php.version",
+        )));
+    }
+    if let Some(version) = tool_version(mise_tools, &["php"]) {
+        return Ok(Some(simple_version_pin(
+            RuntimeKind::Php,
+            version,
+            "mise.toml",
+            "languages.php.version",
+        )));
+    }
+
+    let composer = root.join("composer.json");
+    if composer.exists() {
+        let payload: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&composer)
+                .with_context(|| format!("failed to read {}", composer.display()))?,
+        )
+        .with_context(|| format!("failed to parse {}", composer.display()))?;
+        if let Some(version) = payload
+            .get("config")
+            .and_then(|config| config.get("platform"))
+            .and_then(|platform| platform.get("php"))
+            .and_then(serde_json::Value::as_str)
+            .map(clean_version_value)
+            .filter(|value| !value.is_empty())
+        {
+            let kind = numeric_version_kind(&version);
+            return Ok(Some(DetectedVersion {
+                runtime: RuntimeKind::Php,
+                version: version.clone(),
+                source: "composer.json#config.platform.php".to_string(),
+                kind,
+                config_lines: if kind == VersionKind::Exact {
+                    vec![format!(r#"languages.php.version = "{version}";"#)]
+                } else {
+                    Vec::new()
+                },
+            }));
+        }
+        if let Some(version) = payload
+            .get("require")
+            .and_then(|require| require.get("php"))
+            .and_then(serde_json::Value::as_str)
+            .map(clean_version_value)
+            .filter(|value| !value.is_empty())
+        {
+            return Ok(Some(DetectedVersion {
+                runtime: RuntimeKind::Php,
+                version,
+                source: "composer.json#require.php".to_string(),
+                kind: VersionKind::Constraint,
+                config_lines: Vec::new(),
+            }));
+        }
+    }
+
+    Ok(None)
+}
+
+fn detect_elixir_version(
+    root: &Path,
+    tool_versions: &BTreeMap<String, String>,
+    mise_tools: &BTreeMap<String, String>,
+) -> Result<Option<DetectedVersion>> {
+    if let Some(version) = tool_version(tool_versions, &["elixir"]) {
+        return Ok(Some(DetectedVersion {
+            runtime: RuntimeKind::Elixir,
+            version,
+            source: ".tool-versions".to_string(),
+            kind: VersionKind::Exact,
+            config_lines: Vec::new(),
+        }));
+    }
+    if let Some(version) = tool_version(mise_tools, &["elixir"]) {
+        return Ok(Some(DetectedVersion {
+            runtime: RuntimeKind::Elixir,
+            version,
+            source: "mise.toml".to_string(),
+            kind: VersionKind::Exact,
+            config_lines: Vec::new(),
+        }));
+    }
+
+    let mix_exs = root.join("mix.exs");
+    if mix_exs.exists() {
+        let contents = fs::read_to_string(&mix_exs)
+            .with_context(|| format!("failed to read {}", mix_exs.display()))?;
+        let elixir_requirement = Regex::new(r#"elixir:\s*["']([^"']+)["']"#)?;
+        if let Some(version) = elixir_requirement
+            .captures(&contents)
+            .and_then(|captures| captures.get(1))
+            .map(|value| clean_version_value(value.as_str()))
+            .filter(|value| !value.is_empty())
+        {
+            return Ok(Some(DetectedVersion {
+                runtime: RuntimeKind::Elixir,
+                version,
+                source: "mix.exs#elixir".to_string(),
+                kind: VersionKind::Constraint,
+                config_lines: Vec::new(),
+            }));
+        }
+    }
+
+    Ok(None)
+}
+
+fn detect_erlang_version(
+    _root: &Path,
+    tool_versions: &BTreeMap<String, String>,
+    mise_tools: &BTreeMap<String, String>,
+) -> Result<Option<DetectedVersion>> {
+    if let Some(version) = tool_version(tool_versions, &["erlang", "otp"]) {
+        return Ok(Some(DetectedVersion {
+            runtime: RuntimeKind::Erlang,
+            version,
+            source: ".tool-versions".to_string(),
+            kind: VersionKind::Exact,
+            config_lines: Vec::new(),
+        }));
+    }
+    if let Some(version) = tool_version(mise_tools, &["erlang", "otp"]) {
+        return Ok(Some(DetectedVersion {
+            runtime: RuntimeKind::Erlang,
+            version,
+            source: "mise.toml".to_string(),
+            kind: VersionKind::Exact,
+            config_lines: Vec::new(),
+        }));
+    }
+    Ok(None)
+}
+
+fn detect_java_version(
+    root: &Path,
+    tool_versions: &BTreeMap<String, String>,
+    mise_tools: &BTreeMap<String, String>,
+) -> Result<Option<DetectedVersion>> {
+    if let Some(version) = read_version_file(root.join(".java-version"))? {
+        return Ok(Some(DetectedVersion {
+            runtime: RuntimeKind::Java,
+            version: version.clone(),
+            source: ".java-version".to_string(),
+            kind: numeric_version_kind(&version),
+            config_lines: java_config_lines(&version),
+        }));
+    }
+
+    let sdkman = root.join(".sdkmanrc");
+    if sdkman.exists() {
+        let contents = fs::read_to_string(&sdkman)
+            .with_context(|| format!("failed to read {}", sdkman.display()))?;
+        for line in contents.lines() {
+            let trimmed = line.trim();
+            if let Some(value) = trimmed.strip_prefix("java=") {
+                let version = clean_version_value(value);
+                if !version.is_empty() {
+                    return Ok(Some(DetectedVersion {
+                        runtime: RuntimeKind::Java,
+                        version: version.clone(),
+                        source: ".sdkmanrc".to_string(),
+                        kind: numeric_version_kind(&version),
+                        config_lines: java_config_lines(&version),
+                    }));
+                }
+            }
+        }
+    }
+
+    if let Some(version) = tool_version(tool_versions, &["java"]) {
+        return Ok(Some(DetectedVersion {
+            runtime: RuntimeKind::Java,
+            version: version.clone(),
+            source: ".tool-versions".to_string(),
+            kind: numeric_version_kind(&version),
+            config_lines: java_config_lines(&version),
+        }));
+    }
+    if let Some(version) = tool_version(mise_tools, &["java"]) {
+        return Ok(Some(DetectedVersion {
+            runtime: RuntimeKind::Java,
+            version: version.clone(),
+            source: "mise.toml".to_string(),
+            kind: numeric_version_kind(&version),
+            config_lines: java_config_lines(&version),
+        }));
+    }
+
+    Ok(None)
+}
+
+fn parse_tool_versions(root: &Path) -> Result<BTreeMap<String, String>> {
+    let path = root.join(".tool-versions");
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let contents =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut tools = BTreeMap::new();
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let mut parts = trimmed.split_whitespace();
+        let Some(tool) = parts.next() else {
+            continue;
+        };
+        let Some(version) = parts.next() else {
+            continue;
+        };
+        let version = clean_version_value(version);
+        if !version.is_empty() {
+            tools.insert(tool.to_lowercase(), version);
+        }
+    }
+    Ok(tools)
+}
+
+fn parse_mise_tools(root: &Path) -> Result<BTreeMap<String, String>> {
+    for candidate in [".mise.toml", "mise.toml"] {
+        let path = root.join(candidate);
+        if !path.exists() {
+            continue;
+        }
+        let contents = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let value = toml::from_str::<TomlValue>(&contents)
+            .with_context(|| format!("failed to parse {}", path.display()))?;
+        let mut tools = BTreeMap::new();
+        if let Some(entries) = value.get("tools").and_then(TomlValue::as_table) {
+            for (tool, value) in entries {
+                if let Some(version) = toml_tool_version(value) {
+                    tools.insert(tool.to_lowercase(), version);
+                }
+            }
+        }
+        return Ok(tools);
+    }
+    Ok(BTreeMap::new())
+}
+
+fn toml_tool_version(value: &TomlValue) -> Option<String> {
+    if let Some(version) = value.as_str() {
+        let version = clean_version_value(version);
+        return (!version.is_empty()).then_some(version);
+    }
+    if let Some(table) = value.as_table() {
+        if let Some(version) = table.get("version").and_then(TomlValue::as_str) {
+            let version = clean_version_value(version);
+            return (!version.is_empty()).then_some(version);
+        }
+        if let Some(versions) = table.get("versions").and_then(TomlValue::as_array) {
+            return versions
+                .iter()
+                .find_map(TomlValue::as_str)
+                .map(clean_version_value)
+                .filter(|version| !version.is_empty());
+        }
+    }
+    if let Some(array) = value.as_array() {
+        return array
+            .iter()
+            .find_map(TomlValue::as_str)
+            .map(clean_version_value)
+            .filter(|version| !version.is_empty());
+    }
+    None
+}
+
+fn tool_version(tools: &BTreeMap<String, String>, names: &[&str]) -> Option<String> {
+    names
+        .iter()
+        .find_map(|name| tools.get(*name))
+        .map(ToOwned::to_owned)
+}
+
+fn read_version_file(path: impl AsRef<Path>) -> Result<Option<String>> {
+    let path = path.as_ref();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let contents =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    Ok(contents
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(clean_version_value)
+        .filter(|value| !value.is_empty()))
+}
+
+fn clean_version_value(raw: &str) -> String {
+    let trimmed = raw
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .split('#')
+        .next()
+        .unwrap_or_default()
+        .trim();
+    trimmed
+        .trim_start_matches("ruby-")
+        .trim_start_matches("python-")
+        .trim_start_matches('v')
+        .trim()
+        .to_string()
+}
+
+fn numeric_version_kind(version: &str) -> VersionKind {
+    if version.chars().next().is_some_and(|ch| ch.is_ascii_digit()) {
+        VersionKind::Exact
+    } else {
+        VersionKind::Constraint
+    }
+}
+
+fn simple_version_pin(
+    runtime: RuntimeKind,
+    version: String,
+    source: &str,
+    option: &str,
+) -> DetectedVersion {
+    let kind = numeric_version_kind(&version);
+    DetectedVersion {
+        runtime,
+        version: version.clone(),
+        source: source.to_string(),
+        kind,
+        config_lines: if kind == VersionKind::Exact {
+            vec![format!(r#"{option} = "{version}";"#)]
+        } else {
+            Vec::new()
+        },
+    }
+}
+
+fn nodejs_config_lines(version: &str) -> Vec<String> {
+    major_version(version)
+        .map(|major| {
+            vec![format!(
+                r#"languages.javascript.package = let attr = "nodejs_{major}"; in if builtins.hasAttr attr pkgs then builtins.getAttr attr pkgs else pkgs.nodejs;"#
+            )]
+        })
+        .unwrap_or_default()
+}
+
+fn java_config_lines(version: &str) -> Vec<String> {
+    major_version(version)
+        .map(|major| {
+            vec![format!(
+                r#"languages.java.jdk.package = let attr = "jdk{major}"; in if builtins.hasAttr attr pkgs then builtins.getAttr attr pkgs else pkgs.jdk;"#
+            )]
+        })
+        .unwrap_or_default()
+}
+
+fn rust_config_lines(version: &str) -> Vec<String> {
+    if version.eq_ignore_ascii_case("stable")
+        || version.eq_ignore_ascii_case("beta")
+        || version.eq_ignore_ascii_case("nightly")
+    {
+        return vec![format!(
+            r#"languages.rust.channel = "{}";"#,
+            version.to_lowercase()
+        )];
+    }
+    if version.chars().next().is_some_and(|ch| ch.is_ascii_digit()) {
+        return vec![
+            r#"languages.rust.channel = "stable";"#.to_string(),
+            format!(r#"languages.rust.version = "{version}";"#),
+        ];
+    }
+    Vec::new()
+}
+
+fn major_version(version: &str) -> Option<String> {
+    let cleaned = clean_version_value(version);
+    let digits = cleaned
+        .chars()
+        .skip_while(|ch| !ch.is_ascii_digit())
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    (!digits.is_empty()).then_some(digits)
+}
+
 fn discover_make_targets(path: &Path) -> Result<BTreeSet<String>> {
     let mut targets = BTreeSet::new();
     let regex = Regex::new(r"^([A-Za-z0-9_.-]+):(?:\s|$)")?;
@@ -951,8 +1893,8 @@ fn linux_agent_read_only_paths(_home: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Analysis, Builder, SUPPORT_PACKAGES, SandboxPlan, build_sandbox_plan,
-        fallback_javascript_test_commands, platform_agent_read_only_paths,
+        Analysis, Builder, LanguageRequirement, RuntimeKind, SUPPORT_PACKAGES, SandboxPlan,
+        build_sandbox_plan, fallback_javascript_test_commands, platform_agent_read_only_paths,
         platform_agent_read_write_paths, referenced_instruction_paths, script_is_placeholder,
         standard_device_read_write_paths,
     };
@@ -966,6 +1908,7 @@ mod tests {
             markers: Vec::new(),
             manifests: Vec::new(),
             detected_languages: Vec::new(),
+            detected_versions: Vec::new(),
             language_hints: Vec::new(),
             packages: [
                 SUPPORT_PACKAGES[0].to_string(),
@@ -1068,5 +2011,99 @@ mod tests {
         let dir = tempdir().unwrap();
         let plan = build_sandbox_plan(dir.path(), &Builder::default()).unwrap();
         assert!(plan.read_write_files.contains(&PathBuf::from("/dev/null")));
+    }
+
+    #[test]
+    fn detects_node_version_from_dedicated_file() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"demo","scripts":{"test":"vitest run"}}"#,
+        )
+        .unwrap();
+        fs::write(dir.path().join(".node-version"), "20.18.0\n").unwrap();
+
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert!(
+            analysis
+                .detected_languages
+                .contains(&LanguageRequirement::JavaScript)
+        );
+        assert!(analysis.detected_versions.iter().any(|version| {
+            version.runtime == RuntimeKind::Nodejs
+                && version.version == "20.18.0"
+                && version.source == ".node-version"
+                && version
+                    .config_lines
+                    .iter()
+                    .any(|line| line.contains("nodejs_20"))
+        }));
+    }
+
+    #[test]
+    fn detects_rust_toolchain_file_as_pin() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"1.84.0\"\n",
+        )
+        .unwrap();
+
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert!(analysis.detected_versions.iter().any(|version| {
+            version.runtime == RuntimeKind::Rust
+                && version.source == "rust-toolchain.toml"
+                && version.config_lines
+                    == vec!["languages.rust.toolchainFile = ./rust-toolchain.toml;"]
+        }));
+    }
+
+    #[test]
+    fn detects_tool_versions_for_elixir_and_erlang() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("mix.exs"),
+            "defmodule Demo.MixProject do end\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join(".tool-versions"),
+            "elixir 1.17.3-otp-27\nerlang 27.3.4.10\n",
+        )
+        .unwrap();
+
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert!(analysis.detected_versions.iter().any(|version| {
+            version.runtime == RuntimeKind::Elixir
+                && version.version == "1.17.3-otp-27"
+                && version.source == ".tool-versions"
+        }));
+        assert!(analysis.detected_versions.iter().any(|version| {
+            version.runtime == RuntimeKind::Erlang
+                && version.version == "27.3.4.10"
+                && version.source == ".tool-versions"
+        }));
+    }
+
+    #[test]
+    fn detects_java_version_from_java_version_file() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("pom.xml"), "<project></project>\n").unwrap();
+        fs::write(dir.path().join(".java-version"), "21.0.2-tem\n").unwrap();
+
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert!(analysis.detected_versions.iter().any(|version| {
+            version.runtime == RuntimeKind::Java
+                && version.version == "21.0.2-tem"
+                && version
+                    .config_lines
+                    .iter()
+                    .any(|line| line.contains("jdk21"))
+        }));
     }
 }

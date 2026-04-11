@@ -15,6 +15,7 @@ use crate::analysis::{Analysis, SandboxPlan};
 use crate::devenv_file::{
     GENERATED_DEPS_FILE, ensure_devenv_file, ensure_devenv_yaml, render_generated_nix,
 };
+use crate::eol;
 use crate::hooks::write_stop_hook_assets;
 use crate::host_tools::host_command_paths;
 
@@ -66,6 +67,14 @@ pub fn print_doctor(analysis: &Analysis) -> Result<()> {
                 .map(|lang| format!("{lang:?}").to_lowercase())
                 .collect::<Vec<_>>()
                 .join(", ")
+        }
+    );
+    println!(
+        "Language versions: {}",
+        if analysis.detected_versions.is_empty() {
+            "none".to_string()
+        } else {
+            analysis.doctor_versions().join(", ")
         }
     );
     let doctor_packages = analysis.doctor_packages();
@@ -145,9 +154,15 @@ pub fn launch_shell(
     command: Option<String>,
     block_network: bool,
     no_services: bool,
+    dangerously_use_end_of_life_versions: bool,
     extra_env: Option<&BTreeMap<String, String>>,
     transcript_path: Option<&Path>,
 ) -> Result<ExitCode> {
+    print_version_summary(analysis);
+    eol::ensure_supported_runtime_versions(
+        &analysis.detected_versions,
+        dangerously_use_end_of_life_versions,
+    )?;
     apply_project(root, analysis)?;
     let total_steps = if !no_services && !analysis.services.is_empty() {
         3
@@ -213,6 +228,17 @@ pub fn launch_shell(
         bail!("sandboxed shell exited from signal {signal}");
     }
     bail!("sandboxed shell failed without an exit code")
+}
+
+fn print_version_summary(analysis: &Analysis) {
+    if analysis.detected_versions.is_empty() {
+        return;
+    }
+
+    println!("Detected runtime versions:");
+    for version in &analysis.detected_versions {
+        println!("  - {}", version.summary());
+    }
 }
 
 fn build_sandbox_command(

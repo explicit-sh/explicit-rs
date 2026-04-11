@@ -215,6 +215,7 @@ pub fn launch_live_agent(
     command: String,
     block_network: bool,
     no_services: bool,
+    dangerously_use_end_of_life_versions: bool,
 ) -> Result<ExitCode> {
     let server = LiveRunServer::start(
         root,
@@ -227,6 +228,7 @@ pub fn launch_live_agent(
         Some(command),
         block_network,
         no_services,
+        dangerously_use_end_of_life_versions,
         None,
         None,
     )?;
@@ -242,6 +244,7 @@ pub fn launch_observed_agent(
     agent_args: &[String],
     block_network: bool,
     no_services: bool,
+    dangerously_use_end_of_life_versions: bool,
 ) -> Result<ExitCode> {
     let run = ObservationRun::create(root, analysis, agent, &command, agent_args)?;
     let server = LiveRunServer::start(
@@ -270,6 +273,7 @@ pub fn launch_observed_agent(
         Some(command),
         block_network,
         no_services,
+        dangerously_use_end_of_life_versions,
         Some(&trace_env),
         Some(&run.transcript_log_path),
     )?;
