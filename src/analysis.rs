@@ -734,6 +734,10 @@ fn build_sandbox_plan(root: &Path, builder: &Builder) -> Result<SandboxPlan> {
         }
     }
 
+    for path in standard_device_read_write_paths() {
+        read_write_files.insert(path);
+    }
+
     for language in &builder.languages {
         for path in language.default_cache_dirs(&home) {
             read_write_dirs.insert(path);
@@ -821,6 +825,16 @@ fn build_sandbox_plan(root: &Path, builder: &Builder) -> Result<SandboxPlan> {
     })
 }
 
+fn standard_device_read_write_paths() -> Vec<PathBuf> {
+    vec![
+        PathBuf::from("/dev/null"),
+        PathBuf::from("/dev/tty"),
+        PathBuf::from("/dev/stdin"),
+        PathBuf::from("/dev/stdout"),
+        PathBuf::from("/dev/stderr"),
+    ]
+}
+
 fn referenced_instruction_paths(root: &Path) -> Result<Vec<PathBuf>> {
     let agents_path = root.join("AGENTS.md");
     if !agents_path.exists() {
@@ -891,8 +905,13 @@ fn generic_agent_read_write_paths(home: &Path) -> Vec<PathBuf> {
     ]
 }
 
-fn generic_agent_read_only_paths(_home: &Path) -> Vec<PathBuf> {
-    Vec::new()
+fn generic_agent_read_only_paths(home: &Path) -> Vec<PathBuf> {
+    vec![
+        home.join(".gitconfig"),
+        home.join(".gitignore"),
+        home.join(".gitignore_global"),
+        home.join(".config/git"),
+    ]
 }
 
 fn macos_agent_read_write_paths(home: &Path) -> Vec<PathBuf> {
@@ -935,6 +954,7 @@ mod tests {
         Analysis, Builder, SUPPORT_PACKAGES, SandboxPlan, build_sandbox_plan,
         fallback_javascript_test_commands, platform_agent_read_only_paths,
         platform_agent_read_write_paths, referenced_instruction_paths, script_is_placeholder,
+        standard_device_read_write_paths,
     };
     use std::{collections::BTreeSet, fs, path::PathBuf};
     use tempfile::tempdir;
@@ -1002,6 +1022,8 @@ mod tests {
         assert!(read_write.contains(&home.join(".config")));
         assert!(read_write.contains(&home.join(".npm")));
         assert!(read_write.contains(&PathBuf::from("/var/run")));
+        assert!(read_only.contains(&home.join(".gitconfig")));
+        assert!(read_only.contains(&home.join(".config/git")));
         assert!(read_only.contains(&home.join("Library/Preferences")));
         assert!(read_only.contains(&home.join("Library/Keychains/login.keychain-db")));
         assert!(read_only.contains(&home.join("Library/Keychains/metadata.keychain-db")));
@@ -1036,5 +1058,15 @@ mod tests {
 
         let plan = build_sandbox_plan(dir.path(), &Builder::default()).unwrap();
         assert!(plan.read_only_files.contains(&reference));
+    }
+
+    #[test]
+    fn includes_standard_device_nodes_in_read_write_files() {
+        let device_paths = standard_device_read_write_paths();
+        assert!(device_paths.contains(&PathBuf::from("/dev/null")));
+
+        let dir = tempdir().unwrap();
+        let plan = build_sandbox_plan(dir.path(), &Builder::default()).unwrap();
+        assert!(plan.read_write_files.contains(&PathBuf::from("/dev/null")));
     }
 }
