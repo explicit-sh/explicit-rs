@@ -1,6 +1,7 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -10,6 +11,9 @@ use toml::{Table as TomlTable, Value as TomlValue};
 use crate::analysis::Analysis;
 
 const STOP_GUARD_PATH: &str = "./.nono/stop-guard.sh";
+const EXPLICIT_BIN_PATH: &str = "./.nono/explicit-bin";
+const GIT_PRE_PUSH_SCRIPT_PATH: &str = "./.nono/pre-push-verify.sh";
+const MANAGED_PRE_PUSH_MARKER: &str = "# explicit-managed-pre-push";
 
 #[derive(Debug, Serialize)]
 struct GuardCommand<'a> {
@@ -26,7 +30,10 @@ struct GuardConfig<'a> {
 pub fn write_stop_hook_assets(root: &Path, analysis: &Analysis) -> Result<()> {
     fs::create_dir_all(root.join(".nono")).context("failed to create .nono")?;
     write_guard_commands(root, analysis)?;
+    write_explicit_bin_path(root)?;
     write_stop_guard_script(root)?;
+    write_git_verify_script(root)?;
+    install_git_pre_push_hook(root)?;
     write_claude_settings(root)?;
     write_codex_hooks(root)?;
     write_codex_config(root)?;
@@ -66,65 +73,177 @@ fn write_guard_commands(root: &Path, analysis: &Analysis) -> Result<()> {
     Ok(())
 }
 
+fn write_explicit_bin_path(root: &Path) -> Result<()> {
+    let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
+    fs::write(
+        root.join(EXPLICIT_BIN_PATH.trim_start_matches("./")),
+        current_exe.display().to_string(),
+    )
+    .context("failed to write .nono/explicit-bin")?;
+    Ok(())
+}
+
 fn write_stop_guard_script(root: &Path) -> Result<()> {
     let path = root.join(".nono/stop-guard.sh");
     let script = r#"#!/usr/bin/env bash
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CONFIG_PATH="$ROOT_DIR/.nono/guard-commands.json"
+EXPLICIT_BIN_FILE="$ROOT_DIR/.nono/explicit-bin"
 
-if [[ ! -f "$CONFIG_PATH" ]]; then
-  exit 0
-fi
-
-mapfile -t COMMANDS < <(
-  jq -r '.commands[]? | "\(.kind)\t\(.command)"' "$CONFIG_PATH"
-)
-
-if [[ "${#COMMANDS[@]}" -eq 0 ]]; then
-  exit 0
-fi
-
-failures=()
-run_cmd() {
-  local label="$1"
-  local command="$2"
-  if command -v devenv >/dev/null 2>&1 && [[ -f "$ROOT_DIR/devenv.nix" ]]; then
-    if ! (cd "$ROOT_DIR" && devenv shell --no-tui --no-reload -- bash -lc "$command"); then
-      failures+=("$label: $command")
-    fi
-  else
-    if ! (cd "$ROOT_DIR" && bash -lc "$command"); then
-      failures+=("$label: $command")
+resolve_explicit() {
+  if [[ -n "${EXPLICIT_BIN:-}" && -x "${EXPLICIT_BIN}" ]]; then
+    printf '%s\n' "${EXPLICIT_BIN}"
+    return 0
+  fi
+  if [[ -f "$EXPLICIT_BIN_FILE" ]]; then
+    local candidate
+    candidate="$(<"$EXPLICIT_BIN_FILE")"
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
     fi
   fi
+  if command -v explicit >/dev/null 2>&1; then
+    command -v explicit
+    return 0
+  fi
+  return 1
 }
 
-for entry in "${COMMANDS[@]}"; do
-  kind="${entry%%$'\t'*}"
-  command="${entry#*$'\t'}"
-  run_cmd "$kind" "$command"
-done
-
-if [[ "${#failures[@]}" -gt 0 ]]; then
-  {
-    echo "Stop blocked because the project checks are failing:"
-    printf ' - %s\n' "${failures[@]}"
-    echo
-    echo "Fix the failing lint/build/test command or update .nono/guard-commands.json before stopping."
-  } >&2
+if ! EXPLICIT_BIN="$(resolve_explicit)"; then
+  echo "Stop blocked because explicit could not be found for verification. Run 'explicit apply' again." >&2
   exit 2
 fi
+
+cd "$ROOT_DIR"
+exec "$EXPLICIT_BIN" verify --root "$ROOT_DIR" --stop-hook
 "#;
-    fs::write(&path, script).with_context(|| format!("failed to write {}", path.display()))?;
-    let mut permissions = fs::metadata(&path)
+    write_executable_script(&path, script)?;
+    Ok(())
+}
+
+fn write_git_verify_script(root: &Path) -> Result<()> {
+    let path = root.join(GIT_PRE_PUSH_SCRIPT_PATH.trim_start_matches("./"));
+    let script = r#"#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+EXPLICIT_BIN_FILE="$ROOT_DIR/.nono/explicit-bin"
+
+resolve_explicit() {
+  if [[ -n "${EXPLICIT_BIN:-}" && -x "${EXPLICIT_BIN}" ]]; then
+    printf '%s\n' "${EXPLICIT_BIN}"
+    return 0
+  fi
+  if [[ -f "$EXPLICIT_BIN_FILE" ]]; then
+    local candidate
+    candidate="$(<"$EXPLICIT_BIN_FILE")"
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  fi
+  if command -v explicit >/dev/null 2>&1; then
+    command -v explicit
+    return 0
+  fi
+  return 1
+}
+
+if ! EXPLICIT_BIN="$(resolve_explicit)"; then
+  echo "Push blocked because explicit could not be found for verification. Run 'explicit apply' again." >&2
+  exit 2
+fi
+
+cd "$ROOT_DIR"
+exec "$EXPLICIT_BIN" verify --root "$ROOT_DIR" --git-hook
+"#;
+    write_executable_script(&path, script)?;
+    Ok(())
+}
+
+fn install_git_pre_push_hook(root: &Path) -> Result<()> {
+    let Some(hooks_dir) = resolve_git_hooks_dir(root)? else {
+        return Ok(());
+    };
+    fs::create_dir_all(&hooks_dir)
+        .with_context(|| format!("failed to create {}", hooks_dir.display()))?;
+    let hook_path = hooks_dir.join("pre-push");
+    let backup_path = hooks_dir.join("pre-push.explicit-user");
+
+    if hook_path.exists() && !is_managed_pre_push_hook(&hook_path)? {
+        fs::copy(&hook_path, &backup_path).with_context(|| {
+            format!(
+                "failed to preserve existing git pre-push hook at {}",
+                hook_path.display()
+            )
+        })?;
+    }
+
+    let script = format!(
+        r#"#!/usr/bin/env bash
+{marker}
+set -euo pipefail
+
+ROOT_DIR={root}
+USER_HOOK={user_hook}
+
+if [[ -x "$USER_HOOK" ]]; then
+  "$USER_HOOK" "$@"
+fi
+
+exec "$ROOT_DIR/.nono/pre-push-verify.sh" "$@"
+"#,
+        marker = MANAGED_PRE_PUSH_MARKER,
+        root = shell_quote(root),
+        user_hook = shell_quote(&backup_path),
+    );
+    write_executable_script(&hook_path, &script)?;
+    Ok(())
+}
+
+fn resolve_git_hooks_dir(root: &Path) -> Result<Option<std::path::PathBuf>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--git-path", "hooks"])
+        .output()
+        .context("failed to inspect git hooks path")?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let path = std::path::PathBuf::from(raw);
+    if path.is_absolute() {
+        Ok(Some(path))
+    } else {
+        Ok(Some(root.join(path)))
+    }
+}
+
+fn is_managed_pre_push_hook(path: &Path) -> Result<bool> {
+    let content =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    Ok(content.contains(MANAGED_PRE_PUSH_MARKER))
+}
+
+fn write_executable_script(path: &Path, script: &str) -> Result<()> {
+    fs::write(path, script).with_context(|| format!("failed to write {}", path.display()))?;
+    let mut permissions = fs::metadata(path)
         .with_context(|| format!("failed to read {}", path.display()))?
         .permissions();
     permissions.set_mode(0o755);
-    fs::set_permissions(&path, permissions)
+    fs::set_permissions(path, permissions)
         .with_context(|| format!("failed to chmod {}", path.display()))?;
     Ok(())
+}
+
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', r#"'"'"'"#))
 }
 
 fn write_claude_settings(root: &Path) -> Result<()> {
@@ -222,6 +341,7 @@ fn read_toml_table_or_empty(path: &Path) -> Result<TomlTable> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::process::Command;
 
     use serde_json::Value as JsonValue;
     use tempfile::tempdir;
@@ -284,5 +404,66 @@ mod tests {
                 .unwrap();
         assert!(payload.get("PreToolUse").is_some());
         assert_eq!(payload["Stop"][0]["hooks"][0]["command"], STOP_GUARD_PATH);
+    }
+
+    #[test]
+    fn writes_explicit_bin_path() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".nono")).unwrap();
+        write_explicit_bin_path(dir.path()).unwrap();
+        let written = fs::read_to_string(dir.path().join(".nono/explicit-bin")).unwrap();
+        assert_eq!(
+            written,
+            std::env::current_exe().unwrap().display().to_string()
+        );
+    }
+
+    #[test]
+    fn stop_guard_script_invokes_explicit_verify() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".nono")).unwrap();
+        write_stop_guard_script(dir.path()).unwrap();
+        let script = fs::read_to_string(dir.path().join(".nono/stop-guard.sh")).unwrap();
+        assert!(script.contains("verify --root \"$ROOT_DIR\" --stop-hook"));
+        assert!(script.contains(".nono/explicit-bin"));
+        assert!(!script.contains("jq -r"));
+    }
+
+    #[test]
+    fn git_verify_script_invokes_explicit_verify() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".nono")).unwrap();
+        write_git_verify_script(dir.path()).unwrap();
+        let script = fs::read_to_string(dir.path().join(".nono/pre-push-verify.sh")).unwrap();
+        assert!(script.contains("verify --root \"$ROOT_DIR\" --git-hook"));
+        assert!(script.contains(".nono/explicit-bin"));
+    }
+
+    #[test]
+    fn installs_managed_pre_push_hook_and_preserves_existing_one() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(root)
+            .status()
+            .unwrap();
+        let hooks_dir = resolve_git_hooks_dir(root).unwrap().unwrap();
+        fs::create_dir_all(&hooks_dir).unwrap();
+        fs::write(
+            hooks_dir.join("pre-push"),
+            "#!/usr/bin/env bash\necho user-hook\n",
+        )
+        .unwrap();
+
+        install_git_pre_push_hook(root).unwrap();
+
+        let managed = fs::read_to_string(hooks_dir.join("pre-push")).unwrap();
+        assert!(managed.contains(MANAGED_PRE_PUSH_MARKER));
+        assert!(managed.contains(".nono/pre-push-verify.sh"));
+
+        let preserved = fs::read_to_string(hooks_dir.join("pre-push.explicit-user")).unwrap();
+        assert!(preserved.contains("user-hook"));
     }
 }

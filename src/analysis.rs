@@ -373,7 +373,7 @@ fn analyze_common_files(root: &Path, builder: &mut Builder) -> Result<()> {
     if cargo_toml.exists() {
         builder.add_marker("Cargo.toml");
         builder.add_language(LanguageRequirement::Rust);
-        builder.add_build("cargo build");
+        builder.add_build("cargo build --release");
         builder.add_lint("cargo fmt --check");
         builder.add_lint("cargo clippy --all-targets --all-features -- -D warnings");
         builder.add_test("cargo test");

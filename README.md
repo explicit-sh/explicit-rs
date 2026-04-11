@@ -21,6 +21,7 @@ Given a project directory, `explicit`:
 - regenerates [devenv.generated.nix](/Users/onnimonni/Projects/devenv-nono-llm/devenv.generated.nix) from the detected requirements
 - writes analysis output to `.nono/analysis.json` and `.nono/sandbox-plan.json`
 - writes a shared stop hook used by Claude and Codex
+- installs a managed `pre-push` git hook when the project is a git repo
 - launches a `devenv` shell, starts detected services, and re-execs into a `nono` sandbox
 
 ## Why The Name
@@ -42,6 +43,7 @@ The CLI is:
 explicit scan
 explicit apply
 explicit doctor
+explicit verify
 explicit shell
 explicit observe
 explicit observe codex
@@ -56,6 +58,7 @@ What each command does:
 - `scan`: prints the detected requirements as JSON
 - `apply`: updates `devenv.nix` wiring, rewrites `devenv.generated.nix`, and refreshes `.nono/` metadata and hooks
 - `doctor`: prints a readable summary of what was detected
+- `verify`: runs the detected lint, build, and test commands with short failure summaries
 - `shell`: realizes the `devenv` environment and launches a sandboxed shell for agents or manual use
 - `observe`: attaches to a live agent run in the current project, or falls back to the latest saved report when no live socket exists
 - `observe codex`: launches Codex, then ingests the new Codex session JSONL into a run-scoped SQLite database
@@ -72,6 +75,7 @@ Run directly with Cargo:
 cargo run -- scan
 cargo run -- apply
 cargo run -- doctor
+cargo run -- verify
 cargo run -- shell
 cargo run -- observe
 cargo run -- observe codex
@@ -102,6 +106,7 @@ Run inside the repo `devenv` shell:
 devenv shell
 explicit apply
 explicit doctor
+explicit verify
 explicit shell --command codex
 explicit observe
 explicit observe codex
@@ -209,9 +214,11 @@ The sandbox is intentionally narrow. It allows:
 
 The stop hook blocks agent shutdown if discovered lint, build, or test commands fail.
 
-For example, if a project exposes `cargo fmt --check`, `cargo clippy`, `cargo build`, `cargo test`, `pytest`, `pnpm test`, or `make build`, those commands become part of the stop gate.
+Both the shared agent stop hooks and the managed `pre-push` git hook delegate to `explicit verify`, so the check logic lives in one place.
 
-If no concrete lint or build command is detected, the hook remains advisory and allows exit.
+For example, if a project exposes `cargo fmt --check`, `cargo clippy`, `cargo build --release`, `cargo test`, `pytest`, `pnpm test`, or `make build`, those commands become part of the stop gate.
+
+If no concrete lint, build, or test command is detected, the hook remains advisory and allows exit.
 
 ## Generated Files
 
@@ -221,8 +228,10 @@ Files managed by the tool:
 - `.explicit-observe.sock`: live per-project run socket while an agent is active
 - `.nono/analysis.json`: raw scan result
 - `.nono/sandbox-plan.json`: resolved sandbox permissions
-- `.nono/guard-commands.json`: lint and build commands used by the stop hook
-- `.nono/stop-guard.sh`: hook implementation
+- `.nono/guard-commands.json`: generated metadata for detected lint, build, and test commands
+- `.nono/stop-guard.sh`: shared stop-hook launcher that delegates to `explicit verify`
+- `.nono/pre-push-verify.sh`: git-hook launcher that delegates to `explicit verify`
+- `.git/hooks/pre-push`: managed wrapper that chains any preserved user hook, then runs `.nono/pre-push-verify.sh`
 - `.nono/observability/<run-id>/events.sqlite`: observed Codex run data
 
 [devenv.nix](/Users/onnimonni/Projects/devenv-nono-llm/devenv.nix) is treated as the user-owned entrypoint. `explicit` only ensures the generated import exists and leaves the rest of the file under user control.

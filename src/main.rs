@@ -7,6 +7,7 @@ mod observe;
 mod registry;
 mod runtime;
 mod sandbox;
+mod verify;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -35,6 +36,8 @@ enum Command {
     Apply(CommonArgs),
     #[command(about = "Show a readable summary of detected tools, services, and commands.")]
     Doctor(CommonArgs),
+    #[command(about = "Run the detected lint, build, and test commands for the project.")]
+    Verify(VerifyArgs),
     #[command(about = "Launch a devenv-powered sandbox shell for agents or manual use.")]
     Shell(ShellArgs),
     #[command(about = "Attach to a live project run or inspect observed Codex telemetry.")]
@@ -71,6 +74,16 @@ struct ShellArgs {
     block_network: bool,
     #[arg(long, action = ArgAction::SetTrue)]
     no_services: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+struct VerifyArgs {
+    #[arg(long, default_value = ".")]
+    root: PathBuf,
+    #[arg(long, hide = true, action = ArgAction::SetTrue)]
+    stop_hook: bool,
+    #[arg(long, hide = true, action = ArgAction::SetTrue)]
+    git_hook: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -185,6 +198,11 @@ fn run() -> Result<ExitCode> {
             let analysis = Analysis::analyze(&root)?;
             runtime::print_doctor(&analysis)?;
             Ok(ExitCode::SUCCESS)
+        }
+        Command::Verify(args) => {
+            let root = args.root.canonicalize().context("failed to resolve root")?;
+            let analysis = Analysis::analyze(&root)?;
+            verify::run_project_checks(&root, &analysis, args.stop_hook, args.git_hook)
         }
         Command::Shell(args) => {
             let root = args.root.canonicalize().context("failed to resolve root")?;
@@ -308,6 +326,7 @@ mod tests {
         Cli, Command, ObserveCommand, build_agent_command, extract_observe_flag, shell_escape,
     };
     use clap::Parser;
+    use std::path::PathBuf;
 
     #[test]
     fn build_agent_command_quotes_arguments_for_shell() {
@@ -368,5 +387,17 @@ mod tests {
             }
             _ => panic!("expected observe claude command"),
         }
+    }
+
+    #[test]
+    fn verify_subcommand_parses() {
+        let cli = Cli::try_parse_from(["explicit", "verify", "--root", "/tmp/project"])
+            .expect("expected verify to parse");
+        let Command::Verify(args) = cli.command else {
+            panic!("expected verify command");
+        };
+        assert_eq!(args.root, PathBuf::from("/tmp/project"));
+        assert!(!args.stop_hook);
+        assert!(!args.git_hook);
     }
 }

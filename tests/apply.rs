@@ -23,6 +23,24 @@ fn run_doctor(root: &std::path::Path) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
+fn run_verify(root: &std::path::Path) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_explicit"))
+        .args(["verify", "--root"])
+        .arg(root)
+        .output()
+        .expect("failed to run explicit verify")
+}
+
+fn run_scan(root: &std::path::Path) -> JsonValue {
+    let output = Command::new(env!("CARGO_BIN_EXE_explicit"))
+        .args(["scan", "--root"])
+        .arg(root)
+        .output()
+        .expect("failed to run explicit scan");
+    assert!(output.status.success());
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
 #[test]
 fn apply_detects_node_make_and_generates_hooks() {
     let dir = tempdir().unwrap();
@@ -120,6 +138,32 @@ fn doctor_reports_detected_test_commands() {
 
     let output = run_doctor(root);
     assert!(output.contains("Test commands: pnpm exec vitest run"));
+}
+
+#[test]
+fn rust_projects_use_release_builds() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2021"
+"#,
+    )
+    .unwrap();
+
+    let analysis = run_scan(root);
+    let builds = analysis["build_commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry.as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(builds.contains(&"cargo build --release"));
+    assert!(!builds.contains(&"cargo build"));
 }
 
 #[test]
@@ -474,4 +518,61 @@ gem "rspec-rails"
         .map(|entry| entry["command"].as_str().unwrap())
         .collect::<Vec<_>>();
     assert!(test_entries.contains(&"bundle exec rspec"));
+}
+
+#[test]
+fn apply_installs_managed_pre_push_hook_for_git_repos() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    Command::new("git")
+        .arg("init")
+        .arg("-q")
+        .arg(root)
+        .status()
+        .unwrap();
+    fs::write(root.join("Makefile"), "lint:\n\t@echo lint\n").unwrap();
+
+    run_tool(root);
+
+    let hook = fs::read_to_string(root.join(".git/hooks/pre-push")).unwrap();
+    assert!(hook.contains("explicit-managed-pre-push"));
+    assert!(hook.contains(".nono/pre-push-verify.sh"));
+}
+
+#[test]
+fn verify_passes_when_detected_checks_succeed() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    fs::write(
+        root.join("Makefile"),
+        "lint:\n\t@echo lint-ok\nbuild:\n\t@echo build-ok\ntest:\n\t@echo test-ok\n",
+    )
+    .unwrap();
+
+    let output = run_verify(root);
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("All project checks passed")
+    );
+}
+
+#[test]
+fn verify_blocks_stop_when_detected_checks_fail() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    fs::write(
+        root.join("Makefile"),
+        "lint:\n\t@echo lint-ok\nbuild:\n\t@echo 'error: release build exploded' >&2\n\t@exit 1\ntest:\n\t@echo test-ok\n",
+    )
+    .unwrap();
+
+    let output = run_verify(root);
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("Verification failed."));
+    assert!(stderr.contains("build"));
+    assert!(stderr.contains("make build"));
+    assert!(stderr.contains("release build exploded"));
 }
