@@ -30,7 +30,7 @@ pub fn build_injection_env(log_path: &Path) -> Result<BTreeMap<String, String>> 
             "LD_PRELOAD".to_string(),
             merge_preload_value("LD_PRELOAD", &library, " "),
         );
-        return Ok(env);
+        Ok(env)
     }
 
     #[cfg(not(target_os = "linux"))]

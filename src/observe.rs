@@ -1974,6 +1974,8 @@ mod tests {
         prepare_socket_path, sanitize_transcript_preview, snapshot_session_files, socket_path,
         unique_run_id,
     };
+    #[cfg(target_os = "linux")]
+    use crate::env_trace;
     use rusqlite::Connection;
     use serde_json::json;
     use std::{fs, path::Path, process::ExitCode};
