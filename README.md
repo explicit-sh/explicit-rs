@@ -61,7 +61,7 @@ What each command does:
 - `apply`: updates `devenv.nix` wiring, rewrites `explicit.generated.deps.nix`, and refreshes `.nono/` metadata and hooks
 - `doctor`: prints a readable summary of what was detected
 - `doctor` includes detected runtime versions and where they came from
-- `verify`: runs the detected lint, build, and test commands with short failure summaries
+- `verify`: runs the detected lint, build, test, and repository policy checks with short failure summaries
 - `shell`: realizes the `devenv` environment and launches a sandboxed shell for agents or manual use
 - `observe`: attaches to a live agent run in the current project, or falls back to the latest saved report when no live socket exists
 - `observe codex`: launches Codex, then ingests the new Codex session JSONL into a run-scoped SQLite database
@@ -219,11 +219,18 @@ The sandbox is intentionally narrow. It allows:
 - `.codex/hooks.json`
 - `.codex/config.toml`
 
-The stop hook blocks agent shutdown if discovered lint, build, or test commands fail.
+The stop hook blocks agent shutdown if any verification check fails.
 
 Both the shared agent stop hooks and the managed `pre-push` git hook delegate to `explicit verify`, so the check logic lives in one place.
 
 For example, if a project exposes `cargo fmt --check`, `cargo clippy`, `cargo build --release`, `cargo test`, `pytest`, `pnpm test`, or `make build`, those commands become part of the stop gate.
+
+`explicit verify` also enforces a few repository-level policies:
+
+- git repositories must include a top-level `README.md`
+- public GitHub repositories must include a `LICENSE` file
+- public GitHub repositories must include GitHub Actions workflows that run automatically and cover the detected lint, build, and test commands
+- existing GitHub Actions workflows are syntax-checked, using `actionlint` when it is available in the environment and a YAML/shape validator as fallback
 
 If no concrete lint, build, or test command is detected, the hook remains advisory and allows exit.
 

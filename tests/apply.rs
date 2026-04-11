@@ -553,7 +553,7 @@ fn verify_passes_when_detected_checks_succeed() {
     let output = run_verify(root);
     assert!(output.status.success());
     assert!(
-        String::from_utf8(output.stdout)
+        String::from_utf8(output.stderr)
             .unwrap()
             .contains("All project checks passed")
     );

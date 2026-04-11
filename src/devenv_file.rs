@@ -568,6 +568,7 @@ mod tests {
                 "Detected rustler in the Elixir dependencies; enabling Rust because Rustler-backed NIFs need a Rust toolchain.".to_string(),
                 "Detected postgrex in the Elixir dependencies; adding the PostgreSQL client package and enabling PostgreSQL for local development.".to_string(),
             ],
+            repository: crate::analysis::RepositoryMetadata::default(),
             sandbox_plan: SandboxPlan {
                 root: "/tmp/project".into(),
                 read_write_files: Vec::new(),

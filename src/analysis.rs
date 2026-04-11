@@ -7,6 +7,7 @@ use onefetch::cli::CliOptions;
 use onefetch::info::langs::get_loc_by_language_sorted;
 use onefetch_manifest::{ManifestType, get_manifests};
 use regex::Regex;
+use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value as YamlValue;
 use toml::Value as TomlValue;
@@ -14,7 +15,7 @@ use toml::Value as TomlValue;
 use crate::host_tools::{host_command_paths, host_command_support_dirs};
 use crate::registry::{self, ProjectContext};
 
-pub const SUPPORT_PACKAGES: &[&str] = &["git", "jq", "nono"];
+pub const SUPPORT_PACKAGES: &[&str] = &["actionlint", "git", "jq", "nono"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -201,6 +202,51 @@ pub struct SandboxPlan {
     pub notes: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GitHubVisibility {
+    Public,
+    Private,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct GitHubRepository {
+    pub slug: String,
+    pub visibility: GitHubVisibility,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RepositoryMetadata {
+    pub is_git_repository: bool,
+    pub readme_path: Option<String>,
+    pub license_path: Option<String>,
+    #[serde(default)]
+    pub workflow_files: Vec<String>,
+    pub github: Option<GitHubRepository>,
+}
+
+impl RepositoryMetadata {
+    pub fn has_readme(&self) -> bool {
+        self.readme_path.is_some()
+    }
+
+    pub fn has_license(&self) -> bool {
+        self.license_path.is_some()
+    }
+
+    pub fn has_workflows(&self) -> bool {
+        !self.workflow_files.is_empty()
+    }
+
+    pub fn is_public_github_repository(&self) -> bool {
+        self.github
+            .as_ref()
+            .is_some_and(|repo| repo.visibility == GitHubVisibility::Public)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Analysis {
     pub root: PathBuf,
@@ -217,6 +263,7 @@ pub struct Analysis {
     pub build_commands: Vec<String>,
     pub test_commands: Vec<String>,
     pub notes: Vec<String>,
+    pub repository: RepositoryMetadata,
     pub sandbox_plan: SandboxPlan,
 }
 
@@ -304,6 +351,7 @@ impl Analysis {
         analyze_compose_services(root, &mut builder)?;
         apply_registry_matches(root, &mut builder, &project_context)?;
         let detected_versions = detect_runtime_versions(root, &builder, &project_context)?;
+        let repository = detect_repository_metadata(root)?;
 
         if builder.lint_commands.is_empty()
             && builder.build_commands.is_empty()
@@ -331,6 +379,7 @@ impl Analysis {
             build_commands: builder.build_commands,
             test_commands: builder.test_commands,
             notes: builder.notes.clone(),
+            repository,
             sandbox_plan,
         })
     }
@@ -348,6 +397,218 @@ impl Analysis {
             .iter()
             .map(DetectedVersion::summary)
             .collect()
+    }
+}
+
+fn detect_repository_metadata(root: &Path) -> Result<RepositoryMetadata> {
+    let is_git_repository = is_git_repository(root)?;
+    let workflow_files = discover_workflow_files(root)?;
+    let readme_path = root
+        .join("README.md")
+        .is_file()
+        .then_some("README.md".to_string());
+    let license_path = discover_license_file(root);
+    let github = if is_git_repository {
+        detect_github_repository(root)?
+    } else {
+        None
+    };
+
+    Ok(RepositoryMetadata {
+        is_git_repository,
+        readme_path,
+        license_path,
+        workflow_files,
+        github,
+    })
+}
+
+fn is_git_repository(root: &Path) -> Result<bool> {
+    let output = match std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+    {
+        Ok(output) => output,
+        Err(_) => return Ok(false),
+    };
+    Ok(output.status.success()
+        && String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .eq_ignore_ascii_case("true"))
+}
+
+fn discover_license_file(root: &Path) -> Option<String> {
+    for candidate in [
+        "LICENSE",
+        "LICENSE.md",
+        "LICENSE.txt",
+        "LICENSE-MIT",
+        "LICENSE-APACHE",
+        "LICENCE",
+        "LICENCE.md",
+        "COPYING",
+        "UNLICENSE",
+    ] {
+        if root.join(candidate).is_file() {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+fn discover_workflow_files(root: &Path) -> Result<Vec<String>> {
+    let workflows_dir = root.join(".github/workflows");
+    if !workflows_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut files = Vec::new();
+    for entry in fs::read_dir(&workflows_dir)
+        .with_context(|| format!("failed to read {}", workflows_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !matches!(extension, "yml" | "yaml") {
+            continue;
+        }
+        let relative = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        files.push(relative);
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn detect_github_repository(root: &Path) -> Result<Option<GitHubRepository>> {
+    for remote in git_remote_names(root)? {
+        let Some(url) = git_remote_url(root, &remote)? else {
+            continue;
+        };
+        let Some(slug) = parse_github_slug(&url) else {
+            continue;
+        };
+        return Ok(Some(GitHubRepository {
+            visibility: github_visibility(&slug),
+            slug,
+        }));
+    }
+    Ok(None)
+}
+
+fn git_remote_names(root: &Path) -> Result<Vec<String>> {
+    let output = match std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .arg("remote")
+        .output()
+    {
+        Ok(output) => output,
+        Err(_) => return Ok(Vec::new()),
+    };
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+
+    let mut remotes = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    remotes.sort_by_key(|name| if name == "origin" { 0 } else { 1 });
+    Ok(remotes)
+}
+
+fn git_remote_url(root: &Path, remote: &str) -> Result<Option<String>> {
+    let output = match std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["remote", "get-url", remote])
+        .output()
+    {
+        Ok(output) => output,
+        Err(_) => return Ok(None),
+    };
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok((!url.is_empty()).then_some(url))
+}
+
+fn parse_github_slug(remote_url: &str) -> Option<String> {
+    let trimmed = remote_url.trim().trim_end_matches('/');
+    let without_git = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+
+    for prefix in [
+        "https://github.com/",
+        "http://github.com/",
+        "ssh://git@github.com/",
+        "git@github.com:",
+    ] {
+        if let Some(rest) = without_git.strip_prefix(prefix) {
+            let mut parts = rest.split('/').filter(|part| !part.is_empty());
+            let owner = parts.next()?;
+            let repo = parts.next()?;
+            if parts.next().is_none() {
+                return Some(format!("{owner}/{repo}"));
+            }
+        }
+    }
+
+    None
+}
+
+fn github_visibility(slug: &str) -> GitHubVisibility {
+    #[derive(Deserialize)]
+    struct GitHubRepoApi {
+        private: bool,
+    }
+
+    let client = match Client::builder()
+        .user_agent(format!("explicit/{}", env!("CARGO_PKG_VERSION")))
+        .timeout(std::time::Duration::from_secs(4))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return GitHubVisibility::Unknown,
+    };
+
+    let mut request = client.get(format!("https://api.github.com/repos/{slug}"));
+    if let Some(token) = std::env::var("GITHUB_TOKEN")
+        .ok()
+        .or_else(|| std::env::var("GH_TOKEN").ok())
+    {
+        request = request.bearer_auth(token);
+    }
+
+    let response = match request.send() {
+        Ok(response) => response,
+        Err(_) => return GitHubVisibility::Unknown,
+    };
+
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return GitHubVisibility::Unknown;
+    }
+    if !response.status().is_success() {
+        return GitHubVisibility::Unknown;
+    }
+
+    match response.json::<GitHubRepoApi>() {
+        Ok(payload) if payload.private => GitHubVisibility::Private,
+        Ok(_) => GitHubVisibility::Public,
+        Err(_) => GitHubVisibility::Unknown,
     }
 }
 
@@ -1862,10 +2123,10 @@ fn linux_agent_read_only_paths(_home: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Analysis, Builder, LanguageRequirement, RuntimeKind, SUPPORT_PACKAGES, SandboxPlan,
-        build_sandbox_plan, fallback_javascript_test_commands, platform_agent_read_only_paths,
-        platform_agent_read_write_paths, referenced_instruction_paths, script_is_placeholder,
-        standard_device_read_write_paths,
+        Analysis, Builder, LanguageRequirement, RepositoryMetadata, RuntimeKind, SUPPORT_PACKAGES,
+        SandboxPlan, build_sandbox_plan, fallback_javascript_test_commands,
+        platform_agent_read_only_paths, platform_agent_read_write_paths,
+        referenced_instruction_paths, script_is_placeholder, standard_device_read_write_paths,
     };
     use std::{collections::BTreeSet, fs, path::PathBuf};
     use tempfile::tempdir;
@@ -1894,6 +2155,7 @@ mod tests {
             build_commands: Vec::new(),
             test_commands: Vec::new(),
             notes: Vec::new(),
+            repository: RepositoryMetadata::default(),
             sandbox_plan: SandboxPlan {
                 root: PathBuf::from("/tmp/project"),
                 read_write_files: Vec::new(),
