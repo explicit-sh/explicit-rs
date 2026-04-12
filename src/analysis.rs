@@ -510,14 +510,14 @@ fn analyze_single_project(root: &Path) -> Result<Analysis> {
         packages: builder.packages.into_iter().collect(),
         services: builder.services.iter().copied().collect(),
         nix_options: builder.nix_options.into_iter().collect(),
-            requires_allow_unfree: builder.requires_allow_unfree,
-            lint_commands: builder.lint_commands,
-            build_commands: builder.build_commands,
-            test_commands: builder.test_commands,
-            required_checks: builder.required_checks,
-            notes: builder.notes.clone(),
-            repository,
-            sandbox_plan,
+        requires_allow_unfree: builder.requires_allow_unfree,
+        lint_commands: builder.lint_commands,
+        build_commands: builder.build_commands,
+        test_commands: builder.test_commands,
+        required_checks: builder.required_checks,
+        notes: builder.notes.clone(),
+        repository,
+        sandbox_plan,
     })
 }
 
@@ -1065,7 +1065,10 @@ fn merge_unique_versions(target: &mut Vec<DetectedVersion>, values: Vec<Detected
     target.sort_by_key(|entry| (entry.runtime, entry.source.clone()));
 }
 
-fn merge_unique_requirements(target: &mut Vec<ProjectRequirement>, values: Vec<ProjectRequirement>) {
+fn merge_unique_requirements(
+    target: &mut Vec<ProjectRequirement>,
+    values: Vec<ProjectRequirement>,
+) {
     for value in values {
         if !target.contains(&value) {
             target.push(value);
@@ -3260,12 +3263,16 @@ end
         .unwrap();
 
         let analysis = Analysis::analyze(dir.path()).unwrap();
-        assert!(analysis
-            .lint_commands
-            .contains(&"mix format --check-formatted".to_string()));
-        assert!(analysis
-            .lint_commands
-            .contains(&"mix credo --strict".to_string()));
+        assert!(
+            analysis
+                .lint_commands
+                .contains(&"mix format --check-formatted".to_string())
+        );
+        assert!(
+            analysis
+                .lint_commands
+                .contains(&"mix credo --strict".to_string())
+        );
         assert_eq!(analysis.required_checks.len(), 1);
         assert_eq!(analysis.required_checks[0].subject, "mix.exs");
         assert!(analysis.required_checks[0].summary.contains("Credo"));
@@ -3294,9 +3301,11 @@ end
         .unwrap();
 
         let analysis = Analysis::analyze(dir.path()).unwrap();
-        assert!(analysis
-            .lint_commands
-            .contains(&"mix credo --strict".to_string()));
+        assert!(
+            analysis
+                .lint_commands
+                .contains(&"mix credo --strict".to_string())
+        );
         assert!(analysis.required_checks.is_empty());
     }
 
@@ -3392,14 +3401,18 @@ end
 
         let analysis = Analysis::analyze(dir.path()).unwrap();
         assert!(analysis.markers.contains(&"workspace".to_string()));
-        assert!(analysis
-            .notes
-            .iter()
-            .any(|note| note.contains("services/api (mix.exs)")));
-        assert!(analysis
-            .notes
-            .iter()
-            .any(|note| note.contains("services/worker (mix.exs)")));
+        assert!(
+            analysis
+                .notes
+                .iter()
+                .any(|note| note.contains("services/api (mix.exs)"))
+        );
+        assert!(
+            analysis
+                .notes
+                .iter()
+                .any(|note| note.contains("services/worker (mix.exs)"))
+        );
     }
 
     #[test]
@@ -3416,13 +3429,17 @@ end
         fs::write(mobile.join(".node-version"), "18.20.2\n").unwrap();
 
         let analysis = Analysis::analyze(dir.path()).unwrap();
-        assert!(analysis
-            .detected_versions
-            .iter()
-            .any(|version| version.source == "services/api/.node-version"));
-        assert!(analysis
-            .detected_versions
-            .iter()
-            .any(|version| version.source == "apps/mobile/.node-version"));
+        assert!(
+            analysis
+                .detected_versions
+                .iter()
+                .any(|version| version.source == "services/api/.node-version")
+        );
+        assert!(
+            analysis
+                .detected_versions
+                .iter()
+                .any(|version| version.source == "apps/mobile/.node-version")
+        );
     }
 }

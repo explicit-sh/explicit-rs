@@ -768,7 +768,12 @@ fn devenv_check_command(
     }
     child
         .args(["shell", "--no-tui", "--no-reload", "--", "bash", "-lc"])
-        .arg(command_in_devenv_shell(root, devenv_root, analysis, command));
+        .arg(command_in_devenv_shell(
+            root,
+            devenv_root,
+            analysis,
+            command,
+        ));
     child
 }
 
@@ -1261,7 +1266,8 @@ fn start_verify_services_with_retry(
     if refresh_cache {
         child.args(["--refresh-eval-cache", "--refresh-task-cache"]);
     }
-    child.args(["up", "--detach", "--no-tui", "--no-reload"])
+    child
+        .args(["up", "--detach", "--no-tui", "--no-reload"])
         .args(&processes);
     let output = run_captured_command(
         &mut child,

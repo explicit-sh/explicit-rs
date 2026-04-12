@@ -567,8 +567,7 @@ pub(crate) fn devenv_already_running_pid(output: &str) -> Option<String> {
 pub(crate) fn stale_devenv_cache_detected(output: &str) -> bool {
     output.contains("Cached paths no longer exist (garbage collected?)")
         || output.contains("Cached env path no longer exists")
-        || (output.contains("does not exist and cannot be created")
-            && output.contains("devenv-"))
+        || (output.contains("does not exist and cannot be created") && output.contains("devenv-"))
 }
 
 fn devenv_shell_env_command(root: &Path, refresh_cache: bool) -> Command {
@@ -1086,12 +1085,8 @@ not-a-row
 
     #[test]
     fn detects_already_running_devenv_process_pid() {
-        let output =
-            "Error:   × Processes already running with PID 23984. Stop them first with: devenv processes down";
-        assert_eq!(
-            devenv_already_running_pid(output).as_deref(),
-            Some("23984")
-        );
+        let output = "Error:   × Processes already running with PID 23984. Stop them first with: devenv processes down";
+        assert_eq!(devenv_already_running_pid(output).as_deref(), Some("23984"));
     }
 
     #[test]
