@@ -579,6 +579,7 @@ mod tests {
             services: vec![ServiceRequirement::Postgres],
             nix_options: Vec::new(),
             requires_allow_unfree: false,
+            deploy_hosts: Vec::new(),
             lint_commands: Vec::new(),
             build_commands: Vec::new(),
             test_commands: Vec::new(),

@@ -66,7 +66,11 @@ impl LanguageRequirement {
 
     pub fn default_cache_dirs(self, home: &Path) -> Vec<PathBuf> {
         match self {
-            Self::Elixir => vec![home.join(".mix"), home.join(".hex")],
+            Self::Elixir => vec![
+                home.join(".mix"),
+                home.join(".hex"),
+                home.join("Library/Caches/elixir_make"),
+            ],
             Self::Go => vec![home.join("go"), home.join(".cache/go-build")],
             Self::Java => vec![home.join(".m2"), home.join(".gradle")],
             Self::JavaScript => vec![
@@ -269,9 +273,11 @@ pub struct RepositoryMetadata {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-struct WorkspaceFile {
+struct ExplicitConfigFile {
     #[serde(default)]
-    workspace: WorkspaceConfig,
+    workspace: Option<WorkspaceConfig>,
+    #[serde(default)]
+    deploy: Option<DeployConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -296,6 +302,12 @@ impl Default for WorkspaceConfig {
 
 fn default_workspace_auto_discover() -> bool {
     true
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+struct DeployConfig {
+    #[serde(default)]
+    hosts: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -351,6 +363,8 @@ pub struct Analysis {
     pub services: Vec<ServiceRequirement>,
     pub nix_options: Vec<String>,
     pub requires_allow_unfree: bool,
+    #[serde(default)]
+    pub deploy_hosts: Vec<String>,
     pub lint_commands: Vec<String>,
     pub build_commands: Vec<String>,
     pub test_commands: Vec<String>,
@@ -441,7 +455,7 @@ impl Builder {
 impl Analysis {
     pub fn analyze(root: &Path) -> Result<Self> {
         let mut analysis = analyze_single_project(root)?;
-        if !workspace_auto_discovery_enabled(root) {
+        if !workspace_auto_discovery_enabled(root)? {
             return Ok(analysis);
         }
         let discovery = discover_workspace_members(root)?;
@@ -472,13 +486,17 @@ impl Analysis {
     }
 }
 
-fn workspace_auto_discovery_enabled(root: &Path) -> bool {
-    root.join(EXPLICIT_CONFIG_FILE).is_file() || root.join(".git").exists()
+fn workspace_auto_discovery_enabled(root: &Path) -> Result<bool> {
+    if root.join(".git").exists() {
+        return Ok(true);
+    }
+    Ok(load_explicit_config(root)?.is_some_and(|config| config.workspace.is_some()))
 }
 
 fn analyze_single_project(root: &Path) -> Result<Analysis> {
     let mut builder = Builder::default();
     let project_context = ProjectContext::load(root)?;
+    let deploy_hosts = configured_deploy_hosts(root)?;
     for package in SUPPORT_PACKAGES {
         builder.add_package(*package);
     }
@@ -511,6 +529,7 @@ fn analyze_single_project(root: &Path) -> Result<Analysis> {
         services: builder.services.iter().copied().collect(),
         nix_options: builder.nix_options.into_iter().collect(),
         requires_allow_unfree: builder.requires_allow_unfree,
+        deploy_hosts,
         lint_commands: builder.lint_commands,
         build_commands: builder.build_commands,
         test_commands: builder.test_commands,
@@ -720,7 +739,7 @@ fn discover_workspace_members(root: &Path) -> Result<WorkspaceDiscovery> {
     })
 }
 
-fn load_workspace_config(root: &Path) -> Result<Option<WorkspaceConfig>> {
+fn load_explicit_config(root: &Path) -> Result<Option<ExplicitConfigFile>> {
     let path = root.join(EXPLICIT_CONFIG_FILE);
     if !path.is_file() {
         return Ok(None);
@@ -728,9 +747,25 @@ fn load_workspace_config(root: &Path) -> Result<Option<WorkspaceConfig>> {
 
     let raw =
         fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    let parsed = toml::from_str::<WorkspaceFile>(&raw)
+    let parsed = toml::from_str::<ExplicitConfigFile>(&raw)
         .with_context(|| format!("failed to parse {}", path.display()))?;
-    Ok(Some(parsed.workspace))
+    Ok(Some(parsed))
+}
+
+fn load_workspace_config(root: &Path) -> Result<Option<WorkspaceConfig>> {
+    Ok(load_explicit_config(root)?.and_then(|config| config.workspace))
+}
+
+fn configured_deploy_hosts(root: &Path) -> Result<Vec<String>> {
+    let hosts = load_explicit_config(root)?
+        .and_then(|config| config.deploy)
+        .map(|deploy| deploy.hosts)
+        .unwrap_or_default();
+    Ok(hosts
+        .into_iter()
+        .map(|host| host.trim().to_string())
+        .filter(|host| !host.is_empty())
+        .collect())
 }
 
 fn workspace_excludes(root: &Path, config: Option<&WorkspaceConfig>) -> Result<Vec<PathBuf>> {
@@ -2885,6 +2920,7 @@ mod tests {
             services: Vec::new(),
             nix_options: Vec::new(),
             requires_allow_unfree: false,
+            deploy_hosts: Vec::new(),
             lint_commands: Vec::new(),
             build_commands: Vec::new(),
             test_commands: Vec::new(),
@@ -3011,6 +3047,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let plan = build_sandbox_plan(dir.path(), &Builder::default()).unwrap();
         assert!(plan.read_write_files.contains(&PathBuf::from("/dev/null")));
+    }
+
+    #[test]
+    fn elixir_default_cache_dirs_include_elixir_make_cache() {
+        let home = PathBuf::from("/tmp/home");
+        let dirs = LanguageRequirement::Elixir.default_cache_dirs(&home);
+        assert!(dirs.contains(&home.join(".mix")));
+        assert!(dirs.contains(&home.join(".hex")));
+        assert!(dirs.contains(&home.join("Library/Caches/elixir_make")));
     }
 
     #[test]
@@ -3223,6 +3268,49 @@ members = ["tools/custom"]
                 .iter()
                 .any(|note| note == "Workspace excludes: examples.")
         );
+    }
+
+    #[test]
+    fn deploy_hosts_load_from_explicit_toml() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("mix.exs"), "defmodule Demo.MixProject do end\n").unwrap();
+        fs::write(
+            dir.path().join(EXPLICIT_CONFIG_FILE),
+            r#"[deploy]
+hosts = ["prod.example.com", "ssh://git@deploy.example.com:2222/app"]
+"#,
+        )
+        .unwrap();
+
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert_eq!(
+            analysis.deploy_hosts,
+            vec![
+                "prod.example.com".to_string(),
+                "ssh://git@deploy.example.com:2222/app".to_string()
+            ]
+        );
+        assert!(!analysis.markers.contains(&"workspace".to_string()));
+    }
+
+    #[test]
+    fn deploy_only_explicit_toml_does_not_enable_workspace_discovery() {
+        let dir = tempdir().unwrap();
+        let nested = dir.path().join("deps/child");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(dir.path().join("mix.exs"), "defmodule Demo.MixProject do end\n").unwrap();
+        fs::write(nested.join("package.json"), r#"{"name":"child"}"#).unwrap();
+        fs::write(
+            dir.path().join(EXPLICIT_CONFIG_FILE),
+            r#"[deploy]
+hosts = ["prod.example.com"]
+"#,
+        )
+        .unwrap();
+
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert!(!analysis.markers.contains(&"workspace".to_string()));
+        assert!(analysis.deploy_hosts.contains(&"prod.example.com".to_string()));
     }
 
     #[test]

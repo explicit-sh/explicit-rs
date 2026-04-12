@@ -295,6 +295,15 @@ exclude = ["examples", "docs/generated"]
 
 `members` lets you force extra leaf roots into the analysis, and `exclude` lets you prune paths that should not participate in root-level verification.
 
+The same `explicit.toml` file can also declare SSH deploy hosts:
+
+```toml
+[deploy]
+hosts = ["prod.example.com", "ssh://git@deploy.example.com:2222/app"]
+```
+
+When deploy hosts are configured, `explicit shell`, `explicit codex`, and `explicit claude` create a project-scoped `.nono/runtime/known_hosts` file from matching entries in your local `~/.ssh/known_hosts`. The sandboxed shell then forces `ssh`, `scp`, `sftp`, and Git-over-SSH to use that reduced host list with strict host key checking, instead of exposing your full personal host inventory inside the project shell.
+
 ## Generated Files
 
 Files managed by the tool:

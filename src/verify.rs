@@ -1758,6 +1758,7 @@ mod tests {
             services: Vec::new(),
             nix_options: Vec::new(),
             requires_allow_unfree: false,
+            deploy_hosts: Vec::new(),
             lint_commands: vec!["lint-a".to_string()],
             build_commands: vec!["build-a".to_string()],
             test_commands: vec!["test-a".to_string()],

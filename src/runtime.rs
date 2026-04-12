@@ -1,9 +1,10 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -17,7 +18,7 @@ use crate::devenv_file::{
 };
 use crate::eol;
 use crate::hooks::write_stop_hook_assets;
-use crate::host_tools::host_command_paths;
+use crate::host_tools::{host_command_paths, preferred_command_path};
 
 #[derive(Debug, Clone, Default)]
 pub struct LaunchShellOptions<'a> {
@@ -27,6 +28,13 @@ pub struct LaunchShellOptions<'a> {
     pub dangerously_use_end_of_life_versions: bool,
     pub extra_env: Option<&'a BTreeMap<String, String>>,
     pub transcript_path: Option<&'a Path>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeploySshSetup {
+    configured_hosts: Vec<String>,
+    matched_hosts: Vec<String>,
+    missing_hosts: Vec<String>,
 }
 
 pub(crate) fn ensure_managed_devenv_files(root: &Path, analysis: &Analysis) -> Result<()> {
@@ -140,6 +148,14 @@ pub fn print_doctor(analysis: &Analysis) -> Result<()> {
         }
     );
     println!(
+        "Deploy hosts: {}",
+        if analysis.deploy_hosts.is_empty() {
+            "none".to_string()
+        } else {
+            analysis.deploy_hosts.join(", ")
+        }
+    );
+    println!(
         "Lint commands: {}",
         if analysis.lint_commands.is_empty() {
             "none".to_string()
@@ -219,6 +235,10 @@ pub fn launch_shell(
             .push("network access blocked for this shell invocation".to_string());
     }
 
+    if let Some(setup) = prepare_deploy_ssh(root, analysis, &runtime_dir, &mut env_map, &mut plan)? {
+        print_deploy_ssh_summary(&setup);
+    }
+
     if let Some(extra_env) = options.extra_env {
         env_map.extend(extra_env.clone());
     }
@@ -281,6 +301,225 @@ fn print_workspace_summary(analysis: &Analysis) {
             || note.starts_with("Workspace excludes:")
     }) {
         println!("{note}");
+    }
+}
+
+fn prepare_deploy_ssh(
+    root: &Path,
+    analysis: &Analysis,
+    runtime_dir: &Path,
+    env_map: &mut BTreeMap<String, String>,
+    plan: &mut SandboxPlan,
+) -> Result<Option<DeploySshSetup>> {
+    if analysis.deploy_hosts.is_empty() {
+        return Ok(None);
+    }
+
+    let home = dirs::home_dir().context("failed to resolve home directory for deploy SSH setup")?;
+    let known_hosts_source = home.join(".ssh/known_hosts");
+    let known_hosts_path = runtime_dir.join("known_hosts");
+    let wrapper_dir = runtime_dir.join("ssh-bin");
+    fs::create_dir_all(&wrapper_dir)
+        .with_context(|| format!("failed to create {}", wrapper_dir.display()))?;
+
+    let setup = write_project_known_hosts(
+        &known_hosts_source,
+        &known_hosts_path,
+        &analysis.deploy_hosts,
+    )?;
+    write_ssh_wrapper_scripts(&wrapper_dir)?;
+
+    prepend_path(env_map, &wrapper_dir);
+    env_map.insert(
+        "EXPLICIT_DEPLOY_KNOWN_HOSTS_FILE".to_string(),
+        known_hosts_path.display().to_string(),
+    );
+    env_map.insert(
+        "EXPLICIT_DEPLOY_ROOT".to_string(),
+        root.display().to_string(),
+    );
+    env_map.insert(
+        "GIT_SSH".to_string(),
+        wrapper_dir.join("ssh").display().to_string(),
+    );
+    plan.notes.push(format!(
+        "deploy SSH host verification enabled for: {}",
+        analysis.deploy_hosts.join(", ")
+    ));
+
+    Ok(Some(setup))
+}
+
+fn print_deploy_ssh_summary(setup: &DeploySshSetup) {
+    if setup.configured_hosts.is_empty() {
+        return;
+    }
+    if setup.missing_hosts.is_empty() {
+        println!(
+            "SSH known_hosts: prepared project-scoped host verification for {}.",
+            setup.matched_hosts.join(", ")
+        );
+        return;
+    }
+    if setup.matched_hosts.is_empty() {
+        println!(
+            "SSH known_hosts: no ~/.ssh/known_hosts entries found for configured deploy hosts {}; SSH connections will fail until they are added locally.",
+            setup.missing_hosts.join(", ")
+        );
+        return;
+    }
+    println!(
+        "SSH known_hosts: prepared {}. Missing local ~/.ssh/known_hosts entries for {}.",
+        setup.matched_hosts.join(", "),
+        setup.missing_hosts.join(", ")
+    );
+}
+
+fn write_project_known_hosts(
+    source: &Path,
+    destination: &Path,
+    deploy_hosts: &[String],
+) -> Result<DeploySshSetup> {
+    let mut entries = BTreeSet::new();
+    let mut matched_hosts = Vec::new();
+    let mut missing_hosts = Vec::new();
+
+    for host in deploy_hosts {
+        let host_entries = matching_known_host_entries(source, host)?;
+        if host_entries.is_empty() {
+            missing_hosts.push(host.clone());
+            continue;
+        }
+        matched_hosts.push(host.clone());
+        entries.extend(host_entries);
+    }
+
+    let rendered = if entries.is_empty() {
+        String::new()
+    } else {
+        let mut rendered = entries.into_iter().collect::<Vec<_>>().join("\n");
+        rendered.push('\n');
+        rendered
+    };
+    write_if_changed(destination, rendered)
+        .with_context(|| format!("failed to write {}", destination.display()))?;
+
+    Ok(DeploySshSetup {
+        configured_hosts: deploy_hosts.to_vec(),
+        matched_hosts,
+        missing_hosts,
+    })
+}
+
+fn matching_known_host_entries(source: &Path, host: &str) -> Result<BTreeSet<String>> {
+    if !source.is_file() {
+        return Ok(BTreeSet::new());
+    }
+
+    let ssh_keygen = preferred_command_path("ssh-keygen")
+        .unwrap_or_else(|| PathBuf::from("ssh-keygen"));
+    let mut entries = BTreeSet::new();
+    for query in deploy_host_lookup_queries(host) {
+        let output = Command::new(&ssh_keygen)
+            .args(["-F", &query, "-f"])
+            .arg(source)
+            .output()
+            .with_context(|| format!("failed to query {} with ssh-keygen", source.display()))?;
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines().map(str::trim) {
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                entries.insert(line.to_string());
+            }
+            continue;
+        }
+        if output.status.code() == Some(1) {
+            continue;
+        }
+        bail!(
+            "ssh-keygen -F failed while reading {}: {}",
+            source.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(entries)
+}
+
+fn deploy_host_lookup_queries(host: &str) -> Vec<String> {
+    let trimmed = host.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    let mut queries = BTreeSet::new();
+    queries.insert(trimmed.to_string());
+
+    let mut normalized = trimmed
+        .trim_start_matches("ssh://")
+        .split('/')
+        .next()
+        .unwrap_or(trimmed)
+        .trim()
+        .to_string();
+    if let Some((_, rest)) = normalized.rsplit_once('@') {
+        normalized = rest.to_string();
+    }
+    if let Some((prefix, _)) = normalized.split_once(':')
+        && trimmed.contains('@')
+        && !trimmed.starts_with("ssh://")
+    {
+        normalized = prefix.to_string();
+    }
+    if let Some((host_only, port)) = normalized.rsplit_once(':')
+        && port.chars().all(|ch| ch.is_ascii_digit())
+        && !host_only.contains(']')
+        && !host_only.is_empty()
+    {
+        queries.insert(format!("[{host_only}]:{port}"));
+        queries.insert(host_only.to_string());
+    } else if !normalized.is_empty() {
+        queries.insert(normalized);
+    }
+
+    queries.into_iter().collect()
+}
+
+fn write_ssh_wrapper_scripts(wrapper_dir: &Path) -> Result<()> {
+    for command in ["ssh", "scp", "sftp"] {
+        let Some(binary) = preferred_command_path(command) else {
+            continue;
+        };
+        let wrapper_path = wrapper_dir.join(command);
+        let content = format!(
+            "#!/bin/sh\nexec {} -o UserKnownHostsFile=\"$EXPLICIT_DEPLOY_KNOWN_HOSTS_FILE\" -o GlobalKnownHostsFile=/dev/null -o StrictHostKeyChecking=yes \"$@\"\n",
+            binary.display()
+        );
+        write_if_changed(&wrapper_path, content)
+            .with_context(|| format!("failed to write {}", wrapper_path.display()))?;
+        let mut permissions = fs::metadata(&wrapper_path)
+            .with_context(|| format!("failed to stat {}", wrapper_path.display()))?
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&wrapper_path, permissions)
+            .with_context(|| format!("failed to chmod {}", wrapper_path.display()))?;
+    }
+    Ok(())
+}
+
+fn prepend_path(env_map: &mut BTreeMap<String, String>, prefix: &Path) {
+    let prefix = prefix.display().to_string();
+    match env_map.get_mut("PATH") {
+        Some(path) if !path.is_empty() => {
+            *path = format!("{prefix}:{path}");
+        }
+        Some(path) => {
+            *path = prefix;
+        }
+        None => {
+            env_map.insert("PATH".to_string(), prefix);
+        }
     }
 }
 
@@ -1051,11 +1290,13 @@ fn _write_sandbox_plan(path: &Path, plan: &SandboxPlan) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_sandbox_command, classify_devenv_stderr_line, devenv_already_running_pid,
-        harmonize_tls_certificate_env, humanize_process_command, parse_process_snapshot,
-        stale_devenv_cache_detected, summarize_devenv_failure, summarize_process_tree,
+        build_sandbox_command, classify_devenv_stderr_line, deploy_host_lookup_queries,
+        devenv_already_running_pid, harmonize_tls_certificate_env, humanize_process_command,
+        parse_process_snapshot, prepend_path, stale_devenv_cache_detected,
+        summarize_devenv_failure, summarize_process_tree, write_ssh_wrapper_scripts,
     };
     use std::{collections::BTreeMap, path::Path};
+    use tempfile::tempdir;
 
     #[test]
     fn summarize_process_tree_prefers_interesting_leaf_processes() {
@@ -1244,5 +1485,55 @@ Error:   × Could not bind localhost:5432
                 "claude -p hello",
             ]
         );
+    }
+
+    #[test]
+    fn deploy_host_queries_normalize_common_ssh_forms() {
+        assert_eq!(
+            deploy_host_lookup_queries("ssh://git@deploy.example.com:2222/app"),
+            vec![
+                "[deploy.example.com]:2222".to_string(),
+                "deploy.example.com".to_string(),
+                "ssh://git@deploy.example.com:2222/app".to_string(),
+            ]
+        );
+        assert_eq!(
+            deploy_host_lookup_queries("git@github.com:openai/example.git"),
+            vec![
+                "git@github.com:openai/example.git".to_string(),
+                "github.com".to_string(),
+            ]
+        );
+        assert_eq!(
+            deploy_host_lookup_queries("deploy.example.com:2201"),
+            vec![
+                "[deploy.example.com]:2201".to_string(),
+                "deploy.example.com".to_string(),
+                "deploy.example.com:2201".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn prepend_path_puts_wrapper_dir_first() {
+        let mut env_map = BTreeMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
+        prepend_path(&mut env_map, Path::new("/tmp/project/.nono/runtime/ssh-bin"));
+        assert_eq!(
+            env_map.get("PATH").map(String::as_str),
+            Some("/tmp/project/.nono/runtime/ssh-bin:/usr/bin:/bin")
+        );
+    }
+
+    #[test]
+    fn ssh_wrappers_force_project_known_hosts() {
+        if super::preferred_command_path("ssh").is_none() {
+            return;
+        }
+        let dir = tempdir().unwrap();
+        write_ssh_wrapper_scripts(dir.path()).unwrap();
+        let ssh_wrapper = std::fs::read_to_string(dir.path().join("ssh")).unwrap();
+        assert!(ssh_wrapper.contains("UserKnownHostsFile=\"$EXPLICIT_DEPLOY_KNOWN_HOSTS_FILE\""));
+        assert!(ssh_wrapper.contains("GlobalKnownHostsFile=/dev/null"));
+        assert!(ssh_wrapper.contains("StrictHostKeyChecking=yes"));
     }
 }
