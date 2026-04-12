@@ -163,6 +163,19 @@ pub fn print_doctor(analysis: &Analysis) -> Result<()> {
             analysis.test_commands.join(", ")
         }
     );
+    println!(
+        "Requirements: {}",
+        if analysis.required_checks.is_empty() {
+            "none".to_string()
+        } else {
+            analysis
+                .required_checks
+                .iter()
+                .map(|requirement| format!("{} {}", requirement.kind.as_str(), requirement.summary))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    );
     if !analysis.notes.is_empty() {
         println!("Notes:");
         for note in &analysis.notes {
@@ -178,6 +191,7 @@ pub fn launch_shell(
     options: LaunchShellOptions<'_>,
 ) -> Result<ExitCode> {
     print_version_summary(analysis);
+    print_workspace_summary(analysis);
     eol::ensure_supported_runtime_versions(
         &analysis.detected_versions,
         options.dangerously_use_end_of_life_versions,
@@ -257,6 +271,16 @@ fn print_version_summary(analysis: &Analysis) {
     println!("Detected runtime versions:");
     for version in &analysis.detected_versions {
         println!("  - {}", version.summary());
+    }
+}
+
+fn print_workspace_summary(analysis: &Analysis) {
+    for note in analysis.notes.iter().filter(|note| {
+        note.starts_with("Workspace: ")
+            || note.starts_with("Workspace members:")
+            || note.starts_with("Workspace excludes:")
+    }) {
+        println!("{note}");
     }
 }
 
@@ -363,14 +387,19 @@ fn capture_devenv_env(
     step: usize,
     total_steps: usize,
 ) -> Result<BTreeMap<String, String>> {
+    capture_devenv_env_with_retry(root, step, total_steps, false)
+}
+
+fn capture_devenv_env_with_retry(
+    root: &Path,
+    step: usize,
+    total_steps: usize,
+    refresh_cache: bool,
+) -> Result<BTreeMap<String, String>> {
     print_step_start(step, total_steps, "Realizing devenv environment");
     let start = Instant::now();
     let progress = Arc::new(Mutex::new(ProgressSnapshot::default()));
-    let mut child = Command::new("devenv")
-        .current_dir(root)
-        .args(["shell", "--no-tui", "--no-reload", "--", "env", "-0"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+    let mut child = devenv_shell_env_command(root, refresh_cache)
         .spawn()
         .context("failed to invoke `devenv shell env -0`")?;
 
@@ -388,7 +417,7 @@ fn capture_devenv_env(
         .take()
         .context("failed to capture `devenv shell env -0` stderr")?;
     let stderr_progress = Arc::clone(&progress);
-    let stderr_reader = thread::spawn(move || -> std::io::Result<()> {
+    let stderr_reader = thread::spawn(move || -> std::io::Result<String> {
         read_devenv_stderr(stderr, step, total_steps, stderr_progress)
     });
 
@@ -421,13 +450,24 @@ fn capture_devenv_env(
         .join()
         .map_err(|_| anyhow!("failed to join `devenv shell env -0` reader thread"))?
         .context("failed to read `devenv shell env -0` stdout")?;
-    stderr_reader
+    let stderr_output = stderr_reader
         .join()
         .map_err(|_| anyhow!("failed to join `devenv shell env -0` stderr reader thread"))?
         .context("failed to read `devenv shell env -0` stderr")?;
 
     if !status.success() {
-        bail!("`devenv shell env -0` failed with status {status}");
+        if !refresh_cache && stale_devenv_cache_detected(&stderr_output) {
+            eprintln!(
+                "{} Retrying with refreshed devenv cache...",
+                progress_prefix(step, total_steps)
+            );
+            return capture_devenv_env_with_retry(root, step, total_steps, true);
+        }
+        let stderr_output = stderr_output.trim();
+        if stderr_output.is_empty() {
+            bail!("`devenv shell env -0` failed with status {status}");
+        }
+        bail!("`devenv shell env -0` failed with status {status}\n{stderr_output}");
     }
     print_step_done(
         step,
@@ -456,19 +496,151 @@ fn capture_devenv_env(
 }
 
 fn run_devenv_up(root: &Path, step: usize, total_steps: usize) -> Result<()> {
+    run_devenv_up_with_retry(root, step, total_steps, false)
+}
+
+fn run_devenv_up_with_retry(
+    root: &Path,
+    step: usize,
+    total_steps: usize,
+    refresh_cache: bool,
+) -> Result<()> {
     print_step_start(step, total_steps, "Starting devenv services");
     let start = Instant::now();
-    let status = Command::new("devenv")
-        .current_dir(root)
-        .arg("--verbose")
-        .args(["up", "--detach", "--no-tui", "--no-reload"])
-        .status()
+    let output = devenv_up_command(root, refresh_cache)
+        .output()
         .context("failed to invoke `devenv up --detach`")?;
-    if !status.success() {
-        bail!("`devenv up --detach` failed with status {status}");
+    if output.status.success() {
+        print_step_done(step, total_steps, "Services are ready", start.elapsed());
+        return Ok(());
     }
-    print_step_done(step, total_steps, "Services are ready", start.elapsed());
-    Ok(())
+
+    let combined = String::from_utf8_lossy(&output.stderr).to_string()
+        + "\n"
+        + &String::from_utf8_lossy(&output.stdout);
+    if let Some(pid) = devenv_already_running_pid(&combined) {
+        print_step_done(
+            step,
+            total_steps,
+            &format!("Reusing already-running services (PID {pid})"),
+            start.elapsed(),
+        );
+        return Ok(());
+    }
+
+    if !refresh_cache && stale_devenv_cache_detected(&combined) {
+        eprintln!(
+            "{} Retrying with refreshed devenv cache...",
+            progress_prefix(step, total_steps)
+        );
+        return run_devenv_up_with_retry(root, step, total_steps, true);
+    }
+
+    let summary = summarize_devenv_failure(&combined);
+    if summary.is_empty() {
+        bail!("`devenv up --detach` failed with status {}", output.status);
+    }
+    bail!(
+        "`devenv up --detach` failed with status {}: {summary}",
+        output.status
+    );
+}
+
+pub(crate) fn devenv_already_running_pid(output: &str) -> Option<String> {
+    let marker = "Processes already running with PID ";
+    for line in output.lines() {
+        let trimmed = line.trim();
+        let Some((_, rest)) = trimmed.split_once(marker) else {
+            continue;
+        };
+        let pid = rest
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect::<String>();
+        if !pid.is_empty() {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+pub(crate) fn stale_devenv_cache_detected(output: &str) -> bool {
+    output.contains("Cached paths no longer exist (garbage collected?)")
+        || output.contains("Cached env path no longer exists")
+        || (output.contains("does not exist and cannot be created")
+            && output.contains("devenv-"))
+}
+
+fn devenv_shell_env_command(root: &Path, refresh_cache: bool) -> Command {
+    let mut command = Command::new("devenv");
+    command.current_dir(root);
+    if refresh_cache {
+        command.args(["--refresh-eval-cache", "--refresh-task-cache"]);
+    }
+    command
+        .args(["shell", "--no-tui", "--no-reload", "--", "env", "-0"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
+fn devenv_up_command(root: &Path, refresh_cache: bool) -> Command {
+    let mut command = Command::new("devenv");
+    command.current_dir(root).arg("--verbose");
+    if refresh_cache {
+        command.args(["--refresh-eval-cache", "--refresh-task-cache"]);
+    }
+    command.args(["up", "--detach", "--no-tui", "--no-reload"]);
+    command
+}
+
+fn summarize_devenv_failure(output: &str) -> String {
+    let lines = output
+        .lines()
+        .map(strip_ansi_codes)
+        .map(|line| normalize_devenv_failure_line(&line))
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+
+    lines
+        .iter()
+        .rev()
+        .map(String::as_str)
+        .find(|line| {
+            line.contains("error:")
+                || line.starts_with("Error:")
+                || line.contains("failed")
+                || line.contains("Stop them first")
+        })
+        .or_else(|| lines.last().map(String::as_str))
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn strip_ansi_codes(line: &str) -> String {
+    let mut cleaned = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' && chars.peek() == Some(&'[') {
+            let _ = chars.next();
+            for next in chars.by_ref() {
+                if ('@'..='~').contains(&next) {
+                    break;
+                }
+            }
+            continue;
+        }
+        cleaned.push(ch);
+    }
+    cleaned
+}
+
+fn normalize_devenv_failure_line(line: &str) -> String {
+    line.trim()
+        .trim_start_matches("╰─▶")
+        .trim_start_matches('•')
+        .trim()
+        .to_string()
 }
 
 fn print_step_start(step: usize, total_steps: usize, message: &str) {
@@ -610,10 +782,12 @@ fn read_devenv_stderr(
     step: usize,
     total_steps: usize,
     progress: Arc<Mutex<ProgressSnapshot>>,
-) -> std::io::Result<()> {
+) -> std::io::Result<String> {
     let mut last_emitted = None::<String>;
+    let mut captured = Vec::new();
     for line in BufReader::new(stderr).lines() {
         let line = line?;
+        captured.push(line.clone());
         let Some(update) = classify_devenv_stderr_line(&line) else {
             continue;
         };
@@ -630,7 +804,7 @@ fn read_devenv_stderr(
             eprintln!("{} {}", progress_prefix(step, total_steps), detail);
         }
     }
-    Ok(())
+    Ok(captured.join("\n"))
 }
 
 fn classify_devenv_stderr_line(line: &str) -> Option<DevenvProgressLine> {
@@ -878,8 +1052,9 @@ fn _write_sandbox_plan(path: &Path, plan: &SandboxPlan) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_sandbox_command, classify_devenv_stderr_line, harmonize_tls_certificate_env,
-        humanize_process_command, parse_process_snapshot, summarize_process_tree,
+        build_sandbox_command, classify_devenv_stderr_line, devenv_already_running_pid,
+        harmonize_tls_certificate_env, humanize_process_command, parse_process_snapshot,
+        stale_devenv_cache_detected, summarize_devenv_failure, summarize_process_tree,
     };
     use std::{collections::BTreeMap, path::Path};
 
@@ -907,6 +1082,41 @@ not-a-row
         let processes = parse_process_snapshot(snapshot);
         assert_eq!(processes.len(), 1);
         assert_eq!(processes.get(&100).unwrap().command, "devenv shell");
+    }
+
+    #[test]
+    fn detects_already_running_devenv_process_pid() {
+        let output =
+            "Error:   × Processes already running with PID 23984. Stop them first with: devenv processes down";
+        assert_eq!(
+            devenv_already_running_pid(output).as_deref(),
+            Some("23984")
+        );
+    }
+
+    #[test]
+    fn detects_stale_devenv_cache_failures() {
+        assert!(stale_devenv_cache_detected(
+            "Cached paths no longer exist (garbage collected?)"
+        ));
+        assert!(stale_devenv_cache_detected(
+            "error: path '/nix/store/demo-devenv-shell.drv' does not exist and cannot be created"
+        ));
+        assert!(!stale_devenv_cache_detected(
+            "Error:   × Could not bind localhost:5432"
+        ));
+    }
+
+    #[test]
+    fn summarizes_devenv_failures_from_last_relevant_line() {
+        let output = "\
+some trace noise
+Error:   × Could not bind localhost:5432
+";
+        assert_eq!(
+            summarize_devenv_failure(output),
+            "Error:   × Could not bind localhost:5432"
+        );
     }
 
     #[test]

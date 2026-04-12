@@ -16,6 +16,26 @@ use crate::host_tools::{host_command_paths, host_command_support_dirs};
 use crate::registry::{self, ProjectContext};
 
 pub const SUPPORT_PACKAGES: &[&str] = &["actionlint", "git", "jq", "nono"];
+const NO_COMMANDS_NOTE: &str = "No explicit lint/build/test commands were discovered, so validation hooks stay advisory until the project exposes them.";
+const EXPLICIT_CONFIG_FILE: &str = "explicit.toml";
+const WORKSPACE_IGNORED_DIRS: &[&str] = &[
+    ".git",
+    ".devenv",
+    ".direnv",
+    ".nono",
+    ".codex",
+    ".claude",
+    ".terraform",
+    ".venv",
+    "__pycache__",
+    "_build",
+    "deps",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "vendor",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -172,6 +192,27 @@ impl DetectedVersion {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequirementKind {
+    Lint,
+}
+
+impl RequirementKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Lint => "lint",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectRequirement {
+    pub kind: RequirementKind,
+    pub subject: String,
+    pub summary: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceRequirement {
@@ -227,6 +268,57 @@ pub struct RepositoryMetadata {
     pub github: Option<GitHubRepository>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct WorkspaceFile {
+    #[serde(default)]
+    workspace: WorkspaceConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct WorkspaceConfig {
+    #[serde(default = "default_workspace_auto_discover")]
+    auto_discover: bool,
+    #[serde(default)]
+    members: Vec<String>,
+    #[serde(default)]
+    exclude: Vec<String>,
+}
+
+impl Default for WorkspaceConfig {
+    fn default() -> Self {
+        Self {
+            auto_discover: true,
+            members: Vec::new(),
+            exclude: Vec::new(),
+        }
+    }
+}
+
+fn default_workspace_auto_discover() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkspaceMember {
+    root: PathBuf,
+    relative: PathBuf,
+    reason: String,
+    configured: bool,
+}
+
+#[derive(Debug, Default)]
+struct WorkspaceDiscovery {
+    config_present: bool,
+    excludes: Vec<PathBuf>,
+    members: Vec<WorkspaceMember>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectoryClassification {
+    member_reason: Option<String>,
+    continue_descending: bool,
+}
+
 impl RepositoryMetadata {
     pub fn has_readme(&self) -> bool {
         self.readme_path.is_some()
@@ -262,6 +354,8 @@ pub struct Analysis {
     pub lint_commands: Vec<String>,
     pub build_commands: Vec<String>,
     pub test_commands: Vec<String>,
+    #[serde(default)]
+    pub required_checks: Vec<ProjectRequirement>,
     pub notes: Vec<String>,
     pub repository: RepositoryMetadata,
     pub sandbox_plan: SandboxPlan,
@@ -280,6 +374,7 @@ struct Builder {
     lint_commands: Vec<String>,
     build_commands: Vec<String>,
     test_commands: Vec<String>,
+    required_checks: Vec<ProjectRequirement>,
     notes: Vec<String>,
 }
 
@@ -329,6 +424,12 @@ impl Builder {
         }
     }
 
+    fn add_requirement(&mut self, requirement: ProjectRequirement) {
+        if !self.required_checks.contains(&requirement) {
+            self.required_checks.push(requirement);
+        }
+    }
+
     fn add_note(&mut self, note: impl Into<String>) {
         let note = note.into();
         if !self.notes.contains(&note) {
@@ -339,49 +440,20 @@ impl Builder {
 
 impl Analysis {
     pub fn analyze(root: &Path) -> Result<Self> {
-        let mut builder = Builder::default();
-        let project_context = ProjectContext::load(root)?;
-        for package in SUPPORT_PACKAGES {
-            builder.add_package(*package);
+        let mut analysis = analyze_single_project(root)?;
+        if !workspace_auto_discovery_enabled(root) {
+            return Ok(analysis);
+        }
+        let discovery = discover_workspace_members(root)?;
+        if discovery.members.is_empty() {
+            return Ok(analysis);
         }
 
-        analyze_onefetch(root, &mut builder);
-        analyze_manifests(root, &mut builder)?;
-        analyze_common_files(root, &mut builder, &project_context)?;
-        analyze_compose_services(root, &mut builder)?;
-        apply_registry_matches(root, &mut builder, &project_context)?;
-        let detected_versions = detect_runtime_versions(root, &builder, &project_context)?;
-        let repository = detect_repository_metadata(root)?;
-
-        if builder.lint_commands.is_empty()
-            && builder.build_commands.is_empty()
-            && builder.test_commands.is_empty()
-        {
-            builder.add_note(
-                "No explicit lint/build/test commands were discovered, so validation hooks stay advisory until the project exposes them.",
-            );
-        }
-
-        let sandbox_plan = build_sandbox_plan(root, &builder)?;
-
-        Ok(Self {
-            root: root.to_path_buf(),
-            markers: builder.markers.into_iter().collect(),
-            manifests: builder.manifests.into_iter().collect(),
-            detected_languages: builder.languages.iter().copied().collect(),
-            detected_versions,
-            language_hints: builder.language_hints.into_iter().collect(),
-            packages: builder.packages.into_iter().collect(),
-            services: builder.services.iter().copied().collect(),
-            nix_options: builder.nix_options.into_iter().collect(),
-            requires_allow_unfree: builder.requires_allow_unfree,
-            lint_commands: builder.lint_commands,
-            build_commands: builder.build_commands,
-            test_commands: builder.test_commands,
-            notes: builder.notes.clone(),
-            repository,
-            sandbox_plan,
-        })
+        merge_workspace_members(&mut analysis, discovery)?;
+        ensure_workspace_versions_are_compatible(&analysis.detected_versions)?;
+        let builder = builder_from_analysis(&analysis);
+        analysis.sandbox_plan = build_sandbox_plan(root, &builder)?;
+        Ok(analysis)
     }
 
     pub fn doctor_packages(&self) -> Vec<&str> {
@@ -398,6 +470,615 @@ impl Analysis {
             .map(DetectedVersion::summary)
             .collect()
     }
+}
+
+fn workspace_auto_discovery_enabled(root: &Path) -> bool {
+    root.join(EXPLICIT_CONFIG_FILE).is_file() || root.join(".git").exists()
+}
+
+fn analyze_single_project(root: &Path) -> Result<Analysis> {
+    let mut builder = Builder::default();
+    let project_context = ProjectContext::load(root)?;
+    for package in SUPPORT_PACKAGES {
+        builder.add_package(*package);
+    }
+
+    analyze_onefetch(root, &mut builder);
+    analyze_manifests(root, &mut builder)?;
+    analyze_common_files(root, &mut builder, &project_context)?;
+    analyze_compose_services(root, &mut builder)?;
+    apply_registry_matches(root, &mut builder, &project_context)?;
+    let detected_versions = detect_runtime_versions(root, &builder, &project_context)?;
+    let repository = detect_repository_metadata(root)?;
+
+    if builder.lint_commands.is_empty()
+        && builder.build_commands.is_empty()
+        && builder.test_commands.is_empty()
+    {
+        builder.add_note(NO_COMMANDS_NOTE);
+    }
+
+    let sandbox_plan = build_sandbox_plan(root, &builder)?;
+
+    Ok(Analysis {
+        root: root.to_path_buf(),
+        markers: builder.markers.into_iter().collect(),
+        manifests: builder.manifests.into_iter().collect(),
+        detected_languages: builder.languages.iter().copied().collect(),
+        detected_versions,
+        language_hints: builder.language_hints.into_iter().collect(),
+        packages: builder.packages.into_iter().collect(),
+        services: builder.services.iter().copied().collect(),
+        nix_options: builder.nix_options.into_iter().collect(),
+            requires_allow_unfree: builder.requires_allow_unfree,
+            lint_commands: builder.lint_commands,
+            build_commands: builder.build_commands,
+            test_commands: builder.test_commands,
+            required_checks: builder.required_checks,
+            notes: builder.notes.clone(),
+            repository,
+            sandbox_plan,
+    })
+}
+
+fn merge_workspace_members(analysis: &mut Analysis, discovery: WorkspaceDiscovery) -> Result<()> {
+    let mut auto_discovered = 0usize;
+    let mut configured = 0usize;
+    let mut member_descriptions = Vec::new();
+
+    for member in discovery.members {
+        let member_analysis = analyze_single_project(&member.root)?;
+        if member.configured {
+            configured += 1;
+        } else {
+            auto_discovered += 1;
+        }
+        member_descriptions.push(format!(
+            "{} ({})",
+            display_relative_path(&member.relative),
+            member.reason
+        ));
+        merge_member_analysis(analysis, member_analysis, &member.relative);
+    }
+
+    push_unique_string(&mut analysis.markers, "workspace".to_string());
+    if discovery.config_present {
+        push_unique_string(
+            &mut analysis.notes,
+            format!("Workspace: loaded {EXPLICIT_CONFIG_FILE}."),
+        );
+    }
+    if !discovery.excludes.is_empty() {
+        let excluded = discovery
+            .excludes
+            .iter()
+            .map(|path| display_relative_path(path))
+            .collect::<Vec<_>>()
+            .join(", ");
+        push_unique_string(
+            &mut analysis.notes,
+            format!("Workspace excludes: {excluded}."),
+        );
+    }
+
+    push_unique_string(
+        &mut analysis.notes,
+        format!(
+            "Workspace: merged {} leaf projects into the root analysis ({} auto-discovered, {} configured).",
+            auto_discovered + configured,
+            auto_discovered,
+            configured
+        ),
+    );
+    push_unique_string(
+        &mut analysis.notes,
+        format!("Workspace members: {}.", member_descriptions.join(", ")),
+    );
+    if !analysis.lint_commands.is_empty()
+        || !analysis.build_commands.is_empty()
+        || !analysis.test_commands.is_empty()
+    {
+        analysis.notes.retain(|note| note != NO_COMMANDS_NOTE);
+    }
+
+    Ok(())
+}
+
+fn merge_member_analysis(analysis: &mut Analysis, member: Analysis, relative: &Path) {
+    merge_unique_strings(&mut analysis.markers, member.markers);
+    merge_unique_strings(&mut analysis.manifests, member.manifests);
+    merge_unique_copy(&mut analysis.detected_languages, member.detected_languages);
+
+    let prefixed_versions = member
+        .detected_versions
+        .into_iter()
+        .map(|version| prefix_detected_version_source(version, relative))
+        .collect::<Vec<_>>();
+    merge_unique_versions(&mut analysis.detected_versions, prefixed_versions);
+
+    merge_unique_strings(&mut analysis.language_hints, member.language_hints);
+    merge_unique_strings(&mut analysis.packages, member.packages);
+    merge_unique_copy(&mut analysis.services, member.services);
+    merge_unique_strings(&mut analysis.nix_options, member.nix_options);
+    analysis.requires_allow_unfree |= member.requires_allow_unfree;
+    merge_unique_strings(
+        &mut analysis.lint_commands,
+        member
+            .lint_commands
+            .into_iter()
+            .map(|command| prefix_workspace_command(relative, &command))
+            .collect(),
+    );
+    merge_unique_strings(
+        &mut analysis.build_commands,
+        member
+            .build_commands
+            .into_iter()
+            .map(|command| prefix_workspace_command(relative, &command))
+            .collect(),
+    );
+    merge_unique_strings(
+        &mut analysis.test_commands,
+        member
+            .test_commands
+            .into_iter()
+            .map(|command| prefix_workspace_command(relative, &command))
+            .collect(),
+    );
+    merge_unique_requirements(
+        &mut analysis.required_checks,
+        member
+            .required_checks
+            .into_iter()
+            .map(|requirement| prefix_requirement_subject(requirement, relative))
+            .collect(),
+    );
+}
+
+fn builder_from_analysis(analysis: &Analysis) -> Builder {
+    let mut builder = Builder::default();
+    for marker in &analysis.markers {
+        builder.add_marker(marker.clone());
+    }
+    for manifest in &analysis.manifests {
+        builder.add_manifest(manifest.clone());
+    }
+    for language in &analysis.detected_languages {
+        builder.add_language(*language);
+    }
+    builder
+        .language_hints
+        .extend(analysis.language_hints.iter().cloned());
+    for package in &analysis.packages {
+        builder.add_package(package.clone());
+    }
+    for service in &analysis.services {
+        builder.add_service(*service);
+    }
+    for option in &analysis.nix_options {
+        builder.add_nix_option(option.clone());
+    }
+    builder.requires_allow_unfree = analysis.requires_allow_unfree;
+    for command in &analysis.lint_commands {
+        builder.add_lint(command.clone());
+    }
+    for command in &analysis.build_commands {
+        builder.add_build(command.clone());
+    }
+    for command in &analysis.test_commands {
+        builder.add_test(command.clone());
+    }
+    for requirement in &analysis.required_checks {
+        builder.add_requirement(requirement.clone());
+    }
+    for note in &analysis.notes {
+        builder.add_note(note.clone());
+    }
+    builder
+}
+
+fn discover_workspace_members(root: &Path) -> Result<WorkspaceDiscovery> {
+    let config = load_workspace_config(root)?;
+    let excludes = workspace_excludes(root, config.as_ref())?;
+    let mut members = BTreeMap::new();
+
+    if let Some(config) = config.as_ref() {
+        for raw_member in &config.members {
+            let relative = parse_workspace_relative_path(root, raw_member, "workspace.members")?;
+            let member_root = root.join(&relative);
+            if !member_root.is_dir() {
+                anyhow::bail!(
+                    "{} lists workspace member `{}` but that directory does not exist",
+                    EXPLICIT_CONFIG_FILE,
+                    display_relative_path(&relative)
+                );
+            }
+            let reason = classify_workspace_directory(&member_root)?.member_reason;
+            members.insert(
+                relative.clone(),
+                WorkspaceMember {
+                    root: member_root,
+                    relative,
+                    reason: reason.unwrap_or_else(|| EXPLICIT_CONFIG_FILE.to_string()),
+                    configured: true,
+                },
+            );
+        }
+    }
+
+    if config.as_ref().map(|cfg| cfg.auto_discover).unwrap_or(true) {
+        walk_workspace_tree(root, root, &excludes, &mut members)?;
+    }
+
+    let mut members = members.into_values().collect::<Vec<_>>();
+    members.sort_by_key(|member| member.relative.clone());
+
+    Ok(WorkspaceDiscovery {
+        config_present: config.is_some(),
+        excludes,
+        members,
+    })
+}
+
+fn load_workspace_config(root: &Path) -> Result<Option<WorkspaceConfig>> {
+    let path = root.join(EXPLICIT_CONFIG_FILE);
+    if !path.is_file() {
+        return Ok(None);
+    }
+
+    let raw =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let parsed = toml::from_str::<WorkspaceFile>(&raw)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    Ok(Some(parsed.workspace))
+}
+
+fn workspace_excludes(root: &Path, config: Option<&WorkspaceConfig>) -> Result<Vec<PathBuf>> {
+    let mut excludes = Vec::new();
+    if let Some(config) = config {
+        for raw in &config.exclude {
+            let path = parse_workspace_relative_path(root, raw, "workspace.exclude")?;
+            if !excludes.contains(&path) {
+                excludes.push(path);
+            }
+        }
+    }
+
+    excludes.sort();
+    Ok(excludes)
+}
+
+fn parse_workspace_relative_path(root: &Path, raw: &str, field: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(raw);
+    if path.as_os_str().is_empty() {
+        anyhow::bail!("{EXPLICIT_CONFIG_FILE} contains an empty `{field}` entry");
+    }
+
+    let relative = if path.is_absolute() {
+        path.strip_prefix(root).with_context(|| {
+            format!(
+                "{EXPLICIT_CONFIG_FILE} `{field}` entry `{}` must stay inside the workspace root {}",
+                path.display(),
+                root.display()
+            )
+        })?
+        .to_path_buf()
+    } else {
+        path
+    };
+
+    for component in relative.components() {
+        match component {
+            std::path::Component::CurDir
+            | std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {
+                anyhow::bail!(
+                    "{EXPLICIT_CONFIG_FILE} `{field}` entry `{}` must use a clean path relative to the workspace root",
+                    raw
+                );
+            }
+            std::path::Component::Normal(_) => {}
+        }
+    }
+
+    Ok(relative)
+}
+
+fn walk_workspace_tree(
+    root: &Path,
+    current: &Path,
+    excludes: &[PathBuf],
+    members: &mut BTreeMap<PathBuf, WorkspaceMember>,
+) -> Result<()> {
+    for entry in
+        fs::read_dir(current).with_context(|| format!("failed to read {}", current.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let Some(relative) = path.strip_prefix(root).ok().map(Path::to_path_buf) else {
+            continue;
+        };
+        if should_ignore_workspace_dir(&relative, excludes) {
+            continue;
+        }
+
+        let classification = classify_workspace_directory(&path)?;
+        if let Some(reason) = classification.member_reason {
+            members
+                .entry(relative.clone())
+                .or_insert_with(|| WorkspaceMember {
+                    root: path.clone(),
+                    relative: relative.clone(),
+                    reason,
+                    configured: false,
+                });
+        }
+
+        if classification.continue_descending {
+            walk_workspace_tree(root, &path, excludes, members)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn should_ignore_workspace_dir(relative: &Path, excludes: &[PathBuf]) -> bool {
+    if relative
+        .components()
+        .any(|component| component.as_os_str().to_string_lossy().starts_with('.'))
+    {
+        return true;
+    }
+
+    if let Some(name) = relative.file_name().and_then(|value| value.to_str())
+        && WORKSPACE_IGNORED_DIRS.contains(&name)
+    {
+        return true;
+    }
+
+    excludes
+        .iter()
+        .any(|excluded| relative.starts_with(excluded))
+}
+
+fn classify_workspace_directory(dir: &Path) -> Result<DirectoryClassification> {
+    let package_json = dir.join("package.json");
+    if package_json.is_file() {
+        let continue_descending = package_json_declares_workspaces(&package_json)?
+            || dir.join("pnpm-workspace.yaml").is_file();
+        return Ok(DirectoryClassification {
+            member_reason: Some(if continue_descending {
+                "package.json#workspaces".to_string()
+            } else {
+                "package.json".to_string()
+            }),
+            continue_descending,
+        });
+    }
+
+    let cargo_toml = dir.join("Cargo.toml");
+    if cargo_toml.is_file() {
+        let (has_package, has_workspace) = cargo_workspace_traits(&cargo_toml)?;
+        if has_package || has_workspace {
+            return Ok(DirectoryClassification {
+                member_reason: Some(if has_workspace && !has_package {
+                    "Cargo.toml#workspace".to_string()
+                } else {
+                    "Cargo.toml".to_string()
+                }),
+                continue_descending: has_workspace,
+            });
+        }
+    }
+
+    for (marker, reason) in [
+        ("mix.exs", "mix.exs"),
+        ("go.mod", "go.mod"),
+        ("pyproject.toml", "pyproject.toml"),
+        ("requirements.txt", "requirements.txt"),
+        ("Gemfile", "Gemfile"),
+        ("Bundlefile", "Bundlefile"),
+        ("composer.json", "composer.json"),
+        ("pom.xml", "pom.xml"),
+        ("build.gradle", "build.gradle"),
+        ("build.gradle.kts", "build.gradle.kts"),
+        ("gradlew", "gradlew"),
+        ("terragrunt.hcl", "terragrunt.hcl"),
+    ] {
+        if dir.join(marker).is_file() {
+            return Ok(DirectoryClassification {
+                member_reason: Some(reason.to_string()),
+                continue_descending: false,
+            });
+        }
+    }
+
+    if directory_has_direct_terraform_files(dir)? {
+        return Ok(DirectoryClassification {
+            member_reason: Some("*.tf".to_string()),
+            continue_descending: false,
+        });
+    }
+
+    let makefile = dir.join("Makefile");
+    if makefile.is_file() {
+        let targets = discover_make_targets(&makefile)?;
+        if ["lint", "build", "test", "check"]
+            .into_iter()
+            .any(|target| targets.contains(target))
+        {
+            return Ok(DirectoryClassification {
+                member_reason: Some("Makefile".to_string()),
+                continue_descending: false,
+            });
+        }
+    }
+
+    Ok(DirectoryClassification {
+        member_reason: None,
+        continue_descending: true,
+    })
+}
+
+fn package_json_declares_workspaces(path: &Path) -> Result<bool> {
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let payload = serde_json::from_str::<serde_json::Value>(&raw)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    Ok(payload.get("workspaces").is_some())
+}
+
+fn cargo_workspace_traits(path: &Path) -> Result<(bool, bool)> {
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let value = toml::from_str::<TomlValue>(&raw)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    Ok((
+        value.get("package").and_then(TomlValue::as_table).is_some(),
+        value
+            .get("workspace")
+            .and_then(TomlValue::as_table)
+            .is_some(),
+    ))
+}
+
+fn directory_has_direct_terraform_files(dir: &Path) -> Result<bool> {
+    for entry in fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        if entry
+            .path()
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|extension| extension == "tf")
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn prefix_workspace_command(relative: &Path, command: &str) -> String {
+    format!("cd {} && {command}", shell_quote(relative))
+}
+
+fn prefix_detected_version_source(
+    mut version: DetectedVersion,
+    relative: &Path,
+) -> DetectedVersion {
+    version.source = format!("{}/{}", display_relative_path(relative), version.source);
+    version
+}
+
+fn prefix_requirement_subject(
+    mut requirement: ProjectRequirement,
+    relative: &Path,
+) -> ProjectRequirement {
+    requirement.subject = format!(
+        "{}/{}",
+        display_relative_path(relative),
+        requirement.subject
+    );
+    requirement
+}
+
+fn ensure_workspace_versions_are_compatible(versions: &[DetectedVersion]) -> Result<()> {
+    let mut by_runtime = BTreeMap::<RuntimeKind, Vec<&DetectedVersion>>::new();
+    for version in versions {
+        by_runtime.entry(version.runtime).or_default().push(version);
+    }
+
+    for (runtime, entries) in by_runtime {
+        let mut unique_pins = BTreeMap::<String, Vec<&DetectedVersion>>::new();
+        for entry in &entries {
+            let Some(pin_key) = shared_shell_version_key(entry) else {
+                continue;
+            };
+            unique_pins.entry(pin_key).or_default().push(*entry);
+        }
+        if unique_pins.len() < 2 {
+            continue;
+        }
+
+        let summary = unique_pins
+            .into_values()
+            .flatten()
+            .map(|entry| format!("{} ({})", entry.version, entry.source))
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!(
+            "workspace requires conflicting {} versions for one shared devenv shell: {}",
+            runtime.display_name(),
+            summary
+        );
+    }
+
+    Ok(())
+}
+
+fn shared_shell_version_key(version: &DetectedVersion) -> Option<String> {
+    if version.config_lines.is_empty() {
+        return None;
+    }
+    Some(version.config_lines.join("\n"))
+}
+
+fn merge_unique_strings(target: &mut Vec<String>, values: Vec<String>) {
+    for value in values {
+        push_unique_string(target, value);
+    }
+}
+
+fn push_unique_string(target: &mut Vec<String>, value: String) {
+    if !target.contains(&value) {
+        target.push(value);
+    }
+}
+
+fn merge_unique_copy<T>(target: &mut Vec<T>, values: Vec<T>)
+where
+    T: Copy + PartialEq,
+{
+    for value in values {
+        if !target.contains(&value) {
+            target.push(value);
+        }
+    }
+}
+
+fn merge_unique_versions(target: &mut Vec<DetectedVersion>, values: Vec<DetectedVersion>) {
+    for value in values {
+        if !target.iter().any(|current| {
+            current.runtime == value.runtime
+                && current.version == value.version
+                && current.source == value.source
+        }) {
+            target.push(value);
+        }
+    }
+    target.sort_by_key(|entry| (entry.runtime, entry.source.clone()));
+}
+
+fn merge_unique_requirements(target: &mut Vec<ProjectRequirement>, values: Vec<ProjectRequirement>) {
+    for value in values {
+        if !target.contains(&value) {
+            target.push(value);
+        }
+    }
+}
+
+fn display_relative_path(path: &Path) -> String {
+    path.display().to_string()
+}
+
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\"'\"'"))
 }
 
 fn detect_repository_metadata(root: &Path) -> Result<RepositoryMetadata> {
@@ -772,11 +1453,21 @@ fn analyze_common_files(
     }
 
     if root.join("mix.exs").exists() {
+        let elixir_dependencies = context.dependencies("elixir").cloned().unwrap_or_default();
         builder.add_marker("mix.exs");
         builder.add_language(LanguageRequirement::Elixir);
         builder.add_lint("mix format --check-formatted");
+        builder.add_lint("mix credo --strict");
         builder.add_build("mix compile --warnings-as-errors");
         builder.add_test("mix test");
+        if !elixir_dependencies.contains("credo") {
+            builder.add_requirement(ProjectRequirement {
+                kind: RequirementKind::Lint,
+                subject: "mix.exs".to_string(),
+                summary: "Elixir projects must include Credo and pass `mix credo --strict`."
+                    .to_string(),
+            });
+        }
     }
 
     if root.join("Gemfile").exists() || root.join("Bundlefile").exists() {
@@ -915,6 +1606,16 @@ fn analyze_common_files(
         } else if targets.contains("check") {
             builder.add_test("make check");
         }
+    }
+
+    if root.join("terragrunt.hcl").is_file() {
+        builder.add_marker("terragrunt.hcl");
+        builder.add_package("terragrunt");
+        builder.add_lint("terragrunt hclfmt --check");
+    } else if directory_has_direct_terraform_files(root)? {
+        builder.add_marker("terraform");
+        builder.add_package("opentofu");
+        builder.add_lint("opentofu fmt -check -recursive");
     }
 
     Ok(())
@@ -2152,11 +2853,11 @@ fn linux_agent_read_only_paths(_home: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Analysis, Builder, LanguageRequirement, RepositoryMetadata, RuntimeKind, SUPPORT_PACKAGES,
-        SandboxPlan, build_sandbox_plan, fallback_javascript_test_commands,
-        platform_agent_read_only_paths, platform_agent_read_write_paths,
-        referenced_instruction_paths, script_is_placeholder, script_is_verification_ready,
-        standard_device_read_write_paths,
+        Analysis, Builder, EXPLICIT_CONFIG_FILE, LanguageRequirement, NO_COMMANDS_NOTE,
+        RepositoryMetadata, RuntimeKind, SUPPORT_PACKAGES, SandboxPlan, build_sandbox_plan,
+        fallback_javascript_test_commands, platform_agent_read_only_paths,
+        platform_agent_read_write_paths, referenced_instruction_paths, script_is_placeholder,
+        script_is_verification_ready, standard_device_read_write_paths,
     };
     use std::{collections::BTreeSet, fs, path::PathBuf};
     use tempfile::tempdir;
@@ -2184,6 +2885,7 @@ mod tests {
             lint_commands: Vec::new(),
             build_commands: Vec::new(),
             test_commands: Vec::new(),
+            required_checks: Vec::new(),
             notes: Vec::new(),
             repository: RepositoryMetadata::default(),
             sandbox_plan: SandboxPlan {
@@ -2400,5 +3102,327 @@ mod tests {
                     .iter()
                     .any(|line| line.contains("jdk21"))
         }));
+    }
+
+    #[test]
+    fn auto_discovers_workspace_members_and_prefixes_commands() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        let services = dir.path().join("services/api");
+        let mobile = dir.path().join("apps/mobile");
+        fs::create_dir_all(&services).unwrap();
+        fs::create_dir_all(&mobile).unwrap();
+        fs::write(
+            services.join("Makefile"),
+            "lint:\n\t@echo lint\ncheck:\n\t@echo test\n",
+        )
+        .unwrap();
+        fs::write(
+            mobile.join("package.json"),
+            r#"{
+  "name": "mobile",
+  "packageManager": "yarn@4.0.0",
+  "scripts": {
+    "lint": "eslint .",
+    "test": "jest"
+  }
+}"#,
+        )
+        .unwrap();
+        fs::write(mobile.join("yarn.lock"), "").unwrap();
+
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert!(
+            analysis
+                .lint_commands
+                .contains(&"cd 'services/api' && make lint".to_string())
+        );
+        assert!(
+            analysis
+                .test_commands
+                .contains(&"cd 'services/api' && make check".to_string())
+        );
+        assert!(
+            analysis
+                .lint_commands
+                .contains(&"cd 'apps/mobile' && yarn lint".to_string())
+        );
+        assert!(
+            analysis
+                .test_commands
+                .contains(&"cd 'apps/mobile' && yarn test".to_string())
+        );
+        assert!(analysis.notes.iter().any(|note| {
+            note == "Workspace: merged 2 leaf projects into the root analysis (2 auto-discovered, 0 configured)."
+        }));
+        assert!(
+            analysis
+                .notes
+                .iter()
+                .any(|note| note.contains("services/api (Makefile)"))
+        );
+        assert!(
+            analysis
+                .notes
+                .iter()
+                .any(|note| note.contains("apps/mobile (package.json)"))
+        );
+        assert!(!analysis.notes.iter().any(|note| note == NO_COMMANDS_NOTE));
+    }
+
+    #[test]
+    fn workspace_config_can_exclude_and_add_members() {
+        let dir = tempdir().unwrap();
+        let service = dir.path().join("services/api");
+        let ignored = dir.path().join("examples/demo");
+        let configured = dir.path().join("tools/custom");
+        fs::create_dir_all(&service).unwrap();
+        fs::create_dir_all(&ignored).unwrap();
+        fs::create_dir_all(&configured).unwrap();
+        fs::write(service.join("Makefile"), "lint:\n\t@echo lint\n").unwrap();
+        fs::write(ignored.join("Makefile"), "lint:\n\t@echo ignored\n").unwrap();
+        fs::write(configured.join("Makefile"), "test:\n\t@echo configured\n").unwrap();
+        fs::write(
+            dir.path().join(EXPLICIT_CONFIG_FILE),
+            r#"[workspace]
+exclude = ["examples"]
+members = ["tools/custom"]
+"#,
+        )
+        .unwrap();
+
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert!(
+            analysis
+                .lint_commands
+                .contains(&"cd 'services/api' && make lint".to_string())
+        );
+        assert!(
+            analysis
+                .test_commands
+                .contains(&"cd 'tools/custom' && make test".to_string())
+        );
+        assert!(
+            !analysis
+                .lint_commands
+                .iter()
+                .any(|command| command.contains("examples/demo"))
+        );
+        assert!(
+            analysis
+                .notes
+                .iter()
+                .any(|note| note == &format!("Workspace: loaded {EXPLICIT_CONFIG_FILE}."))
+        );
+        assert!(
+            analysis
+                .notes
+                .iter()
+                .any(|note| note == "Workspace excludes: examples.")
+        );
+    }
+
+    #[test]
+    fn auto_discovers_terraform_leafs() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        let infra = dir.path().join("infra/networking");
+        fs::create_dir_all(&infra).unwrap();
+        fs::write(
+            infra.join("main.tf"),
+            "terraform {\n  required_version = \">= 1.6.0\"\n}\n",
+        )
+        .unwrap();
+
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert!(analysis.packages.contains(&"opentofu".to_string()));
+        assert!(
+            analysis
+                .lint_commands
+                .contains(&"cd 'infra/networking' && opentofu fmt -check -recursive".to_string())
+        );
+    }
+
+    #[test]
+    fn elixir_projects_add_credo_lint_and_requirement_when_missing() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("mix.exs"),
+            r#"defmodule Demo.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :demo, version: "0.1.0", elixir: "~> 1.15"]
+  end
+end
+"#,
+        )
+        .unwrap();
+
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert!(analysis
+            .lint_commands
+            .contains(&"mix format --check-formatted".to_string()));
+        assert!(analysis
+            .lint_commands
+            .contains(&"mix credo --strict".to_string()));
+        assert_eq!(analysis.required_checks.len(), 1);
+        assert_eq!(analysis.required_checks[0].subject, "mix.exs");
+        assert!(analysis.required_checks[0].summary.contains("Credo"));
+    }
+
+    #[test]
+    fn elixir_projects_with_credo_clear_requirement() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("mix.exs"),
+            r#"defmodule Demo.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :demo, version: "0.1.0", elixir: "~> 1.15"]
+  end
+
+  defp deps do
+    [
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
+    ]
+  end
+end
+"#,
+        )
+        .unwrap();
+
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert!(analysis
+            .lint_commands
+            .contains(&"mix credo --strict".to_string()));
+        assert!(analysis.required_checks.is_empty());
+    }
+
+    #[test]
+    fn workspace_conflicting_runtime_versions_fail_analysis() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        let api = dir.path().join("services/api");
+        let mobile = dir.path().join("apps/mobile");
+        fs::create_dir_all(&api).unwrap();
+        fs::create_dir_all(&mobile).unwrap();
+        fs::write(api.join("package.json"), r#"{"name":"api"}"#).unwrap();
+        fs::write(api.join(".node-version"), "18.19.1\n").unwrap();
+        fs::write(mobile.join("package.json"), r#"{"name":"mobile"}"#).unwrap();
+        fs::write(mobile.join(".node-version"), "20.11.1\n").unwrap();
+
+        let err = Analysis::analyze(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("conflicting nodejs versions"));
+        assert!(err.contains("18.19.1 (services/api/.node-version)"));
+        assert!(err.contains("20.11.1 (apps/mobile/.node-version)"));
+    }
+
+    #[test]
+    fn workspace_discovery_skips_leaf_dependency_dirs() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("services/stuffix");
+        let deps = root.join("deps/phoenix");
+        fs::create_dir_all(&deps).unwrap();
+        fs::write(
+            root.join("mix.exs"),
+            r#"defmodule Stuffix.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :stuffix, version: "0.1.0", elixir: "~> 1.15"]
+  end
+end
+"#,
+        )
+        .unwrap();
+        fs::write(
+            deps.join("mix.exs"),
+            r#"defmodule Phoenix.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :phoenix, version: "0.1.0", elixir: "~> 1.11"]
+  end
+end
+"#,
+        )
+        .unwrap();
+
+        let analysis = Analysis::analyze(&root).unwrap();
+        assert!(!analysis.markers.contains(&"workspace".to_string()));
+        assert_eq!(analysis.detected_versions.len(), 1);
+        assert_eq!(analysis.detected_versions[0].version, "~> 1.15");
+        assert_eq!(analysis.detected_versions[0].source, "mix.exs#elixir");
+    }
+
+    #[test]
+    fn workspace_constraint_versions_without_shared_pin_do_not_conflict() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        let api = dir.path().join("services/api");
+        let worker = dir.path().join("services/worker");
+        fs::create_dir_all(&api).unwrap();
+        fs::create_dir_all(&worker).unwrap();
+        fs::write(
+            api.join("mix.exs"),
+            r#"defmodule Api.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :api, version: "0.1.0", elixir: "~> 1.15"]
+  end
+end
+"#,
+        )
+        .unwrap();
+        fs::write(
+            worker.join("mix.exs"),
+            r#"defmodule Worker.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :worker, version: "0.1.0", elixir: "~> 1.18"]
+  end
+end
+"#,
+        )
+        .unwrap();
+
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert!(analysis.markers.contains(&"workspace".to_string()));
+        assert!(analysis
+            .notes
+            .iter()
+            .any(|note| note.contains("services/api (mix.exs)")));
+        assert!(analysis
+            .notes
+            .iter()
+            .any(|note| note.contains("services/worker (mix.exs)")));
+    }
+
+    #[test]
+    fn workspace_same_node_major_versions_share_shell_pin() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        let api = dir.path().join("services/api");
+        let mobile = dir.path().join("apps/mobile");
+        fs::create_dir_all(&api).unwrap();
+        fs::create_dir_all(&mobile).unwrap();
+        fs::write(api.join("package.json"), r#"{"name":"api"}"#).unwrap();
+        fs::write(api.join(".node-version"), "18.19.1\n").unwrap();
+        fs::write(mobile.join("package.json"), r#"{"name":"mobile"}"#).unwrap();
+        fs::write(mobile.join(".node-version"), "18.20.2\n").unwrap();
+
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert!(analysis
+            .detected_versions
+            .iter()
+            .any(|version| version.source == "services/api/.node-version"));
+        assert!(analysis
+            .detected_versions
+            .iter()
+            .any(|version| version.source == "apps/mobile/.node-version"));
     }
 }

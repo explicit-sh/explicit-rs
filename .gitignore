@@ -1,5 +1,6 @@
 .devenv/
 .direnv/
+.DS_Store
 devenv.local.nix
 result
 target/

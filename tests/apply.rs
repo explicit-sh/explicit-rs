@@ -141,6 +141,145 @@ fn doctor_reports_detected_test_commands() {
 }
 
 #[test]
+fn apply_discovers_workspace_leaf_commands() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let service = root.join("services/api");
+    let mobile = root.join("apps/mobile");
+    Command::new("git")
+        .arg("init")
+        .arg("-q")
+        .arg(root)
+        .status()
+        .unwrap();
+
+    fs::create_dir_all(&service).unwrap();
+    fs::create_dir_all(&mobile).unwrap();
+    fs::write(service.join("Makefile"), "lint:\n\t@echo lint\n").unwrap();
+    fs::write(
+        mobile.join("package.json"),
+        r#"{
+  "name": "mobile",
+  "packageManager": "yarn@4.0.0",
+  "scripts": {
+    "test": "jest"
+  }
+}"#,
+    )
+    .unwrap();
+    fs::write(mobile.join("yarn.lock"), "").unwrap();
+
+    run_tool(root);
+
+    let guard_payload: JsonValue =
+        serde_json::from_str(&fs::read_to_string(root.join(".nono/guard-commands.json")).unwrap())
+            .unwrap();
+    let commands = guard_payload["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["command"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(commands.contains(&"cd 'services/api' && make lint"));
+    assert!(commands.contains(&"cd 'apps/mobile' && yarn test"));
+
+    let doctor = run_doctor(root);
+    assert!(doctor.contains("Workspace: merged 2 leaf projects into the root analysis"));
+    assert!(doctor.contains("services/api (Makefile)"));
+    assert!(doctor.contains("apps/mobile (package.json)"));
+}
+
+#[test]
+fn doctor_reports_mixed_workspace_leafs() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let infra = root.join("infra");
+    let service = root.join("services/stuffix");
+    Command::new("git")
+        .arg("init")
+        .arg("-q")
+        .arg(root)
+        .status()
+        .unwrap();
+
+    fs::create_dir_all(&infra).unwrap();
+    fs::create_dir_all(&service).unwrap();
+    fs::write(
+        infra.join("main.tf"),
+        "terraform {\n  required_version = \">= 1.6.0\"\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        service.join("mix.exs"),
+        r#"defmodule Demo.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :demo, version: "0.1.0", elixir: "~> 1.15"]
+  end
+
+  defp deps do
+    [
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
+    ]
+  end
+end
+"#,
+    )
+    .unwrap();
+
+    let output = run_doctor(root);
+    assert!(output.contains("Markers: terraform, mix.exs, workspace"));
+    assert!(output.contains(
+        "Lint commands: cd 'infra' && opentofu fmt -check -recursive, cd 'services/stuffix' && mix format --check-formatted, cd 'services/stuffix' && mix credo --strict"
+    ));
+    assert!(
+        output
+            .contains("Build commands: cd 'services/stuffix' && mix compile --warnings-as-errors")
+    );
+    assert!(output.contains("Test commands: cd 'services/stuffix' && mix test"));
+    assert!(output.contains("Requirements: none"));
+    assert!(output.contains("Workspace members: infra (*.tf), services/stuffix (mix.exs)."));
+}
+
+#[test]
+fn verify_workspace_root_reports_root_ds_store_policy_before_leaf_commands() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let infra = root.join("infra");
+    let service = root.join("services/stuffix");
+
+    fs::create_dir_all(&infra).unwrap();
+    fs::create_dir_all(&service).unwrap();
+    fs::write(root.join("README.md"), "# Demo\n").unwrap();
+    fs::write(
+        infra.join("main.tf"),
+        "terraform {\n  required_version = \">= 1.6.0\"\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        service.join("mix.exs"),
+        "defmodule Demo.MixProject do end\n",
+    )
+    .unwrap();
+    Command::new("git")
+        .arg("init")
+        .arg("-q")
+        .arg(root)
+        .status()
+        .unwrap();
+
+    let output = run_verify(root);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("Verification failed."));
+    assert!(stderr.contains(" - ignore: .gitignore"));
+    assert!(stderr.contains("git repositories must ignore .DS_Store"));
+    assert!(!stderr.contains("opentofu fmt -check -recursive"));
+    assert!(!stderr.contains("mix format --check-formatted"));
+}
+
+#[test]
 fn rust_projects_use_release_builds() {
     let dir = tempdir().unwrap();
     let root = dir.path();
@@ -201,7 +340,45 @@ fn apply_preserves_existing_claude_settings() {
         .map(|entry| entry["command"].as_str().unwrap())
         .collect::<Vec<_>>();
     assert!(commands.contains(&"mix format --check-formatted"));
+    assert!(commands.contains(&"mix credo --strict"));
     assert!(commands.contains(&"mix compile --warnings-as-errors"));
+}
+
+#[test]
+fn verify_workspace_root_reports_missing_credo_before_leaf_commands() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let service = root.join("services/stuffix");
+
+    fs::create_dir_all(&service).unwrap();
+    fs::write(root.join("README.md"), "# Demo\n").unwrap();
+    fs::write(root.join(".gitignore"), ".DS_Store\n").unwrap();
+    fs::write(
+        service.join("mix.exs"),
+        r#"defmodule Demo.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :demo, version: "0.1.0", elixir: "~> 1.15"]
+  end
+end
+"#,
+    )
+    .unwrap();
+    Command::new("git")
+        .arg("init")
+        .arg("-q")
+        .arg(root)
+        .status()
+        .unwrap();
+
+    let output = run_verify(root);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains(" - lint: services/stuffix/mix.exs"));
+    assert!(stderr.contains("Elixir projects must include Credo"));
+    assert!(!stderr.contains("mix format --check-formatted"));
+    assert!(stderr.contains("mix credo --strict"));
 }
 
 #[test]

@@ -302,6 +302,9 @@ fn reason_for_package(analysis: &Analysis, package: &str) -> String {
         "python3" => "Needed to run the detected Python project.".to_string(),
         "gradle" => "Needed because the project uses Gradle.".to_string(),
         "maven" => "Needed because the project uses Maven.".to_string(),
+        "opentofu" => {
+            "Needed because the project includes Terraform-compatible infrastructure.".to_string()
+        }
         "golangci-lint" => {
             "Needed because the project has golangci-lint configuration.".to_string()
         }
@@ -579,6 +582,7 @@ mod tests {
             lint_commands: Vec::new(),
             build_commands: Vec::new(),
             test_commands: Vec::new(),
+            required_checks: Vec::new(),
             notes: vec![
                 "Detected rustler in the Elixir dependencies; enabling Rust because Rustler-backed NIFs need a Rust toolchain.".to_string(),
                 "Detected postgrex in the Elixir dependencies; adding the PostgreSQL client package and enabling PostgreSQL for local development.".to_string(),

@@ -80,35 +80,15 @@ pub fn ensure_supported_runtime_versions(
     allow_end_of_life: bool,
 ) -> Result<()> {
     let mut failures = Vec::new();
-    let mut skipped = Vec::new();
     for version in versions {
         if version.runtime.eol_product_slug().is_empty() {
-            skipped.push(format!(
-                "{} {} from {} was not checked because this runtime does not have lifecycle mapping support yet.",
-                version.runtime.display_name(),
-                version.version,
-                version.source
-            ));
             continue;
         }
         let Some(status) = resolve_status(version)? else {
-            skipped.push(format!(
-                "{} {} from {} was not checked because no end-of-life entry matched its release cycle.",
-                version.runtime.display_name(),
-                version.version,
-                version.source
-            ));
             continue;
         };
         if status.is_eol {
             failures.push(format_failure(version, &status));
-        }
-    }
-
-    if !skipped.is_empty() {
-        eprintln!("Lifecycle checks skipped:");
-        for item in &skipped {
-            eprintln!("  - {item}");
         }
     }
 
@@ -398,5 +378,20 @@ mod tests {
                 .to_string()
                 .contains("dangerously-use-end-of-life-versions")
         );
+    }
+
+    #[test]
+    fn allows_unmapped_versions_without_error() {
+        let result = ensure_supported_runtime_versions(
+            &[DetectedVersion {
+                runtime: RuntimeKind::Elixir,
+                version: "~> 1.15".to_string(),
+                source: "services/stuffix/mix.exs#elixir".to_string(),
+                kind: VersionKind::Constraint,
+                config_lines: Vec::new(),
+            }],
+            false,
+        );
+        assert!(result.is_ok());
     }
 }

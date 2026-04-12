@@ -15,6 +15,7 @@ The point is to make the normally implicit parts of local development explicit:
 Given a project directory, `explicit`:
 
 - scans common project markers such as `package.json`, `Cargo.toml`, `go.mod`, `mix.exs`, `Gemfile`, `composer.json`, `pyproject.toml`, `requirements.txt`, `Makefile`, Gradle files, Maven files, and Compose files
+- when started at a repository root, auto-discovers typical leaf projects underneath it and merges their commands, packages, services, and options into one workspace analysis
 - detects likely languages, packages, lint commands, build commands, and local services
 - detects likely test commands and common test frameworks
 - detects runtime versions from idiomatic project files such as `.node-version`, `.nvmrc`, `.ruby-version`, `.python-version`, `rust-toolchain.toml`, `go.mod`, `.tool-versions`, `mise.toml`, `.java-version`, and `.php-version`
@@ -61,7 +62,7 @@ What each command does:
 - `apply`: updates `devenv.nix` wiring, rewrites `explicit.generated.deps.nix`, and refreshes `.nono/` metadata and hooks
 - `doctor`: prints a readable summary of what was detected
 - `doctor` includes detected runtime versions and where they came from
-- `verify`: refreshes local managed devenv inputs when needed, then runs the detected lint, build, test, and repository policy checks with short failure summaries
+- `verify`: refreshes local managed devenv inputs when needed, then runs the detected lint, build, test, workspace, and repository policy checks with short failure summaries
 - `shell`: realizes the `devenv` environment and launches a sandboxed shell for agents or manual use
 - `observe`: attaches to a live agent run in the current project, or falls back to the latest saved report when no live socket exists
 - `observe codex`: launches Codex, then ingests the new Codex session JSONL into a run-scoped SQLite database
@@ -223,11 +224,15 @@ The stop hook blocks agent shutdown if any verification check fails.
 
 Both the shared agent stop hooks and the managed `pre-push` git hook delegate to `explicit verify`, so the check logic lives in one place.
 
+At a monorepo root, that means one root hook can block exit when any discovered leaf project is broken.
+
 For example, if a project exposes `cargo fmt --check`, `cargo clippy`, `cargo build --release`, `cargo test`, `pytest`, `pnpm test`, or `make build`, those commands become part of the stop gate.
 
 `explicit verify` also enforces a few repository-level policies:
 
 - git repositories must include a top-level `README.md`
+- git repositories must ignore `.DS_Store`
+- `mix.exs` projects must include Credo and pass `mix credo --strict`
 - public GitHub repositories must include a `LICENSE` file
 - public GitHub repositories must include GitHub Actions workflows that run automatically and cover the detected lint, build, and test commands
 - existing GitHub Actions workflows are syntax-checked, using `actionlint` when it is available in the environment and a YAML/shape validator as fallback
@@ -238,9 +243,57 @@ When `devenv` is available, `explicit verify` prefers the nearest existing ances
 
 When verification detects local services such as PostgreSQL, it starts only the matching `devenv` service processes before running checks. Generated PostgreSQL configs prefer loopback TCP so `localhost:5432` works when that port is free, while the `devenv` runtime socket remains available for tools that use standard `PG*` environment variables.
 
-Interactive terminal runs show progress lines and any services started for verification. Non-interactive runs collapse to `[PASS]` on success or a single failure report on error.
+Interactive terminal runs show progress lines, any services started for verification, and workspace discovery notes when the root analysis merged leaf projects. Non-interactive runs collapse to `[PASS]` on success or a single failure report on error.
 
 If no concrete lint, build, or test command is detected, the hook remains advisory and allows exit.
+
+## Workspace Roots
+
+If you run `explicit` at a repository root, or in a directory with an `explicit.toml` workspace section, it treats that directory as a workspace root and tries to discover leaf projects automatically. The goal is that `explicit apply`, `explicit verify`, `explicit codex`, and `explicit claude` all work from the top of a typical monorepo without a hand-written orchestration file. Leaf directories inside a repo do not auto-discover nested workspaces on their own.
+
+Leaf project markers include:
+
+- `package.json`
+- `Cargo.toml`
+- `go.mod`
+- `mix.exs`
+- `pyproject.toml`, `requirements.txt`
+- `Gemfile`, `Bundlefile`
+- `composer.json`
+- `pom.xml`, `build.gradle`, `build.gradle.kts`, `gradlew`
+- `Makefile` when it exposes `lint`, `build`, `test`, or `check`
+- `terragrunt.hcl`
+- directories with direct `*.tf` files
+
+Workspace container markers include:
+
+- `package.json#workspaces`
+- `pnpm-workspace.yaml`
+- `Cargo.toml [workspace]`
+
+Normal leaf projects stop recursive discovery below that subtree. This is intentional so a React Native app leaf does not also turn `android/` into a second independent Gradle leaf unless you explicitly model it that way.
+
+The merged workspace analysis:
+
+- prefixes leaf commands as `cd <member> && ...`
+- merges packages, services, Nix options, and language enables across the workspace
+- makes the root stop hook and `explicit verify` cover those leaf commands
+- emits explicit workspace notes in `doctor`, `verify`, and shell launch output
+- prefers OpenTofu for generic `*.tf` infrastructure roots, while keeping `terragrunt.hcl` on Terragrunt
+- ignores common dependency and build trees such as `deps/`, `_build/`, `node_modules/`, `.terraform/`, and `target/`
+
+If multiple leaf projects would force different shared-shell runtime pins, `explicit` fails analysis instead of guessing which version the root `devenv` shell should pin. Soft manifest constraints without a generated shell pin do not fail the workspace by themselves.
+
+If auto-discovery needs help, add an optional `explicit.toml` file at the repo root:
+
+```toml
+[workspace]
+auto_discover = true
+members = ["tools/custom"]
+exclude = ["examples", "docs/generated"]
+```
+
+`members` lets you force extra leaf roots into the analysis, and `exclude` lets you prune paths that should not participate in root-level verification.
 
 ## Generated Files
 

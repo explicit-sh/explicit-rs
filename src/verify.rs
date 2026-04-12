@@ -13,6 +13,7 @@ use serde_yaml::{Mapping as YamlMapping, Value as YamlValue};
 
 use crate::analysis::{Analysis, ServiceRequirement};
 use crate::host_tools::preferred_command_path;
+use crate::runtime::{devenv_already_running_pid, stale_devenv_cache_detected};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VerifyMode {
@@ -116,6 +117,7 @@ struct ProgressProbeState {
 struct StartedServices {
     processes: Vec<&'static str>,
     duration: Duration,
+    reused_pid: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,6 +158,7 @@ pub fn run_project_checks(
 
     if output_style == VerifyOutputStyle::Interactive {
         eprintln!("Running {} project checks...", displayed_checks);
+        print_workspace_notes(analysis);
     }
 
     if let Some(failure) = first_project_policy_failure(root, analysis)? {
@@ -206,6 +209,16 @@ pub fn run_project_checks(
         print_compact_pass();
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn print_workspace_notes(analysis: &Analysis) {
+    for note in analysis.notes.iter().filter(|note| {
+        note.starts_with("Workspace: ")
+            || note.starts_with("Workspace members:")
+            || note.starts_with("Workspace excludes:")
+    }) {
+        eprintln!("note {note}");
+    }
 }
 
 fn report_single_failure(
@@ -337,8 +350,9 @@ fn check_lane_key(check: &ProjectCheck) -> String {
 fn project_policy_check_count(analysis: &Analysis) -> usize {
     let mut count = 0;
     if analysis.repository.is_git_repository {
-        count += 1;
+        count += 2;
     }
+    count += analysis.required_checks.len();
     if analysis.repository.has_workflows() {
         count += 1;
     }
@@ -355,6 +369,26 @@ fn first_project_policy_failure(root: &Path, analysis: &Analysis) -> Result<Opti
             subject: "README.md".to_string(),
             exit_code: None,
             summary: "git repositories must include a top-level README.md".to_string(),
+            duration: None,
+        }));
+    }
+
+    if analysis.repository.is_git_repository && !ds_store_is_gitignored(root)? {
+        return Ok(Some(CheckFailure {
+            kind: "ignore",
+            subject: ".gitignore".to_string(),
+            exit_code: None,
+            summary: "git repositories must ignore .DS_Store".to_string(),
+            duration: None,
+        }));
+    }
+
+    if let Some(requirement) = analysis.required_checks.first() {
+        return Ok(Some(CheckFailure {
+            kind: requirement.kind.as_str(),
+            subject: requirement.subject.clone(),
+            exit_code: None,
+            summary: requirement.summary.clone(),
             duration: None,
         }));
     }
@@ -435,6 +469,31 @@ fn first_project_policy_failure(root: &Path, analysis: &Analysis) -> Result<Opti
     }
 
     Ok(None)
+}
+
+fn ds_store_is_gitignored(root: &Path) -> Result<bool> {
+    let output = Command::new("git")
+        .current_dir(root)
+        .args(["check-ignore", "--no-index", ".DS_Store"])
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to check .DS_Store ignore rules in {}",
+                root.display()
+            )
+        })?;
+
+    if output.status.success() {
+        return Ok(true);
+    }
+    if output.status.code() == Some(1) {
+        return Ok(false);
+    }
+
+    anyhow::bail!(
+        "git check-ignore failed while checking .DS_Store ignore rules: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
 }
 
 fn audit_workflows(root: &Path, workflow_files: &[String]) -> Result<WorkflowAudit> {
@@ -639,23 +698,27 @@ fn run_check(
     command: &str,
     progress: Option<&CommandProgress>,
 ) -> Result<CheckOutput> {
+    run_check_with_retry(root, analysis, command, progress, false)
+}
+
+fn run_check_with_retry(
+    root: &Path,
+    analysis: &Analysis,
+    command: &str,
+    progress: Option<&CommandProgress>,
+    refresh_cache: bool,
+) -> Result<CheckOutput> {
     let mut child = if should_use_devenv(root) {
         let devenv_root =
             devenv_root_for_check(root).expect("devenv root should exist when shell usage is set");
-        let mut child = Command::new("devenv");
-        child.current_dir(&devenv_root);
-        if progress.is_some() {
-            child.args(["--trace-output", "stderr", "--trace-format", "json"]);
-        }
-        child
-            .args(["shell", "--no-tui", "--no-reload", "--", "bash", "-lc"])
-            .arg(command_in_devenv_shell(
-                root,
-                &devenv_root,
-                analysis,
-                command,
-            ));
-        child
+        devenv_check_command(
+            root,
+            &devenv_root,
+            analysis,
+            command,
+            progress.is_some(),
+            refresh_cache,
+        )
     } else {
         let mut child = Command::new("bash");
         child.current_dir(root).args([
@@ -664,11 +727,49 @@ fn run_check(
         ]);
         child
     };
-    run_captured_command(
+    let output = run_captured_command(
         &mut child,
         &format!("failed to run check command `{command}`"),
         progress,
-    )
+    )?;
+
+    if !refresh_cache && should_use_devenv(root) {
+        let combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.output.stderr),
+            String::from_utf8_lossy(&output.output.stdout)
+        );
+        if stale_devenv_cache_detected(&combined) {
+            if let Some(progress) = progress {
+                eprintln!("{}... refreshing stale devenv cache", progress.wait_prefix);
+            }
+            return run_check_with_retry(root, analysis, command, progress, true);
+        }
+    }
+
+    Ok(output)
+}
+
+fn devenv_check_command(
+    root: &Path,
+    devenv_root: &Path,
+    analysis: &Analysis,
+    command: &str,
+    with_trace_output: bool,
+    refresh_cache: bool,
+) -> Command {
+    let mut child = Command::new("devenv");
+    child.current_dir(devenv_root);
+    if with_trace_output {
+        child.args(["--trace-output", "stderr", "--trace-format", "json"]);
+    }
+    if refresh_cache {
+        child.args(["--refresh-eval-cache", "--refresh-task-cache"]);
+    }
+    child
+        .args(["shell", "--no-tui", "--no-reload", "--", "bash", "-lc"])
+        .arg(command_in_devenv_shell(root, devenv_root, analysis, command));
+    child
 }
 
 fn run_captured_command(
@@ -1132,6 +1233,15 @@ fn start_verify_services(
     analysis: &Analysis,
     output_style: VerifyOutputStyle,
 ) -> Result<ServiceStartResult> {
+    start_verify_services_with_retry(root, analysis, output_style, false)
+}
+
+fn start_verify_services_with_retry(
+    root: &Path,
+    analysis: &Analysis,
+    output_style: VerifyOutputStyle,
+    refresh_cache: bool,
+) -> Result<ServiceStartResult> {
     let Some(devenv_root) = existing_devenv_root(root) else {
         return Ok(ServiceStartResult::NotNeeded);
     };
@@ -1147,10 +1257,11 @@ fn start_verify_services(
     let command = format!("devenv up --detach {}", processes.join(" "));
     let progress = service_progress(&processes, output_style);
     let mut child = Command::new("devenv");
-    child
-        .current_dir(&devenv_root)
-        .arg("--verbose")
-        .args(["up", "--detach", "--no-tui", "--no-reload"])
+    child.current_dir(&devenv_root).arg("--verbose");
+    if refresh_cache {
+        child.args(["--refresh-eval-cache", "--refresh-task-cache"]);
+    }
+    child.args(["up", "--detach", "--no-tui", "--no-reload"])
         .args(&processes);
     let output = run_captured_command(
         &mut child,
@@ -1162,7 +1273,28 @@ fn start_verify_services(
         return Ok(ServiceStartResult::Started(StartedServices {
             processes,
             duration: output.duration,
+            reused_pid: None,
         }));
+    }
+
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.output.stderr),
+        String::from_utf8_lossy(&output.output.stdout)
+    );
+    if let Some(pid) = devenv_already_running_pid(&combined) {
+        return Ok(ServiceStartResult::Started(StartedServices {
+            processes,
+            duration: output.duration,
+            reused_pid: Some(pid),
+        }));
+    }
+
+    if !refresh_cache && stale_devenv_cache_detected(&combined) {
+        if output_style == VerifyOutputStyle::Interactive {
+            eprintln!("svc  refreshing stale devenv cache...");
+        }
+        return start_verify_services_with_retry(root, analysis, output_style, true);
     }
 
     Ok(ServiceStartResult::Failed(CheckFailure {
@@ -1439,11 +1571,19 @@ fn verify_output_style_with_stderr_terminal(
 }
 
 fn print_started_services(started: &StartedServices) {
-    eprintln!(
-        "svc  {} ({})",
-        started.processes.join(", "),
-        format_duration(started.duration)
-    );
+    match started.reused_pid.as_deref() {
+        Some(pid) => eprintln!(
+            "svc  {} (reused PID {}, {})",
+            started.processes.join(", "),
+            pid,
+            format_duration(started.duration)
+        ),
+        None => eprintln!(
+            "svc  {} ({})",
+            started.processes.join(", "),
+            format_duration(started.duration)
+        ),
+    }
 }
 
 fn print_compact_pass() {
@@ -1584,20 +1724,20 @@ fn shell_quote(path: &Path) -> String {
 mod tests {
     use super::{
         ProjectCheck, VerifyMode, build_stop_reason, check_preflight_note, command_in_devenv_shell,
-        command_with_runtime_env, devenv_root_for_check_with_env, existing_devenv_root,
-        first_project_policy_failure, humanize_devenv_trace_line, humanize_live_output,
-        is_matching_devenv_root, missing_workflow_commands, normalize_summary,
-        prepare_verify_environment, project_checks, service_process_names, shell_quote,
-        should_use_devenv, summarize_failure, tokens_are_subsequence,
+        command_with_runtime_env, devenv_check_command, devenv_root_for_check_with_env,
+        existing_devenv_root, first_project_policy_failure, humanize_devenv_trace_line,
+        humanize_live_output, is_matching_devenv_root, missing_workflow_commands,
+        normalize_summary, prepare_verify_environment, project_checks, service_process_names,
+        shell_quote, should_use_devenv, summarize_failure, tokens_are_subsequence,
         verify_output_style_with_stderr_terminal, workflow_runs_command,
     };
     use crate::analysis::{
-        Analysis, GitHubRepository, GitHubVisibility, RepositoryMetadata, SandboxPlan,
-        ServiceRequirement,
+        Analysis, GitHubRepository, GitHubVisibility, ProjectRequirement, RepositoryMetadata,
+        RequirementKind, SandboxPlan, ServiceRequirement,
     };
     use std::os::unix::process::ExitStatusExt;
     use std::path::PathBuf;
-    use std::process::Output;
+    use std::process::{Command, Output};
     use std::time::Duration;
 
     fn analysis_with_checks() -> Analysis {
@@ -1615,6 +1755,7 @@ mod tests {
             lint_commands: vec!["lint-a".to_string()],
             build_commands: vec!["build-a".to_string()],
             test_commands: vec!["test-a".to_string()],
+            required_checks: Vec::new(),
             notes: Vec::new(),
             repository: RepositoryMetadata::default(),
             sandbox_plan: SandboxPlan {
@@ -1764,6 +1905,25 @@ mod tests {
             command,
             "export PGHOST=\"${DEVENV_RUNTIME}/postgres\" && export PGHOSTADDR=\"127.0.0.1\" && mix test"
         );
+    }
+
+    #[test]
+    fn devenv_check_retry_adds_refresh_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let command = devenv_check_command(
+            dir.path(),
+            dir.path(),
+            &analysis_with_checks(),
+            "mix test",
+            false,
+            true,
+        );
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args.contains(&"--refresh-eval-cache".to_string()));
+        assert!(args.contains(&"--refresh-task-cache".to_string()));
     }
 
     #[test]
@@ -1931,6 +2091,32 @@ mod tests {
     }
 
     #[test]
+    fn requires_ds_store_ignore_for_git_repositories() {
+        let dir = tempfile::tempdir().unwrap();
+        Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(dir.path())
+            .status()
+            .unwrap();
+        std::fs::write(dir.path().join("README.md"), "# Demo\n").unwrap();
+
+        let mut analysis = analysis_with_checks();
+        analysis.repository = RepositoryMetadata {
+            is_git_repository: true,
+            readme_path: Some("README.md".to_string()),
+            ..RepositoryMetadata::default()
+        };
+
+        let failure = first_project_policy_failure(dir.path(), &analysis)
+            .unwrap()
+            .expect("expected ds_store ignore failure");
+        assert_eq!(failure.kind, "ignore");
+        assert_eq!(failure.subject, ".gitignore");
+        assert!(failure.summary.contains(".DS_Store"));
+    }
+
+    #[test]
     fn requires_license_for_public_github_repositories() {
         let dir = tempfile::tempdir().unwrap();
         let mut analysis = analysis_with_checks();
@@ -1947,6 +2133,26 @@ mod tests {
             .expect("expected license failure");
         assert_eq!(failure.kind, "license");
         assert_eq!(failure.subject, "LICENSE");
+    }
+
+    #[test]
+    fn requires_credo_for_elixir_projects() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut analysis = analysis_with_checks();
+        analysis.required_checks = vec![ProjectRequirement {
+            kind: RequirementKind::Lint,
+            subject: "mix.exs".to_string(),
+            summary: "Elixir projects must include Credo and pass `mix credo --strict`."
+                .to_string(),
+        }];
+
+        let failure = first_project_policy_failure(dir.path(), &analysis)
+            .unwrap()
+            .expect("expected credo failure");
+        assert_eq!(failure.kind, "lint");
+        assert_eq!(failure.subject, "mix.exs");
+        assert!(failure.summary.contains("Credo"));
+        assert!(failure.summary.contains("mix credo --strict"));
     }
 
     #[test]
@@ -2014,6 +2220,12 @@ jobs:
     #[test]
     fn prioritizes_repository_prerequisites_one_at_a_time() {
         let dir = tempfile::tempdir().unwrap();
+        Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(dir.path())
+            .status()
+            .unwrap();
         let mut analysis = analysis_with_checks();
         analysis.repository = RepositoryMetadata {
             is_git_repository: true,
@@ -2023,6 +2235,12 @@ jobs:
             }),
             ..RepositoryMetadata::default()
         };
+        analysis.required_checks = vec![ProjectRequirement {
+            kind: RequirementKind::Lint,
+            subject: "mix.exs".to_string(),
+            summary: "Elixir projects must include Credo and pass `mix credo --strict`."
+                .to_string(),
+        }];
 
         let failure = first_project_policy_failure(dir.path(), &analysis)
             .unwrap()
@@ -2033,6 +2251,18 @@ jobs:
         let failure = first_project_policy_failure(dir.path(), &analysis)
             .unwrap()
             .expect("expected second failure");
+        assert_eq!(failure.subject, ".gitignore");
+
+        std::fs::write(dir.path().join(".gitignore"), ".DS_Store\n").unwrap();
+        let failure = first_project_policy_failure(dir.path(), &analysis)
+            .unwrap()
+            .expect("expected third failure");
+        assert_eq!(failure.subject, "mix.exs");
+
+        analysis.required_checks = Vec::new();
+        let failure = first_project_policy_failure(dir.path(), &analysis)
+            .unwrap()
+            .expect("expected fourth failure");
         assert_eq!(failure.subject, "LICENSE");
     }
 
