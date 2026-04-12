@@ -29,7 +29,7 @@ pub struct LaunchShellOptions<'a> {
     pub transcript_path: Option<&'a Path>,
 }
 
-pub fn apply_project(root: &Path, analysis: &Analysis) -> Result<()> {
+pub(crate) fn ensure_managed_devenv_files(root: &Path, analysis: &Analysis) -> Result<()> {
     ensure_devenv_file(root)?;
     ensure_devenv_yaml(root, analysis)?;
     write_if_changed(
@@ -42,6 +42,11 @@ pub fn apply_project(root: &Path, analysis: &Analysis) -> Result<()> {
         fs::remove_file(&legacy_generated)
             .with_context(|| format!("failed to remove {}", legacy_generated.display()))?;
     }
+    Ok(())
+}
+
+pub fn apply_project(root: &Path, analysis: &Analysis) -> Result<()> {
+    ensure_managed_devenv_files(root, analysis)?;
     fs::create_dir_all(root.join(".nono")).context("failed to create .nono directory")?;
     write_if_changed(
         root.join(".nono/analysis.json"),

@@ -291,6 +291,7 @@ dependencies = [
     assert!(generated.contains("pkgs.freetype"));
     assert!(generated.contains("pkgs.libjpeg"));
     assert!(generated.contains("services.postgres.enable = true;"));
+    assert!(generated.contains("services.postgres.listen_addresses = \"127.0.0.1\";"));
     assert!(generated.contains("services.redis.enable = true;"));
     assert!(generated.contains("maturin"));
     assert!(generated.contains("psycopg"));
@@ -342,6 +343,7 @@ fn apply_detects_nextjs_native_dependencies_and_services() {
     assert!(generated.contains("pkgs.sqlite"));
     assert!(generated.contains("pkgs.postgresql"));
     assert!(generated.contains("services.postgres.enable = true;"));
+    assert!(generated.contains("services.postgres.listen_addresses = \"127.0.0.1\";"));
     assert!(generated.contains("services.redis.enable = true;"));
     assert!(generated.contains("sharp"));
     assert!(generated.contains("Prisma"));
@@ -463,6 +465,7 @@ end
     assert!(generated.contains("Enabling Rust because Rustler-backed NIFs need a Rust toolchain."));
     assert!(generated.contains("pkgs.postgresql"));
     assert!(generated.contains("services.postgres.enable = true;"));
+    assert!(generated.contains("services.postgres.listen_addresses = \"127.0.0.1\";"));
     assert!(generated.contains("services.redis.enable = true;"));
     assert!(generated.contains("rustler"));
     let analysis: JsonValue =
@@ -552,11 +555,19 @@ fn verify_passes_when_detected_checks_succeed() {
 
     let output = run_verify(root);
     assert!(output.status.success());
-    assert!(
-        String::from_utf8(output.stderr)
-            .unwrap()
-            .contains("All project checks passed")
-    );
+    assert_eq!(String::from_utf8(output.stderr).unwrap().trim(), "[PASS]");
+}
+
+#[test]
+fn verify_prepares_managed_devenv_files() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    fs::write(root.join("Makefile"), "lint:\n\t@echo lint-ok\n").unwrap();
+
+    let output = run_verify(root);
+    assert!(output.status.success());
+    assert!(root.join("devenv.nix").is_file());
+    assert!(root.join("explicit.generated.deps.nix").is_file());
 }
 
 #[test]

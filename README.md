@@ -61,7 +61,7 @@ What each command does:
 - `apply`: updates `devenv.nix` wiring, rewrites `explicit.generated.deps.nix`, and refreshes `.nono/` metadata and hooks
 - `doctor`: prints a readable summary of what was detected
 - `doctor` includes detected runtime versions and where they came from
-- `verify`: runs the detected lint, build, test, and repository policy checks with short failure summaries
+- `verify`: refreshes local managed devenv inputs when needed, then runs the detected lint, build, test, and repository policy checks with short failure summaries
 - `shell`: realizes the `devenv` environment and launches a sandboxed shell for agents or manual use
 - `observe`: attaches to a live agent run in the current project, or falls back to the latest saved report when no live socket exists
 - `observe codex`: launches Codex, then ingests the new Codex session JSONL into a run-scoped SQLite database
@@ -233,6 +233,12 @@ For example, if a project exposes `cargo fmt --check`, `cargo clippy`, `cargo bu
 - existing GitHub Actions workflows are syntax-checked, using `actionlint` when it is available in the environment and a YAML/shape validator as fallback
 
 Verification is intentionally sequential. It reports only the highest-priority failing item on each run, so agents get one concrete thing to fix before the next blocker is revealed.
+
+When `devenv` is available, `explicit verify` prefers the nearest existing ancestor `devenv.nix`. If the current folder has no `devenv.nix`, it walks upward and runs checks from that ancestor shell while still executing the command in the original project directory. If no ancestor exists, it prepares local managed `devenv` files first. If `verify` is already running inside that same `devenv shell`, it reuses the current shell instead of nesting another one.
+
+When verification detects local services such as PostgreSQL, it starts only the matching `devenv` service processes before running checks. Generated PostgreSQL configs prefer loopback TCP so `localhost:5432` works when that port is free, while the `devenv` runtime socket remains available for tools that use standard `PG*` environment variables.
+
+Interactive terminal runs show progress lines and any services started for verification. Non-interactive runs collapse to `[PASS]` on success or a single failure report on error.
 
 If no concrete lint, build, or test command is detected, the hook remains advisory and allows exit.
 

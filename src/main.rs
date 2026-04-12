@@ -209,6 +209,7 @@ fn run() -> Result<ExitCode> {
         Command::Verify(args) => {
             let root = args.root.canonicalize().context("failed to resolve root")?;
             let analysis = Analysis::analyze(&root)?;
+            verify::prepare_verify_environment(&root, &analysis)?;
             verify::run_project_checks(&root, &analysis, args.stop_hook, args.git_hook)
         }
         Command::Shell(args) => {

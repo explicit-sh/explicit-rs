@@ -727,7 +727,7 @@ fn analyze_common_files(
                 if (name == "test" || name.starts_with("test:"))
                     && value
                         .as_str()
-                        .map(|script| !script_is_placeholder(script))
+                        .map(|script| script_is_verification_ready(name, script))
                         .unwrap_or(false)
                 {
                     builder.add_test(format!("{runner} {name}"));
@@ -1871,6 +1871,35 @@ fn script_is_placeholder(script: &str) -> bool {
     normalized.contains("no test specified")
 }
 
+fn script_is_verification_ready(name: &str, script: &str) -> bool {
+    if script_is_placeholder(script) {
+        return false;
+    }
+
+    let normalized_name = name.to_lowercase();
+    let normalized_script = script.to_lowercase();
+
+    if normalized_name.contains("debug")
+        || normalized_name.contains("watch")
+        || normalized_name.contains("inspect")
+    {
+        return false;
+    }
+
+    if normalized_script.contains("--inspect")
+        || normalized_script.contains("--inspect-brk")
+        || normalized_script.contains("--watch")
+        || normalized_script.contains("--watchall")
+        || normalized_script.contains("cypress open")
+        || normalized_script.contains("playwright test --ui")
+        || normalized_script.contains("vitest --ui")
+    {
+        return false;
+    }
+
+    true
+}
+
 fn build_sandbox_plan(root: &Path, builder: &Builder) -> Result<SandboxPlan> {
     let home = dirs::home_dir().context("failed to resolve home directory")?;
     let mut read_write_files = BTreeSet::new();
@@ -2126,7 +2155,8 @@ mod tests {
         Analysis, Builder, LanguageRequirement, RepositoryMetadata, RuntimeKind, SUPPORT_PACKAGES,
         SandboxPlan, build_sandbox_plan, fallback_javascript_test_commands,
         platform_agent_read_only_paths, platform_agent_read_write_paths,
-        referenced_instruction_paths, script_is_placeholder, standard_device_read_write_paths,
+        referenced_instruction_paths, script_is_placeholder, script_is_verification_ready,
+        standard_device_read_write_paths,
     };
     use std::{collections::BTreeSet, fs, path::PathBuf};
     use tempfile::tempdir;
@@ -2178,6 +2208,20 @@ mod tests {
     }
 
     #[test]
+    fn ignores_non_verification_test_scripts() {
+        assert!(!script_is_verification_ready(
+            "test:debug",
+            "node --inspect-brk node_modules/jest/bin/jest.js --runInBand"
+        ));
+        assert!(!script_is_verification_ready(
+            "test:watch",
+            "vitest --watch"
+        ));
+        assert!(script_is_verification_ready("test", "npx jest"));
+        assert!(script_is_verification_ready("test:unit", "vitest run"));
+    }
+
+    #[test]
     fn infers_javascript_fallback_test_frameworks() {
         let mut dependencies = BTreeSet::new();
         dependencies.insert("vitest".to_string());
@@ -2185,6 +2229,26 @@ mod tests {
             fallback_javascript_test_commands(&dependencies, "pnpm exec"),
             vec!["pnpm exec vitest run".to_string()]
         );
+    }
+
+    #[test]
+    fn analysis_skips_debug_test_scripts() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{
+                "name":"demo",
+                "scripts":{
+                    "test":"npx jest",
+                    "test:debug":"node --inspect-brk node_modules/jest/bin/jest.js --runInBand"
+                }
+            }"#,
+        )
+        .unwrap();
+        fs::write(dir.path().join("yarn.lock"), "").unwrap();
+
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert_eq!(analysis.test_commands, vec!["yarn test".to_string()]);
     }
 
     #[test]
