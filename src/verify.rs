@@ -264,7 +264,6 @@ fn execute_checks(
         return lanes
             .into_iter()
             .flatten()
-            .into_iter()
             .map(|check| {
                 let progress = check_progress(&check, root, checks.len(), output_style);
                 let output = run_check(root, analysis, &check.command, progress.as_ref())?;
@@ -280,7 +279,6 @@ fn execute_checks(
         .map(|lane| {
             let root = root.clone();
             let analysis = analysis.clone();
-            let output_style = output_style;
             let total_checks = checks.len();
             thread::spawn(move || -> Result<Vec<CheckExecution>> {
                 lane.into_iter()
