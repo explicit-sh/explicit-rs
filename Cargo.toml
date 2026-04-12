@@ -2,6 +2,8 @@
 name = "explicit"
 version = "0.1.0"
 edition = "2024"
+authors = ["Onni Hakala"]
+license = "MIT"
 
 [lib]
 name = "explicit_env_trace"
