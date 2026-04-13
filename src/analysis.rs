@@ -200,12 +200,14 @@ impl DetectedVersion {
 #[serde(rename_all = "snake_case")]
 pub enum RequirementKind {
     Lint,
+    Starter,
 }
 
 impl RequirementKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Lint => "lint",
+            Self::Starter => "starter",
         }
     }
 }
@@ -244,6 +246,8 @@ pub struct SandboxPlan {
     #[serde(default)]
     pub read_only_files: Vec<PathBuf>,
     pub read_only_dirs: Vec<PathBuf>,
+    #[serde(default)]
+    pub protected_write_files: Vec<PathBuf>,
     pub notes: Vec<String>,
 }
 
@@ -278,6 +282,8 @@ struct ExplicitConfigFile {
     workspace: Option<WorkspaceConfig>,
     #[serde(default)]
     deploy: Option<DeployConfig>,
+    #[serde(default)]
+    sandbox: Option<SandboxConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -308,6 +314,35 @@ fn default_workspace_auto_discover() -> bool {
 struct DeployConfig {
     #[serde(default)]
     hosts: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+struct SandboxConfig {
+    #[serde(default)]
+    read_only_files: Vec<String>,
+    #[serde(default)]
+    read_only_dirs: Vec<String>,
+    #[serde(default)]
+    read_write_files: Vec<String>,
+    #[serde(default)]
+    read_write_dirs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ConfiguredSandboxPaths {
+    read_only_files: Vec<PathBuf>,
+    read_only_dirs: Vec<PathBuf>,
+    read_write_files: Vec<PathBuf>,
+    read_write_dirs: Vec<PathBuf>,
+}
+
+impl ConfiguredSandboxPaths {
+    fn is_empty(&self) -> bool {
+        self.read_only_files.is_empty()
+            && self.read_only_dirs.is_empty()
+            && self.read_write_files.is_empty()
+            && self.read_write_dirs.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -497,6 +532,7 @@ fn analyze_single_project(root: &Path) -> Result<Analysis> {
     let mut builder = Builder::default();
     let project_context = ProjectContext::load(root)?;
     let deploy_hosts = configured_deploy_hosts(root)?;
+    let sandbox_paths = configured_sandbox_paths(root)?;
     for package in SUPPORT_PACKAGES {
         builder.add_package(*package);
     }
@@ -514,6 +550,43 @@ fn analyze_single_project(root: &Path) -> Result<Analysis> {
         && builder.test_commands.is_empty()
     {
         builder.add_note(NO_COMMANDS_NOTE);
+    }
+
+    if !sandbox_paths.is_empty() {
+        let mut entries = Vec::new();
+        if !sandbox_paths.read_only_files.is_empty() {
+            entries.push(format!(
+                "{} read-only file override(s)",
+                sandbox_paths.read_only_files.len()
+            ));
+        }
+        if !sandbox_paths.read_only_dirs.is_empty() {
+            entries.push(format!(
+                "{} read-only dir override(s)",
+                sandbox_paths.read_only_dirs.len()
+            ));
+        }
+        if !sandbox_paths.read_write_files.is_empty() {
+            entries.push(format!(
+                "{} read-write file override(s)",
+                sandbox_paths.read_write_files.len()
+            ));
+        }
+        if !sandbox_paths.read_write_dirs.is_empty() {
+            entries.push(format!(
+                "{} read-write dir override(s)",
+                sandbox_paths.read_write_dirs.len()
+            ));
+        }
+        builder.add_note(format!(
+            "Sandbox: loaded {} from {EXPLICIT_CONFIG_FILE}.",
+            entries.join(", ")
+        ));
+    }
+    if root.join(EXPLICIT_CONFIG_FILE).is_file() {
+        builder.add_note(format!(
+            "Sandbox: writes to {EXPLICIT_CONFIG_FILE} are denied inside the sandbox on macOS."
+        ));
     }
 
     let sandbox_plan = build_sandbox_plan(root, &builder)?;
@@ -766,6 +839,60 @@ fn configured_deploy_hosts(root: &Path) -> Result<Vec<String>> {
         .map(|host| host.trim().to_string())
         .filter(|host| !host.is_empty())
         .collect())
+}
+
+fn configured_sandbox_paths(root: &Path) -> Result<ConfiguredSandboxPaths> {
+    let Some(config) = load_explicit_config(root)? else {
+        return Ok(ConfiguredSandboxPaths::default());
+    };
+    let Some(sandbox) = config.sandbox else {
+        return Ok(ConfiguredSandboxPaths::default());
+    };
+
+    Ok(ConfiguredSandboxPaths {
+        read_only_files: resolve_configured_paths(root, &sandbox.read_only_files, "sandbox.read_only_files")?,
+        read_only_dirs: resolve_configured_paths(root, &sandbox.read_only_dirs, "sandbox.read_only_dirs")?,
+        read_write_files: resolve_configured_paths(root, &sandbox.read_write_files, "sandbox.read_write_files")?,
+        read_write_dirs: resolve_configured_paths(root, &sandbox.read_write_dirs, "sandbox.read_write_dirs")?,
+    })
+}
+
+fn resolve_configured_paths(root: &Path, values: &[String], field: &str) -> Result<Vec<PathBuf>> {
+    let home = dirs::home_dir().context("failed to resolve home directory")?;
+    values
+        .iter()
+        .map(|value| resolve_configured_path(root, &home, value, field))
+        .collect()
+}
+
+fn resolve_configured_path(root: &Path, home: &Path, raw: &str, field: &str) -> Result<PathBuf> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        anyhow::bail!("{EXPLICIT_CONFIG_FILE} contains an empty `{field}` entry");
+    }
+
+    let expanded = expand_config_path_value(home, raw);
+    let path = PathBuf::from(expanded);
+    Ok(if path.is_absolute() { path } else { root.join(path) })
+}
+
+fn expand_config_path_value(home: &Path, raw: &str) -> String {
+    if raw == "~" {
+        return home.display().to_string();
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        return home.join(rest).display().to_string();
+    }
+    if let Some(rest) = raw.strip_prefix("$HOME/") {
+        return home.join(rest).display().to_string();
+    }
+    if let Some(rest) = raw.strip_prefix("${HOME}/") {
+        return home.join(rest).display().to_string();
+    }
+    if raw == "$HOME" || raw == "${HOME}" {
+        return home.display().to_string();
+    }
+    raw.to_string()
 }
 
 fn workspace_excludes(root: &Path, config: Option<&WorkspaceConfig>) -> Result<Vec<PathBuf>> {
@@ -1494,6 +1621,9 @@ fn analyze_common_files(
         let elixir_dependencies = context.dependencies("elixir").cloned().unwrap_or_default();
         builder.add_marker("mix.exs");
         builder.add_language(LanguageRequirement::Elixir);
+        if elixir_dependencies.contains("phoenix") {
+            builder.add_marker("phoenix");
+        }
         builder.add_lint("mix format --check-formatted");
         builder.add_lint("mix credo --strict");
         builder.add_build("mix compile --warnings-as-errors");
@@ -1506,9 +1636,14 @@ fn analyze_common_files(
                     .to_string(),
             });
         }
+        if let Some(requirement) = detect_phoenix_starter_page_requirement(root, &elixir_dependencies)?
+        {
+            builder.add_requirement(requirement);
+        }
     }
 
     if root.join("Gemfile").exists() || root.join("Bundlefile").exists() {
+        let ruby_dependencies = context.dependencies("ruby").cloned().unwrap_or_default();
         builder.add_marker(if root.join("Gemfile").exists() {
             "Gemfile"
         } else {
@@ -1516,11 +1651,18 @@ fn analyze_common_files(
         });
         builder.add_language(LanguageRequirement::Ruby);
         builder.add_package("bundler");
+        if ruby_dependencies.contains("rails") || root.join("bin/rails").exists() {
+            builder.add_marker("rails");
+        }
         if root.join(".rubocop.yml").exists() {
             builder.add_lint("bundle exec rubocop");
         }
-        for command in detect_ruby_test_commands(root, context.dependencies("ruby"))? {
+        for command in detect_ruby_test_commands(root, Some(&ruby_dependencies))? {
             builder.add_test(command);
+        }
+        if let Some(requirement) = detect_rails_starter_page_requirement(root, &ruby_dependencies)?
+        {
+            builder.add_requirement(requirement);
         }
     }
 
@@ -2580,6 +2722,186 @@ fn detect_ruby_test_commands(
     Ok(Vec::new())
 }
 
+fn detect_phoenix_starter_page_requirement(
+    root: &Path,
+    dependencies: &BTreeSet<String>,
+) -> Result<Option<ProjectRequirement>> {
+    if !dependencies.contains("phoenix") {
+        return Ok(None);
+    }
+
+    let Some(router_path) = find_first_relative_file(root, &|relative, _| {
+        let normalized = relative.to_string_lossy().replace('\\', "/");
+        normalized.starts_with("lib/") && normalized.ends_with("/router.ex")
+    })? else {
+        return Ok(None);
+    };
+    let router_contents = fs::read_to_string(root.join(&router_path))
+        .with_context(|| format!("failed to read {}", root.join(&router_path).display()))?;
+    let Some(action) = phoenix_default_home_action(&router_contents) else {
+        return Ok(None);
+    };
+
+    let Some(template_path) =
+        find_first_relative_file(root, &|relative, _| {
+            let normalized = relative.to_string_lossy().replace('\\', "/");
+            normalized.starts_with("lib/")
+                && (normalized.contains("/page_html/") || normalized.contains("/templates/page/"))
+        })?
+    else {
+        return Ok(None);
+    };
+
+    let template_file_name = template_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    if !matches!(
+        (action, template_file_name),
+        ("home", "home.html.heex")
+            | ("home", "home.html.eex")
+            | ("index", "index.html.heex")
+            | ("index", "index.html.eex")
+    ) {
+        return Ok(None);
+    }
+
+    let template_contents = fs::read_to_string(root.join(&template_path))
+        .with_context(|| format!("failed to read {}", root.join(&template_path).display()))?;
+    if !looks_like_default_phoenix_home_page(&template_contents) {
+        return Ok(None);
+    }
+
+    Ok(Some(ProjectRequirement {
+        kind: RequirementKind::Starter,
+        subject: display_relative_path(&template_path),
+        summary: "Phoenix projects must replace the default getting started home page before using the generated stop hook.".to_string(),
+    }))
+}
+
+fn detect_rails_starter_page_requirement(
+    root: &Path,
+    dependencies: &BTreeSet<String>,
+) -> Result<Option<ProjectRequirement>> {
+    let has_rails = dependencies.contains("rails") || root.join("bin/rails").exists();
+    if !has_rails || rails_project_is_api_only(root)? {
+        return Ok(None);
+    }
+
+    let routes_path = root.join("config/routes.rb");
+    if !routes_path.is_file() {
+        return Ok(None);
+    }
+    let routes = fs::read_to_string(&routes_path)
+        .with_context(|| format!("failed to read {}", routes_path.display()))?;
+    if rails_routes_define_root(&routes) {
+        return Ok(None);
+    }
+
+    Ok(Some(ProjectRequirement {
+        kind: RequirementKind::Starter,
+        subject: "config/routes.rb".to_string(),
+        summary: "Rails projects must replace the generated getting started page by defining a real root route.".to_string(),
+    }))
+}
+
+fn phoenix_default_home_action(router_contents: &str) -> Option<&'static str> {
+    let regex =
+        Regex::new(r#"get\s+["']/["']\s*,\s*PageController\s*,\s*:(home|index)\b"#).ok()?;
+    for line in router_contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some(captures) = regex.captures(line) else {
+            continue;
+        };
+        let action = captures.get(1)?.as_str();
+        return match action {
+            "home" => Some("home"),
+            "index" => Some("index"),
+            _ => None,
+        };
+    }
+    None
+}
+
+fn looks_like_default_phoenix_home_page(contents: &str) -> bool {
+    let normalized = contents.to_lowercase();
+    (normalized.contains("peace of mind from prototype to production")
+        && normalized.contains("a productive framework that does not compromise speed or maintainability"))
+        || (normalized.contains("welcome to phoenix!") && normalized.contains("phoenix framework"))
+}
+
+fn rails_project_is_api_only(root: &Path) -> Result<bool> {
+    let application_path = root.join("config/application.rb");
+    if application_path.is_file() {
+        let contents = fs::read_to_string(&application_path)
+            .with_context(|| format!("failed to read {}", application_path.display()))?;
+        if contents.contains("config.api_only = true") {
+            return Ok(true);
+        }
+    }
+
+    let application_controller = root.join("app/controllers/application_controller.rb");
+    if application_controller.is_file() {
+        let contents = fs::read_to_string(&application_controller)
+            .with_context(|| format!("failed to read {}", application_controller.display()))?;
+        if contents.contains("ActionController::API") {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn rails_routes_define_root(routes: &str) -> bool {
+    let regex = Regex::new(r#"\broot\s+(?:["'][^"']+["']|to:\s*["'][^"']+["'])"#)
+        .expect("root route regex must compile");
+    routes.lines().any(|line| {
+        let line = line.trim();
+        !line.is_empty() && !line.starts_with('#') && regex.is_match(line)
+    })
+}
+
+fn find_first_relative_file(
+    start: &Path,
+    predicate: &dyn Fn(&Path, &Path) -> bool,
+) -> Result<Option<PathBuf>> {
+    if !start.is_dir() {
+        return Ok(None);
+    }
+    find_first_relative_file_impl(start, start, predicate)
+}
+
+fn find_first_relative_file_impl(
+    base: &Path,
+    current: &Path,
+    predicate: &dyn Fn(&Path, &Path) -> bool,
+) -> Result<Option<PathBuf>> {
+    let mut entries = fs::read_dir(current)
+        .with_context(|| format!("failed to read {}", current.display()))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.path());
+
+    for entry in entries {
+        let path = entry.path();
+        let relative = path.strip_prefix(base).unwrap_or(&path);
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            if let Some(found) = find_first_relative_file_impl(base, &path, predicate)? {
+                return Ok(Some(found));
+            }
+            continue;
+        }
+        if file_type.is_file() && predicate(relative, &path) {
+            return Ok(Some(relative.to_path_buf()));
+        }
+    }
+
+    Ok(None)
+}
+
 fn fallback_javascript_test_commands(
     dependencies: &BTreeSet<String>,
     exec_runner: &str,
@@ -2641,10 +2963,12 @@ fn script_is_verification_ready(name: &str, script: &str) -> bool {
 
 fn build_sandbox_plan(root: &Path, builder: &Builder) -> Result<SandboxPlan> {
     let home = dirs::home_dir().context("failed to resolve home directory")?;
+    let configured_paths = configured_sandbox_paths(root)?;
     let mut read_write_files = BTreeSet::new();
     let mut read_write_dirs = BTreeSet::new();
     let mut read_only_files = BTreeSet::new();
     let mut read_only_dirs = BTreeSet::new();
+    let mut protected_write_files = BTreeSet::new();
 
     read_write_dirs.insert(root.to_path_buf());
     read_write_dirs.insert(root.join(".devenv"));
@@ -2738,6 +3062,23 @@ fn build_sandbox_plan(root: &Path, builder: &Builder) -> Result<SandboxPlan> {
         read_write_dirs.insert(parent.to_path_buf());
     }
 
+    for path in configured_paths.read_write_files {
+        read_write_files.insert(path);
+    }
+    for path in configured_paths.read_write_dirs {
+        read_write_dirs.insert(path);
+    }
+    for path in configured_paths.read_only_files {
+        read_only_files.insert(path);
+    }
+    for path in configured_paths.read_only_dirs {
+        read_only_dirs.insert(path);
+    }
+    let explicit_config = root.join(EXPLICIT_CONFIG_FILE);
+    if explicit_config.is_file() {
+        protected_write_files.insert(explicit_config);
+    }
+
     let read_write_files = read_write_files
         .into_iter()
         .filter(|path| path.exists())
@@ -2754,6 +3095,10 @@ fn build_sandbox_plan(root: &Path, builder: &Builder) -> Result<SandboxPlan> {
         .into_iter()
         .filter(|path| path.exists())
         .collect::<Vec<_>>();
+    let protected_write_files = protected_write_files
+        .into_iter()
+        .filter(|path| path.exists())
+        .collect::<Vec<_>>();
 
     Ok(SandboxPlan {
         root: root.to_path_buf(),
@@ -2761,6 +3106,7 @@ fn build_sandbox_plan(root: &Path, builder: &Builder) -> Result<SandboxPlan> {
         read_write_dirs,
         read_only_files,
         read_only_dirs,
+        protected_write_files,
         notes: builder.notes.clone(),
     })
 }
@@ -2822,9 +3168,6 @@ fn platform_agent_read_only_paths(home: &Path) -> Vec<PathBuf> {
 
 fn generic_agent_read_write_paths(home: &Path) -> Vec<PathBuf> {
     vec![
-        home.join(".config"),
-        home.join(".cache"),
-        home.join(".local/share"),
         home.join(".config/claude"),
         home.join(".config/claude-code"),
         home.join(".config/Anthropic"),
@@ -2833,6 +3176,7 @@ fn generic_agent_read_write_paths(home: &Path) -> Vec<PathBuf> {
         home.join(".cache/claude-code"),
         home.join(".cache/Anthropic"),
         home.join(".cache/codex"),
+        home.join(".cache/nix"),
         home.join(".local/share/claude"),
         home.join(".local/share/claude-code"),
         home.join(".local/share/Anthropic"),
@@ -2892,7 +3236,8 @@ fn linux_agent_read_only_paths(_home: &Path) -> Vec<PathBuf> {
 mod tests {
     use super::{
         Analysis, Builder, EXPLICIT_CONFIG_FILE, LanguageRequirement, NO_COMMANDS_NOTE,
-        RepositoryMetadata, RuntimeKind, SUPPORT_PACKAGES, SandboxPlan, build_sandbox_plan,
+        RepositoryMetadata, RequirementKind, RuntimeKind, SUPPORT_PACKAGES, SandboxPlan,
+        build_sandbox_plan, configured_sandbox_paths, expand_config_path_value,
         fallback_javascript_test_commands, platform_agent_read_only_paths,
         platform_agent_read_write_paths, referenced_instruction_paths, script_is_placeholder,
         script_is_verification_ready, standard_device_read_write_paths,
@@ -2933,6 +3278,7 @@ mod tests {
                 read_write_dirs: Vec::new(),
                 read_only_files: Vec::new(),
                 read_only_dirs: Vec::new(),
+                protected_write_files: Vec::new(),
                 notes: Vec::new(),
             },
         };
@@ -2998,7 +3344,10 @@ mod tests {
         let read_write = platform_agent_read_write_paths(&home);
         let read_only = platform_agent_read_only_paths(&home);
         assert!(read_write.contains(&home.join("Library/Keychains")));
-        assert!(read_write.contains(&home.join(".config")));
+        assert!(read_write.contains(&home.join(".config/codex")));
+        assert!(read_write.contains(&home.join(".cache/codex")));
+        assert!(read_write.contains(&home.join(".cache/nix")));
+        assert!(read_write.contains(&home.join(".local/share/codex")));
         assert!(read_write.contains(&home.join(".npm")));
         assert!(read_write.contains(&PathBuf::from("/var/run")));
         assert!(read_only.contains(&home.join(".gitconfig")));
@@ -3056,6 +3405,74 @@ mod tests {
         assert!(dirs.contains(&home.join(".mix")));
         assert!(dirs.contains(&home.join(".hex")));
         assert!(dirs.contains(&home.join("Library/Caches/elixir_make")));
+    }
+
+    #[test]
+    fn expands_config_path_home_prefixes() {
+        let home = PathBuf::from("/Users/tester");
+        assert_eq!(
+            expand_config_path_value(&home, "$HOME/.config/sops/age/key.txt"),
+            "/Users/tester/.config/sops/age/key.txt"
+        );
+        assert_eq!(
+            expand_config_path_value(&home, "${HOME}/.config/sops/age/key.txt"),
+            "/Users/tester/.config/sops/age/key.txt"
+        );
+        assert_eq!(
+            expand_config_path_value(&home, "~/.config/sops/age/key.txt"),
+            "/Users/tester/.config/sops/age/key.txt"
+        );
+    }
+
+    #[test]
+    fn sandbox_config_adds_read_only_files_and_root_relative_dirs() {
+        let dir = tempdir().unwrap();
+        let key_dir = dir.path().join("keys");
+        let cache_dir = dir.path().join("runtime-cache");
+        fs::create_dir_all(&key_dir).unwrap();
+        fs::create_dir_all(&cache_dir).unwrap();
+        let key_file = key_dir.join("deploy.age");
+        fs::write(&key_file, "secret").unwrap();
+        fs::write(
+            dir.path().join(EXPLICIT_CONFIG_FILE),
+            r#"[sandbox]
+read_only_files = ["keys/deploy.age"]
+read_write_dirs = ["runtime-cache"]
+"#,
+        )
+        .unwrap();
+
+        let configured = configured_sandbox_paths(dir.path()).unwrap();
+        assert_eq!(configured.read_only_files, vec![key_file.clone()]);
+        assert_eq!(configured.read_write_dirs, vec![cache_dir.clone()]);
+
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert!(analysis.sandbox_plan.read_only_files.contains(&key_file));
+        assert!(analysis.sandbox_plan.read_write_dirs.contains(&cache_dir));
+        assert!(analysis.notes.iter().any(|note| {
+            note == &format!(
+                "Sandbox: loaded 1 read-only file override(s), 1 read-write dir override(s) from {EXPLICIT_CONFIG_FILE}."
+            )
+        }));
+    }
+
+    #[test]
+    fn sandbox_plan_protects_explicit_toml_from_writes() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join(EXPLICIT_CONFIG_FILE), "[sandbox]\n").unwrap();
+
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert!(
+            analysis
+                .sandbox_plan
+                .protected_write_files
+                .contains(&dir.path().join(EXPLICIT_CONFIG_FILE))
+        );
+        assert!(analysis.notes.iter().any(|note| {
+            note == &format!(
+                "Sandbox: writes to {EXPLICIT_CONFIG_FILE} are denied inside the sandbox on macOS."
+            )
+        }));
     }
 
     #[test]
@@ -3395,6 +3812,179 @@ end
                 .contains(&"mix credo --strict".to_string())
         );
         assert!(analysis.required_checks.is_empty());
+    }
+
+    #[test]
+    fn phoenix_projects_require_replacing_default_home_page() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("lib/demo_web/controllers/page_html")).unwrap();
+        fs::write(
+            dir.path().join("mix.exs"),
+            r#"defmodule Demo.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :demo, version: "0.1.0", elixir: "~> 1.15"]
+  end
+
+  defp deps do
+    [
+      {:phoenix, "~> 1.7"},
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
+    ]
+  end
+end
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("lib/demo_web/router.ex"),
+            r#"defmodule DemoWeb.Router do
+  use DemoWeb, :router
+
+  scope "/", DemoWeb do
+    pipe_through :browser
+    get "/", PageController, :home
+  end
+end
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("lib/demo_web/controllers/page_html/home.html.heex"),
+            r#"<section>
+  <h1>Peace of mind from prototype to production</h1>
+  <p>A productive framework that does not compromise speed or maintainability.</p>
+</section>
+"#,
+        )
+        .unwrap();
+
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        let requirement = analysis
+            .required_checks
+            .iter()
+            .find(|requirement| requirement.kind == RequirementKind::Starter)
+            .expect("expected starter requirement");
+        assert_eq!(
+            requirement.subject,
+            "lib/demo_web/controllers/page_html/home.html.heex"
+        );
+        assert!(requirement.summary.contains("Phoenix projects must replace"));
+        assert!(analysis.markers.contains(&"phoenix".to_string()));
+    }
+
+    #[test]
+    fn phoenix_projects_with_custom_home_page_clear_starter_requirement() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("lib/demo_web/controllers/page_html")).unwrap();
+        fs::write(
+            dir.path().join("mix.exs"),
+            r#"defmodule Demo.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :demo, version: "0.1.0", elixir: "~> 1.15"]
+  end
+
+  defp deps do
+    [
+      {:phoenix, "~> 1.7"},
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
+    ]
+  end
+end
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("lib/demo_web/router.ex"),
+            r#"defmodule DemoWeb.Router do
+  use DemoWeb, :router
+
+  scope "/", DemoWeb do
+    pipe_through :browser
+    get "/", PageController, :home
+  end
+end
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("lib/demo_web/controllers/page_html/home.html.heex"),
+            "<h1>Custom storefront</h1>\n",
+        )
+        .unwrap();
+
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert!(
+            !analysis
+                .required_checks
+                .iter()
+                .any(|requirement| requirement.kind == RequirementKind::Starter)
+        );
+    }
+
+    #[test]
+    fn rails_projects_require_real_root_route() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("config")).unwrap();
+        fs::create_dir_all(dir.path().join("app/controllers")).unwrap();
+        fs::write(
+            dir.path().join("Gemfile"),
+            "source \"https://rubygems.org\"\ngem \"rails\"\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("config/routes.rb"),
+            "Rails.application.routes.draw do\n  # root \"posts#index\"\nend\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("app/controllers/application_controller.rb"),
+            "class ApplicationController < ActionController::Base\nend\n",
+        )
+        .unwrap();
+
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        let requirement = analysis
+            .required_checks
+            .iter()
+            .find(|requirement| requirement.kind == RequirementKind::Starter)
+            .expect("expected starter requirement");
+        assert_eq!(requirement.subject, "config/routes.rb");
+        assert!(requirement.summary.contains("real root route"));
+        assert!(analysis.markers.contains(&"rails".to_string()));
+    }
+
+    #[test]
+    fn rails_projects_with_root_route_clear_starter_requirement() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("config")).unwrap();
+        fs::create_dir_all(dir.path().join("app/controllers")).unwrap();
+        fs::write(
+            dir.path().join("Gemfile"),
+            "source \"https://rubygems.org\"\ngem \"rails\"\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("config/routes.rb"),
+            "Rails.application.routes.draw do\n  root \"home#index\"\nend\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("app/controllers/application_controller.rb"),
+            "class ApplicationController < ActionController::Base\nend\n",
+        )
+        .unwrap();
+
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert!(
+            !analysis
+                .required_checks
+                .iter()
+                .any(|requirement| requirement.kind == RequirementKind::Starter)
+        );
     }
 
     #[test]

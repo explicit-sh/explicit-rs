@@ -251,7 +251,7 @@ fn verify_workspace_root_reports_root_ds_store_policy_before_leaf_commands() {
 
     fs::create_dir_all(&infra).unwrap();
     fs::create_dir_all(&service).unwrap();
-    fs::write(root.join("README.md"), "# Demo\n").unwrap();
+    fs::write(root.join("README.md"), "# Demo\n\n## License\nMIT\n").unwrap();
     fs::write(
         infra.join("main.tf"),
         "terraform {\n  required_version = \">= 1.6.0\"\n}\n",
@@ -277,6 +277,40 @@ fn verify_workspace_root_reports_root_ds_store_policy_before_leaf_commands() {
     assert!(stderr.contains("git repositories must ignore .DS_Store"));
     assert!(!stderr.contains("opentofu fmt -check -recursive"));
     assert!(!stderr.contains("mix format --check-formatted"));
+}
+
+#[test]
+fn verify_reports_missing_readme_license_section_before_commands() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+
+    fs::write(root.join("README.md"), "# Demo\n\n## Usage\nTry it.\n").unwrap();
+    fs::write(root.join(".gitignore"), ".DS_Store\n").unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2021"
+"#,
+    )
+    .unwrap();
+    Command::new("git")
+        .arg("init")
+        .arg("-q")
+        .arg(root)
+        .status()
+        .unwrap();
+
+    let output = run_verify(root);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("Verification failed."));
+    assert!(stderr.contains(" - docs: README.md#License"));
+    assert!(stderr.contains(
+        "git repositories must end README.md with a `## License` section"
+    ));
+    assert!(!stderr.contains("cargo fmt --check"));
 }
 
 #[test]
@@ -351,7 +385,7 @@ fn verify_workspace_root_reports_missing_credo_before_leaf_commands() {
     let service = root.join("services/stuffix");
 
     fs::create_dir_all(&service).unwrap();
-    fs::write(root.join("README.md"), "# Demo\n").unwrap();
+    fs::write(root.join("README.md"), "# Demo\n\n## License\nMIT\n").unwrap();
     fs::write(root.join(".gitignore"), ".DS_Store\n").unwrap();
     fs::write(
         service.join("mix.exs"),
@@ -379,6 +413,72 @@ end
     assert!(stderr.contains("Elixir projects must include Credo"));
     assert!(!stderr.contains("mix format --check-formatted"));
     assert!(stderr.contains("mix credo --strict"));
+}
+
+#[test]
+fn verify_blocks_on_default_phoenix_home_page_before_commands() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join("lib/demo_web/controllers/page_html")).unwrap();
+    fs::write(root.join("README.md"), "# Demo\n\n## License\nMIT\n").unwrap();
+    fs::write(root.join(".gitignore"), ".DS_Store\n").unwrap();
+    fs::write(
+        root.join("mix.exs"),
+        r#"defmodule Demo.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :demo, version: "0.1.0", elixir: "~> 1.15"]
+  end
+
+  defp deps do
+    [
+      {:phoenix, "~> 1.7"},
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
+    ]
+  end
+end
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("lib/demo_web/router.ex"),
+        r#"defmodule DemoWeb.Router do
+  use DemoWeb, :router
+
+  scope "/", DemoWeb do
+    pipe_through :browser
+    get "/", PageController, :home
+  end
+end
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("lib/demo_web/controllers/page_html/home.html.heex"),
+        r#"<section>
+  <h1>Peace of mind from prototype to production</h1>
+  <p>A productive framework that does not compromise speed or maintainability.</p>
+</section>
+"#,
+    )
+    .unwrap();
+    Command::new("git")
+        .arg("init")
+        .arg("-q")
+        .arg(root)
+        .status()
+        .unwrap();
+
+    let output = run_verify(root);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains(
+        " - starter: lib/demo_web/controllers/page_html/home.html.heex"
+    ));
+    assert!(stderr.contains("Phoenix projects must replace the default getting started home page"));
+    assert!(!stderr.contains("mix format --check-formatted"));
 }
 
 #[test]

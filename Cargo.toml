@@ -18,6 +18,7 @@ libc = "0.2.177"
 nono = "0.31.0"
 onefetch = "2.27.1"
 onefetch-manifest = "2.27.1"
+pulldown-cmark = "0.13.0"
 regex = "1.12.2"
 reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 rnix = "0.14.0"

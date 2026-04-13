@@ -595,6 +595,7 @@ mod tests {
                 read_write_dirs: Vec::new(),
                 read_only_files: Vec::new(),
                 read_only_dirs: Vec::new(),
+                protected_write_files: Vec::new(),
                 notes: Vec::new(),
             },
         };

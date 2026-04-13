@@ -115,10 +115,37 @@ fn build_capabilities(plan: &SandboxPlan) -> Result<CapabilitySet> {
             caps = caps.allow_path(path, AccessMode::Read)?;
         }
     }
+    add_protected_write_file_rules(&mut caps, &plan.protected_write_files)?;
     if std::env::var("DEVENV_NONO_BLOCK_NETWORK").as_deref() == Ok("1") {
         caps = caps.block_network();
     }
     Ok(caps)
+}
+
+fn add_protected_write_file_rules(caps: &mut CapabilitySet, paths: &[PathBuf]) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    for path in paths {
+        let escaped = escape_seatbelt_path(path)?;
+        caps.add_platform_rule(format!("(deny file-write* (literal \"{escaped}\"))"))?;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    let _ = (caps, paths);
+
+    Ok(())
+}
+
+fn escape_seatbelt_path(path: &Path) -> Result<String> {
+    let raw = path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("path is not valid UTF-8: {}", path.display()))?;
+    if raw.contains('"') || raw.contains('\n') || raw.contains('\r') {
+        bail!(
+            "path cannot be protected by macOS sandbox deny rule: {}",
+            path.display()
+        );
+    }
+    Ok(raw.replace('\\', "\\\\"))
 }
 
 fn apply_sandbox(caps: &CapabilitySet) -> Result<()> {
@@ -136,8 +163,9 @@ fn apply_sandbox(caps: &CapabilitySet) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{choose_shell, preferred_shell_path};
+    use super::{choose_shell, escape_seatbelt_path, preferred_shell_path};
     use std::collections::BTreeMap;
+    use std::path::Path;
 
     #[test]
     fn prefers_known_system_shell_over_env_shell() {
@@ -155,5 +183,11 @@ mod tests {
         assert_eq!(shell.args[1], "--norc");
         assert_eq!(shell.args[2], "-c");
         assert_eq!(shell.args[3], "codex");
+    }
+
+    #[test]
+    fn escape_seatbelt_path_rejects_unsafe_characters() {
+        assert!(escape_seatbelt_path(Path::new("/tmp/ok.toml")).is_ok());
+        assert!(escape_seatbelt_path(Path::new("/tmp/bad\"quote")).is_err());
     }
 }

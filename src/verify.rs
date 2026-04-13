@@ -8,6 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow};
+use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
 use serde_json::Value as JsonValue;
 use serde_yaml::{Mapping as YamlMapping, Value as YamlValue};
 
@@ -350,7 +351,7 @@ fn check_lane_key(check: &ProjectCheck) -> String {
 fn project_policy_check_count(analysis: &Analysis) -> usize {
     let mut count = 0;
     if analysis.repository.is_git_repository {
-        count += 2;
+        count += 3;
     }
     count += analysis.required_checks.len();
     if analysis.repository.has_workflows() {
@@ -369,6 +370,16 @@ fn first_project_policy_failure(root: &Path, analysis: &Analysis) -> Result<Opti
             subject: "README.md".to_string(),
             exit_code: None,
             summary: "git repositories must include a top-level README.md".to_string(),
+            duration: None,
+        }));
+    }
+
+    if analysis.repository.is_git_repository && !readme_has_license_section(root, analysis)? {
+        return Ok(Some(CheckFailure {
+            kind: "docs",
+            subject: "README.md#License".to_string(),
+            exit_code: None,
+            summary: "git repositories must end README.md with a `## License` section containing at least one word of paragraph content".to_string(),
             duration: None,
         }));
     }
@@ -469,6 +480,76 @@ fn first_project_policy_failure(root: &Path, analysis: &Analysis) -> Result<Opti
     }
 
     Ok(None)
+}
+
+fn readme_has_license_section(root: &Path, analysis: &Analysis) -> Result<bool> {
+    let Some(readme_path) = analysis.repository.readme_path.as_deref() else {
+        return Ok(false);
+    };
+    let readme_path = root.join(readme_path);
+    let contents = fs::read_to_string(&readme_path)
+        .with_context(|| format!("failed to read {}", readme_path.display()))?;
+    Ok(markdown_has_terminal_license_section(&contents))
+}
+
+fn markdown_has_terminal_license_section(contents: &str) -> bool {
+    let mut current_heading_level = None;
+    let mut current_heading_text = String::new();
+    let mut current_paragraph_text = String::new();
+    let mut active_level2_heading = None::<String>;
+    let mut last_level2_heading = None::<String>;
+    let mut license_paragraph_words = 0usize;
+
+    for event in Parser::new(contents) {
+        match event {
+            Event::Start(Tag::Heading { level, .. }) => {
+                current_heading_level = Some(level);
+                current_heading_text.clear();
+            }
+            Event::End(TagEnd::Heading(level)) => {
+                let heading_text = current_heading_text.trim().to_string();
+                if level == HeadingLevel::H2 {
+                    last_level2_heading = Some(heading_text.clone());
+                    active_level2_heading = Some(heading_text);
+                }
+                current_heading_level = None;
+                current_heading_text.clear();
+            }
+            Event::Start(Tag::Paragraph) => {
+                current_paragraph_text.clear();
+            }
+            Event::End(TagEnd::Paragraph) => {
+                if active_level2_heading.as_deref() == Some("License") {
+                    license_paragraph_words += count_words(&current_paragraph_text);
+                }
+                current_paragraph_text.clear();
+            }
+            Event::Text(text) | Event::Code(text) => {
+                if current_heading_level.is_some() {
+                    current_heading_text.push_str(text.as_ref());
+                } else {
+                    current_paragraph_text.push_str(text.as_ref());
+                }
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                if current_heading_level.is_some() {
+                    current_heading_text.push(' ');
+                } else {
+                    current_paragraph_text.push(' ');
+                }
+            }
+            _ => {}
+        }
+    }
+
+    last_level2_heading.as_deref() == Some("License") && license_paragraph_words > 0
+}
+
+fn count_words(contents: &str) -> usize {
+    contents
+        .split_whitespace()
+        .filter(|word| word.chars().any(|ch| ch.is_alphanumeric()))
+        .count()
 }
 
 fn ds_store_is_gitignored(root: &Path) -> Result<bool> {
@@ -1732,10 +1813,10 @@ mod tests {
         ProjectCheck, VerifyMode, build_stop_reason, check_preflight_note, command_in_devenv_shell,
         command_with_runtime_env, devenv_check_command, devenv_root_for_check_with_env,
         existing_devenv_root, first_project_policy_failure, humanize_devenv_trace_line,
-        humanize_live_output, is_matching_devenv_root, missing_workflow_commands,
-        normalize_summary, prepare_verify_environment, project_checks, service_process_names,
-        shell_quote, should_use_devenv, summarize_failure, tokens_are_subsequence,
-        verify_output_style_with_stderr_terminal, workflow_runs_command,
+        humanize_live_output, is_matching_devenv_root, markdown_has_terminal_license_section,
+        missing_workflow_commands, normalize_summary, prepare_verify_environment, project_checks,
+        service_process_names, shell_quote, should_use_devenv, summarize_failure,
+        tokens_are_subsequence, verify_output_style_with_stderr_terminal, workflow_runs_command,
     };
     use crate::analysis::{
         Analysis, GitHubRepository, GitHubVisibility, ProjectRequirement, RepositoryMetadata,
@@ -1771,6 +1852,7 @@ mod tests {
                 read_write_dirs: Vec::new(),
                 read_only_files: Vec::new(),
                 read_only_dirs: Vec::new(),
+                protected_write_files: Vec::new(),
                 notes: Vec::new(),
             },
         }
@@ -2098,6 +2180,26 @@ mod tests {
     }
 
     #[test]
+    fn requires_license_section_in_readme_for_git_repositories() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("README.md"), "# Demo\n\n## Usage\nTry it.\n").unwrap();
+
+        let mut analysis = analysis_with_checks();
+        analysis.repository = RepositoryMetadata {
+            is_git_repository: true,
+            readme_path: Some("README.md".to_string()),
+            ..RepositoryMetadata::default()
+        };
+
+        let failure = first_project_policy_failure(dir.path(), &analysis)
+            .unwrap()
+            .expect("expected readme license section failure");
+        assert_eq!(failure.kind, "docs");
+        assert_eq!(failure.subject, "README.md#License");
+        assert!(failure.summary.contains("## License"));
+    }
+
+    #[test]
     fn requires_ds_store_ignore_for_git_repositories() {
         let dir = tempfile::tempdir().unwrap();
         Command::new("git")
@@ -2106,7 +2208,7 @@ mod tests {
             .arg(dir.path())
             .status()
             .unwrap();
-        std::fs::write(dir.path().join("README.md"), "# Demo\n").unwrap();
+        std::fs::write(dir.path().join("README.md"), "# Demo\n\n## License\nMIT\n").unwrap();
 
         let mut analysis = analysis_with_checks();
         analysis.repository = RepositoryMetadata {
@@ -2121,6 +2223,30 @@ mod tests {
         assert_eq!(failure.kind, "ignore");
         assert_eq!(failure.subject, ".gitignore");
         assert!(failure.summary.contains(".DS_Store"));
+    }
+
+    #[test]
+    fn accepts_readme_with_license_section_as_last_section() {
+        assert!(markdown_has_terminal_license_section(
+            "# Demo\n\n## Usage\nTry it.\n\n## License\nMIT\n"
+        ));
+    }
+
+    #[test]
+    fn rejects_readme_when_license_section_is_not_last() {
+        assert!(!markdown_has_terminal_license_section(
+            "# Demo\n\n## License\nMIT\n\n## Usage\nTry it.\n"
+        ));
+    }
+
+    #[test]
+    fn rejects_readme_when_license_section_lacks_paragraph_words() {
+        assert!(!markdown_has_terminal_license_section(
+            "# Demo\n\n## License\n- \n"
+        ));
+        assert!(!markdown_has_terminal_license_section(
+            "# Demo\n\n## License\n\n```text\nMIT\n```\n"
+        ));
     }
 
     #[test]
@@ -2160,6 +2286,29 @@ mod tests {
         assert_eq!(failure.subject, "mix.exs");
         assert!(failure.summary.contains("Credo"));
         assert!(failure.summary.contains("mix credo --strict"));
+    }
+
+    #[test]
+    fn requires_replacing_default_starter_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut analysis = analysis_with_checks();
+        analysis.required_checks = vec![ProjectRequirement {
+            kind: RequirementKind::Starter,
+            subject: "lib/demo_web/controllers/page_html/home.html.heex".to_string(),
+            summary:
+                "Phoenix projects must replace the default getting started home page before using the generated stop hook."
+                    .to_string(),
+        }];
+
+        let failure = first_project_policy_failure(dir.path(), &analysis)
+            .unwrap()
+            .expect("expected starter page failure");
+        assert_eq!(failure.kind, "starter");
+        assert_eq!(
+            failure.subject,
+            "lib/demo_web/controllers/page_html/home.html.heex"
+        );
+        assert!(failure.summary.contains("default getting started home page"));
     }
 
     #[test]
@@ -2255,21 +2404,36 @@ jobs:
         assert_eq!(failure.subject, "README.md");
 
         analysis.repository.readme_path = Some("README.md".to_string());
+        std::fs::write(
+            dir.path().join("README.md"),
+            "# Demo\n\n## Usage\nTry it.\n",
+        )
+        .unwrap();
         let failure = first_project_policy_failure(dir.path(), &analysis)
             .unwrap()
             .expect("expected second failure");
+        assert_eq!(failure.subject, "README.md#License");
+
+        std::fs::write(
+            dir.path().join("README.md"),
+            "# Demo\n\n## License\nMIT\n",
+        )
+        .unwrap();
+        let failure = first_project_policy_failure(dir.path(), &analysis)
+            .unwrap()
+            .expect("expected third failure");
         assert_eq!(failure.subject, ".gitignore");
 
         std::fs::write(dir.path().join(".gitignore"), ".DS_Store\n").unwrap();
         let failure = first_project_policy_failure(dir.path(), &analysis)
             .unwrap()
-            .expect("expected third failure");
+            .expect("expected fourth failure");
         assert_eq!(failure.subject, "mix.exs");
 
         analysis.required_checks = Vec::new();
         let failure = first_project_policy_failure(dir.path(), &analysis)
             .unwrap()
-            .expect("expected fourth failure");
+            .expect("expected fifth failure");
         assert_eq!(failure.subject, "LICENSE");
     }
 

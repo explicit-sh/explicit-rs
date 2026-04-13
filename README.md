@@ -231,8 +231,11 @@ For example, if a project exposes `cargo fmt --check`, `cargo clippy`, `cargo bu
 `explicit verify` also enforces a few repository-level policies:
 
 - git repositories must include a top-level `README.md`
+- git repositories must end `README.md` with a `## License` section that has at least one word of paragraph content
 - git repositories must ignore `.DS_Store`
 - `mix.exs` projects must include Credo and pass `mix credo --strict`
+- Phoenix projects must replace the generated getting started home page before shipping it
+- Rails projects must replace the generated getting started page by defining a real root route
 - public GitHub repositories must include a `LICENSE` file
 - public GitHub repositories must include GitHub Actions workflows that run automatically and cover the detected lint, build, and test commands
 - existing GitHub Actions workflows are syntax-checked, using `actionlint` when it is available in the environment and a YAML/shape validator as fallback
@@ -299,10 +302,24 @@ The same `explicit.toml` file can also declare SSH deploy hosts:
 
 ```toml
 [deploy]
-hosts = ["prod.example.com", "ssh://git@deploy.example.com:2222/app"]
+hosts = ["deploy-alias", "prod.example.com", "ssh://git@deploy.example.com:2222/app"]
 ```
 
-When deploy hosts are configured, `explicit shell`, `explicit codex`, and `explicit claude` create a project-scoped `.nono/runtime/known_hosts` file from matching entries in your local `~/.ssh/known_hosts`. The sandboxed shell then forces `ssh`, `scp`, `sftp`, and Git-over-SSH to use that reduced host list with strict host key checking, instead of exposing your full personal host inventory inside the project shell.
+Plain SSH aliases from `~/.ssh/config` or `~/.ssh/known_hosts` are valid here too. When deploy hosts are configured, `explicit shell`, `explicit codex`, and `explicit claude` create a project-scoped `.nono/runtime/known_hosts` file from matching entries in your local `~/.ssh/known_hosts`, plus a project-scoped `.nono/runtime/ssh_config` file for opted-in aliases resolved through `ssh -G`. The sandboxed shell then forces `ssh`, `scp`, `sftp`, and Git-over-SSH to use those reduced project-scoped files with strict host key checking, instead of exposing your full personal host inventory or SSH config inside the project shell.
+
+You can also add explicit sandbox allowances when a project needs a specific host file or directory that the heuristics would not normally grant:
+
+```toml
+[sandbox]
+read_only_files = ["~/.config/sops/age/secure-enclave-key.txt"]
+read_only_dirs = []
+read_write_files = []
+read_write_dirs = ["tmp/runtime-cache"]
+```
+
+`read_only_files`, `read_only_dirs`, `read_write_files`, and `read_write_dirs` accept paths relative to the project root, absolute paths, `~/...`, `$HOME/...`, or `${HOME}/...`. Prefer `~/...` in the config when the path lives under your home directory. This is the right place to allow a single deployment key, token cache, or generated runtime directory without broadening access to the whole parent tree.
+
+When `explicit.toml` exists, the sandbox also protects it from writes on macOS so an LLM cannot silently expand its own allowlist while it is running.
 
 ## Generated Files
 
