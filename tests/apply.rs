@@ -307,9 +307,10 @@ edition = "2021"
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("Verification failed."));
     assert!(stderr.contains(" - docs: README.md#License"));
-    assert!(stderr.contains(
-        "git repositories must end README.md with a `## License` section"
-    ));
+    assert!(
+        stderr
+            .contains("git repositories must end README.md with exactly one `## License` section")
+    );
     assert!(!stderr.contains("cargo fmt --check"));
 }
 
@@ -474,9 +475,7 @@ end
     let output = run_verify(root);
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains(
-        " - starter: lib/demo_web/controllers/page_html/home.html.heex"
-    ));
+    assert!(stderr.contains(" - starter: lib/demo_web/controllers/page_html/home.html.heex"));
     assert!(stderr.contains("Phoenix projects must replace the default getting started home page"));
     assert!(!stderr.contains("mix format --check-formatted"));
 }

@@ -850,10 +850,26 @@ fn configured_sandbox_paths(root: &Path) -> Result<ConfiguredSandboxPaths> {
     };
 
     Ok(ConfiguredSandboxPaths {
-        read_only_files: resolve_configured_paths(root, &sandbox.read_only_files, "sandbox.read_only_files")?,
-        read_only_dirs: resolve_configured_paths(root, &sandbox.read_only_dirs, "sandbox.read_only_dirs")?,
-        read_write_files: resolve_configured_paths(root, &sandbox.read_write_files, "sandbox.read_write_files")?,
-        read_write_dirs: resolve_configured_paths(root, &sandbox.read_write_dirs, "sandbox.read_write_dirs")?,
+        read_only_files: resolve_configured_paths(
+            root,
+            &sandbox.read_only_files,
+            "sandbox.read_only_files",
+        )?,
+        read_only_dirs: resolve_configured_paths(
+            root,
+            &sandbox.read_only_dirs,
+            "sandbox.read_only_dirs",
+        )?,
+        read_write_files: resolve_configured_paths(
+            root,
+            &sandbox.read_write_files,
+            "sandbox.read_write_files",
+        )?,
+        read_write_dirs: resolve_configured_paths(
+            root,
+            &sandbox.read_write_dirs,
+            "sandbox.read_write_dirs",
+        )?,
     })
 }
 
@@ -873,7 +889,11 @@ fn resolve_configured_path(root: &Path, home: &Path, raw: &str, field: &str) -> 
 
     let expanded = expand_config_path_value(home, raw);
     let path = PathBuf::from(expanded);
-    Ok(if path.is_absolute() { path } else { root.join(path) })
+    Ok(if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    })
 }
 
 fn expand_config_path_value(home: &Path, raw: &str) -> String {
@@ -1636,7 +1656,8 @@ fn analyze_common_files(
                     .to_string(),
             });
         }
-        if let Some(requirement) = detect_phoenix_starter_page_requirement(root, &elixir_dependencies)?
+        if let Some(requirement) =
+            detect_phoenix_starter_page_requirement(root, &elixir_dependencies)?
         {
             builder.add_requirement(requirement);
         }
@@ -2733,7 +2754,8 @@ fn detect_phoenix_starter_page_requirement(
     let Some(router_path) = find_first_relative_file(root, &|relative, _| {
         let normalized = relative.to_string_lossy().replace('\\', "/");
         normalized.starts_with("lib/") && normalized.ends_with("/router.ex")
-    })? else {
+    })?
+    else {
         return Ok(None);
     };
     let router_contents = fs::read_to_string(root.join(&router_path))
@@ -2742,12 +2764,11 @@ fn detect_phoenix_starter_page_requirement(
         return Ok(None);
     };
 
-    let Some(template_path) =
-        find_first_relative_file(root, &|relative, _| {
-            let normalized = relative.to_string_lossy().replace('\\', "/");
-            normalized.starts_with("lib/")
-                && (normalized.contains("/page_html/") || normalized.contains("/templates/page/"))
-        })?
+    let Some(template_path) = find_first_relative_file(root, &|relative, _| {
+        let normalized = relative.to_string_lossy().replace('\\', "/");
+        normalized.starts_with("lib/")
+            && (normalized.contains("/page_html/") || normalized.contains("/templates/page/"))
+    })?
     else {
         return Ok(None);
     };
@@ -2806,8 +2827,7 @@ fn detect_rails_starter_page_requirement(
 }
 
 fn phoenix_default_home_action(router_contents: &str) -> Option<&'static str> {
-    let regex =
-        Regex::new(r#"get\s+["']/["']\s*,\s*PageController\s*,\s*:(home|index)\b"#).ok()?;
+    let regex = Regex::new(r#"get\s+["']/["']\s*,\s*PageController\s*,\s*:(home|index)\b"#).ok()?;
     for line in router_contents.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -2829,7 +2849,8 @@ fn phoenix_default_home_action(router_contents: &str) -> Option<&'static str> {
 fn looks_like_default_phoenix_home_page(contents: &str) -> bool {
     let normalized = contents.to_lowercase();
     (normalized.contains("peace of mind from prototype to production")
-        && normalized.contains("a productive framework that does not compromise speed or maintainability"))
+        && normalized
+            .contains("a productive framework that does not compromise speed or maintainability"))
         || (normalized.contains("welcome to phoenix!") && normalized.contains("phoenix framework"))
 }
 
@@ -3690,7 +3711,11 @@ members = ["tools/custom"]
     #[test]
     fn deploy_hosts_load_from_explicit_toml() {
         let dir = tempdir().unwrap();
-        fs::write(dir.path().join("mix.exs"), "defmodule Demo.MixProject do end\n").unwrap();
+        fs::write(
+            dir.path().join("mix.exs"),
+            "defmodule Demo.MixProject do end\n",
+        )
+        .unwrap();
         fs::write(
             dir.path().join(EXPLICIT_CONFIG_FILE),
             r#"[deploy]
@@ -3715,7 +3740,11 @@ hosts = ["prod.example.com", "ssh://git@deploy.example.com:2222/app"]
         let dir = tempdir().unwrap();
         let nested = dir.path().join("deps/child");
         fs::create_dir_all(&nested).unwrap();
-        fs::write(dir.path().join("mix.exs"), "defmodule Demo.MixProject do end\n").unwrap();
+        fs::write(
+            dir.path().join("mix.exs"),
+            "defmodule Demo.MixProject do end\n",
+        )
+        .unwrap();
         fs::write(nested.join("package.json"), r#"{"name":"child"}"#).unwrap();
         fs::write(
             dir.path().join(EXPLICIT_CONFIG_FILE),
@@ -3727,7 +3756,11 @@ hosts = ["prod.example.com"]
 
         let analysis = Analysis::analyze(dir.path()).unwrap();
         assert!(!analysis.markers.contains(&"workspace".to_string()));
-        assert!(analysis.deploy_hosts.contains(&"prod.example.com".to_string()));
+        assert!(
+            analysis
+                .deploy_hosts
+                .contains(&"prod.example.com".to_string())
+        );
     }
 
     #[test]
@@ -3851,7 +3884,8 @@ end
         )
         .unwrap();
         fs::write(
-            dir.path().join("lib/demo_web/controllers/page_html/home.html.heex"),
+            dir.path()
+                .join("lib/demo_web/controllers/page_html/home.html.heex"),
             r#"<section>
   <h1>Peace of mind from prototype to production</h1>
   <p>A productive framework that does not compromise speed or maintainability.</p>
@@ -3870,7 +3904,11 @@ end
             requirement.subject,
             "lib/demo_web/controllers/page_html/home.html.heex"
         );
-        assert!(requirement.summary.contains("Phoenix projects must replace"));
+        assert!(
+            requirement
+                .summary
+                .contains("Phoenix projects must replace")
+        );
         assert!(analysis.markers.contains(&"phoenix".to_string()));
     }
 
@@ -3911,7 +3949,8 @@ end
         )
         .unwrap();
         fs::write(
-            dir.path().join("lib/demo_web/controllers/page_html/home.html.heex"),
+            dir.path()
+                .join("lib/demo_web/controllers/page_html/home.html.heex"),
             "<h1>Custom storefront</h1>\n",
         )
         .unwrap();

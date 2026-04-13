@@ -379,7 +379,7 @@ fn first_project_policy_failure(root: &Path, analysis: &Analysis) -> Result<Opti
             kind: "docs",
             subject: "README.md#License".to_string(),
             exit_code: None,
-            summary: "git repositories must end README.md with a `## License` section containing at least one word of paragraph content".to_string(),
+            summary: "git repositories must end README.md with exactly one `## License` section containing at least one word of paragraph content".to_string(),
             duration: None,
         }));
     }
@@ -498,6 +498,7 @@ fn markdown_has_terminal_license_section(contents: &str) -> bool {
     let mut current_paragraph_text = String::new();
     let mut active_level2_heading = None::<String>;
     let mut last_level2_heading = None::<String>;
+    let mut license_heading_count = 0usize;
     let mut license_paragraph_words = 0usize;
 
     for event in Parser::new(contents) {
@@ -509,6 +510,9 @@ fn markdown_has_terminal_license_section(contents: &str) -> bool {
             Event::End(TagEnd::Heading(level)) => {
                 let heading_text = current_heading_text.trim().to_string();
                 if level == HeadingLevel::H2 {
+                    if heading_text == "License" {
+                        license_heading_count += 1;
+                    }
                     last_level2_heading = Some(heading_text.clone());
                     active_level2_heading = Some(heading_text);
                 }
@@ -542,7 +546,9 @@ fn markdown_has_terminal_license_section(contents: &str) -> bool {
         }
     }
 
-    last_level2_heading.as_deref() == Some("License") && license_paragraph_words > 0
+    license_heading_count == 1
+        && last_level2_heading.as_deref() == Some("License")
+        && license_paragraph_words > 0
 }
 
 fn count_words(contents: &str) -> usize {
@@ -2182,7 +2188,11 @@ mod tests {
     #[test]
     fn requires_license_section_in_readme_for_git_repositories() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("README.md"), "# Demo\n\n## Usage\nTry it.\n").unwrap();
+        std::fs::write(
+            dir.path().join("README.md"),
+            "# Demo\n\n## Usage\nTry it.\n",
+        )
+        .unwrap();
 
         let mut analysis = analysis_with_checks();
         analysis.repository = RepositoryMetadata {
@@ -2250,6 +2260,13 @@ mod tests {
     }
 
     #[test]
+    fn rejects_readme_when_license_section_is_duplicated() {
+        assert!(!markdown_has_terminal_license_section(
+            "# Demo\n\n## License\nMIT\n\n## Usage\nTry it.\n\n## License\nApache-2.0\n"
+        ));
+    }
+
+    #[test]
     fn requires_license_for_public_github_repositories() {
         let dir = tempfile::tempdir().unwrap();
         let mut analysis = analysis_with_checks();
@@ -2308,7 +2325,11 @@ mod tests {
             failure.subject,
             "lib/demo_web/controllers/page_html/home.html.heex"
         );
-        assert!(failure.summary.contains("default getting started home page"));
+        assert!(
+            failure
+                .summary
+                .contains("default getting started home page")
+        );
     }
 
     #[test]
@@ -2414,11 +2435,7 @@ jobs:
             .expect("expected second failure");
         assert_eq!(failure.subject, "README.md#License");
 
-        std::fs::write(
-            dir.path().join("README.md"),
-            "# Demo\n\n## License\nMIT\n",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("README.md"), "# Demo\n\n## License\nMIT\n").unwrap();
         let failure = first_project_policy_failure(dir.path(), &analysis)
             .unwrap()
             .expect("expected third failure");

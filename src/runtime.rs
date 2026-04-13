@@ -236,7 +236,8 @@ pub fn launch_shell(
             .push("network access blocked for this shell invocation".to_string());
     }
 
-    if let Some(setup) = prepare_deploy_ssh(root, analysis, &runtime_dir, &mut env_map, &mut plan)? {
+    if let Some(setup) = prepare_deploy_ssh(root, analysis, &runtime_dir, &mut env_map, &mut plan)?
+    {
         print_deploy_ssh_summary(&setup);
     }
 
@@ -324,7 +325,11 @@ fn prepare_deploy_ssh(
     fs::create_dir_all(&wrapper_dir)
         .with_context(|| format!("failed to create {}", wrapper_dir.display()))?;
 
-    let mut setup = write_project_known_hosts(&known_hosts_source, &known_hosts_path, &analysis.deploy_hosts)?;
+    let mut setup = write_project_known_hosts(
+        &known_hosts_source,
+        &known_hosts_path,
+        &analysis.deploy_hosts,
+    )?;
     setup.configured_aliases = write_project_ssh_config(&ssh_config_path, &analysis.deploy_hosts)?;
     write_ssh_wrapper_scripts(&wrapper_dir)?;
 
@@ -445,8 +450,8 @@ fn matching_known_host_entries(source: &Path, host: &str) -> Result<BTreeSet<Str
         return Ok(BTreeSet::new());
     }
 
-    let ssh_keygen = preferred_command_path("ssh-keygen")
-        .unwrap_or_else(|| PathBuf::from("ssh-keygen"));
+    let ssh_keygen =
+        preferred_command_path("ssh-keygen").unwrap_or_else(|| PathBuf::from("ssh-keygen"));
     let mut entries = BTreeSet::new();
     let mut queries = BTreeSet::new();
     queries.extend(deploy_host_lookup_queries(host));
@@ -1702,15 +1707,22 @@ Error:   × Could not bind localhost:5432
     fn only_plain_hosts_use_ssh_config_resolution() {
         assert!(is_plain_ssh_host_alias("deploy-alias"));
         assert!(is_plain_ssh_host_alias("deploy.example.com"));
-        assert!(!is_plain_ssh_host_alias("ssh://git@deploy.example.com:2222/app"));
-        assert!(!is_plain_ssh_host_alias("git@github.com:openai/example.git"));
+        assert!(!is_plain_ssh_host_alias(
+            "ssh://git@deploy.example.com:2222/app"
+        ));
+        assert!(!is_plain_ssh_host_alias(
+            "git@github.com:openai/example.git"
+        ));
         assert!(!is_plain_ssh_host_alias("[deploy.example.com]:2222"));
     }
 
     #[test]
     fn prepend_path_puts_wrapper_dir_first() {
         let mut env_map = BTreeMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
-        prepend_path(&mut env_map, Path::new("/tmp/project/.nono/runtime/ssh-bin"));
+        prepend_path(
+            &mut env_map,
+            Path::new("/tmp/project/.nono/runtime/ssh-bin"),
+        );
         assert_eq!(
             env_map.get("PATH").map(String::as_str),
             Some("/tmp/project/.nono/runtime/ssh-bin:/usr/bin:/bin")
@@ -1777,8 +1789,7 @@ Error:   × Could not bind localhost:5432
         )
         .unwrap();
 
-        let setup = write_project_known_hosts(&source, &destination, &[alias.to_string()])
-            .unwrap();
+        let setup = write_project_known_hosts(&source, &destination, &[alias.to_string()]).unwrap();
         assert_eq!(setup.matched_hosts, vec![alias.to_string()]);
         assert!(setup.missing_hosts.is_empty());
         assert_eq!(

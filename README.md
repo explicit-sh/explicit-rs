@@ -231,7 +231,7 @@ For example, if a project exposes `cargo fmt --check`, `cargo clippy`, `cargo bu
 `explicit verify` also enforces a few repository-level policies:
 
 - git repositories must include a top-level `README.md`
-- git repositories must end `README.md` with a `## License` section that has at least one word of paragraph content
+- git repositories must end `README.md` with exactly one `## License` section that has at least one word of paragraph content
 - git repositories must ignore `.DS_Store`
 - `mix.exs` projects must include Credo and pass `mix credo --strict`
 - Phoenix projects must replace the generated getting started home page before shipping it
@@ -409,3 +409,7 @@ The current implementation is aimed at being a strong baseline:
 - it launches agents inside a narrower sandbox than the host machine
 
 It does not yet try to fully infer every project-specific service, package, or permission edge case.
+
+## License
+
+See [LICENSE](/Users/onnimonni/Projects/devenv-nono-llm/LICENSE) for the full license text.
