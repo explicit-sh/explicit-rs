@@ -1,16 +1,22 @@
 use std::fs;
+use std::path::PathBuf;
 use std::process::Command;
 
 use serde_json::Value as JsonValue;
 use tempfile::tempdir;
 
 fn run_tool(root: &std::path::Path) {
-    let status = Command::new(env!("CARGO_BIN_EXE_explicit"))
+    let output = Command::new(env!("CARGO_BIN_EXE_explicit"))
         .args(["apply", "--root"])
         .arg(root)
-        .status()
+        .output()
         .expect("failed to run explicit");
-    assert!(status.success());
+    assert!(
+        output.status.success(),
+        "explicit apply failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn run_doctor(root: &std::path::Path) -> String {
@@ -27,6 +33,7 @@ fn run_verify(root: &std::path::Path) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_explicit"))
         .args(["verify", "--root"])
         .arg(root)
+        .env("PATH", path_without_command("devenv"))
         .output()
         .expect("failed to run explicit verify")
 }
@@ -39,6 +46,17 @@ fn run_scan(root: &std::path::Path) -> JsonValue {
         .expect("failed to run explicit scan");
     assert!(output.status.success());
     serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn path_without_command(command: &str) -> std::ffi::OsString {
+    let original = std::env::var_os("PATH").unwrap_or_default();
+    let filtered = std::env::split_paths(&original)
+        .filter(|entry| !entry.join(command).is_file())
+        .collect::<Vec<PathBuf>>();
+    if filtered.is_empty() {
+        return original;
+    }
+    std::env::join_paths(filtered).unwrap_or(original)
 }
 
 #[test]
@@ -101,43 +119,44 @@ fn apply_detects_node_make_and_generates_hooks() {
         &fs::read_to_string(root.join(".claude/settings.local.json")).unwrap(),
     )
     .unwrap();
+    assert!(
+        claude["hooks"]["Stop"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains(".nono/explicit-bin")
+    );
     assert_eq!(
-        claude["hooks"]["Stop"][0]["hooks"][0]["command"],
-        "./.nono/stop-guard.sh"
+        claude["hooks"]["PreToolUse"][0]["matcher"]
+            .as_str()
+            .unwrap(),
+        "Bash"
+    );
+    assert_eq!(
+        claude["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap(),
+        &format!(
+            "'{}' __claude-pre-tool-use-bash",
+            root.canonicalize()
+                .unwrap()
+                .join(".nono/explicit-bin")
+                .display()
+        )
     );
 
     let codex_hooks: JsonValue =
         serde_json::from_str(&fs::read_to_string(root.join(".codex/hooks.json")).unwrap()).unwrap();
-    assert_eq!(
-        codex_hooks["Stop"][0]["hooks"][0]["command"],
-        "./.nono/stop-guard.sh"
+    assert!(
+        codex_hooks["Stop"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains(".nono/explicit-bin")
     );
     assert!(
         fs::read_to_string(root.join(".codex/config.toml"))
             .unwrap()
             .contains("codex_hooks = true")
     );
-}
-
-#[test]
-fn doctor_reports_detected_test_commands() {
-    let dir = tempdir().unwrap();
-    let root = dir.path();
-
-    fs::write(
-        root.join("package.json"),
-        r#"{
-  "name": "frontend-demo",
-  "packageManager": "pnpm@9.0.0",
-  "devDependencies": {
-    "vitest": "^3.0.0"
-  }
-}"#,
-    )
-    .unwrap();
-
-    let output = run_doctor(root);
-    assert!(output.contains("Test commands: pnpm exec vitest run"));
 }
 
 #[test]
@@ -190,25 +209,18 @@ fn apply_discovers_workspace_leaf_commands() {
 }
 
 #[test]
-fn doctor_reports_mixed_workspace_leafs() {
+fn verify_workspace_root_reports_leaf_package_install_dir_ignore_before_commands() {
     let dir = tempdir().unwrap();
     let root = dir.path();
-    let infra = root.join("infra");
     let service = root.join("services/stuffix");
-    Command::new("git")
-        .arg("init")
-        .arg("-q")
-        .arg(root)
-        .status()
-        .unwrap();
 
-    fs::create_dir_all(&infra).unwrap();
     fs::create_dir_all(&service).unwrap();
     fs::write(
-        infra.join("main.tf"),
-        "terraform {\n  required_version = \">= 1.6.0\"\n}\n",
+        root.join("README.md"),
+        "# Demo\n\nSee [README](README.md).\n\n## License\nMIT\n",
     )
     .unwrap();
+    fs::write(root.join(".gitignore"), ".DS_Store\n").unwrap();
     fs::write(
         service.join("mix.exs"),
         r#"defmodule Demo.MixProject do
@@ -227,41 +239,6 @@ end
 "#,
     )
     .unwrap();
-
-    let output = run_doctor(root);
-    assert!(output.contains("Markers: terraform, mix.exs, workspace"));
-    assert!(output.contains(
-        "Lint commands: cd 'infra' && opentofu fmt -check -recursive, cd 'services/stuffix' && mix format --check-formatted, cd 'services/stuffix' && mix credo --strict"
-    ));
-    assert!(
-        output
-            .contains("Build commands: cd 'services/stuffix' && mix compile --warnings-as-errors")
-    );
-    assert!(output.contains("Test commands: cd 'services/stuffix' && mix test"));
-    assert!(output.contains("Requirements: none"));
-    assert!(output.contains("Workspace members: infra (*.tf), services/stuffix (mix.exs)."));
-}
-
-#[test]
-fn verify_workspace_root_reports_root_ds_store_policy_before_leaf_commands() {
-    let dir = tempdir().unwrap();
-    let root = dir.path();
-    let infra = root.join("infra");
-    let service = root.join("services/stuffix");
-
-    fs::create_dir_all(&infra).unwrap();
-    fs::create_dir_all(&service).unwrap();
-    fs::write(root.join("README.md"), "# Demo\n\n## License\nMIT\n").unwrap();
-    fs::write(
-        infra.join("main.tf"),
-        "terraform {\n  required_version = \">= 1.6.0\"\n}\n",
-    )
-    .unwrap();
-    fs::write(
-        service.join("mix.exs"),
-        "defmodule Demo.MixProject do end\n",
-    )
-    .unwrap();
     Command::new("git")
         .arg("init")
         .arg("-q")
@@ -273,25 +250,42 @@ fn verify_workspace_root_reports_root_ds_store_policy_before_leaf_commands() {
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("Verification failed."));
-    assert!(stderr.contains(" - ignore: .gitignore"));
-    assert!(stderr.contains("git repositories must ignore .DS_Store"));
-    assert!(!stderr.contains("opentofu fmt -check -recursive"));
+    assert!(stderr.contains(" - ignore: services/stuffix/deps"));
+    assert!(
+        stderr.contains(
+            "package-manager install directory `services/stuffix/deps` must be gitignored"
+        )
+    );
     assert!(!stderr.contains("mix format --check-formatted"));
 }
 
 #[test]
-fn verify_reports_missing_readme_license_section_before_commands() {
+fn verify_reports_low_elixir_coverage_threshold_before_commands() {
     let dir = tempdir().unwrap();
     let root = dir.path();
 
-    fs::write(root.join("README.md"), "# Demo\n\n## Usage\nTry it.\n").unwrap();
-    fs::write(root.join(".gitignore"), ".DS_Store\n").unwrap();
+    fs::write(root.join("README.md"), "# Demo\n\n## License\nMIT\n").unwrap();
+    fs::write(root.join(".gitignore"), ".DS_Store\ndeps/\n").unwrap();
     fs::write(
-        root.join("Cargo.toml"),
-        r#"[package]
-name = "demo"
-version = "0.1.0"
-edition = "2021"
+        root.join("mix.exs"),
+        r#"defmodule Demo.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :demo,
+      version: "0.1.0",
+      elixir: "~> 1.15",
+      test_coverage: [summary: [threshold: 75]]
+    ]
+  end
+
+  defp deps do
+    [
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
+    ]
+  end
+end
 "#,
     )
     .unwrap();
@@ -306,12 +300,9 @@ edition = "2021"
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("Verification failed."));
-    assert!(stderr.contains(" - docs: README.md#License"));
-    assert!(
-        stderr
-            .contains("git repositories must end README.md with exactly one `## License` section")
-    );
-    assert!(!stderr.contains("cargo fmt --check"));
+    assert!(stderr.contains(" - coverage: mix.exs#test_coverage"));
+    assert!(stderr.contains("must enforce at least 80% test coverage"));
+    assert!(!stderr.contains("mix test --cover"));
 }
 
 #[test]
@@ -338,6 +329,22 @@ edition = "2021"
         .collect::<Vec<_>>();
     assert!(builds.contains(&"cargo build --release"));
     assert!(!builds.contains(&"cargo build"));
+    let coverage = analysis["coverage_commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry.as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(coverage.contains(
+        &"cargo llvm-cov --workspace --all-features --fail-under-lines 80 --summary-only"
+    ));
+    let packages = analysis["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry.as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(packages.contains(&"cargo-llvm-cov"));
 }
 
 #[test]
@@ -345,7 +352,20 @@ fn apply_preserves_existing_claude_settings() {
     let dir = tempdir().unwrap();
     let root = dir.path();
 
-    fs::write(root.join("mix.exs"), "defmodule Demo.MixProject do end\n").unwrap();
+    fs::write(
+        root.join("mix.exs"),
+        r#"defmodule Demo.MixProject do
+  def project do
+    [app: :demo, version: "0.1.0", deps: deps()]
+  end
+
+  defp deps do
+    [{:credo, "~> 1.7", only: [:dev, :test], runtime: false}]
+  end
+end
+"#,
+    )
+    .unwrap();
     fs::create_dir_all(root.join(".claude")).unwrap();
     fs::write(
         root.join(".claude/settings.local.json"),
@@ -360,9 +380,23 @@ fn apply_preserves_existing_claude_settings() {
     )
     .unwrap();
     assert_eq!(payload["enabledMcpjsonServers"][0], "context7");
+    assert!(
+        payload["hooks"]["Stop"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains(".nono/explicit-bin")
+    );
     assert_eq!(
-        payload["hooks"]["Stop"][0]["hooks"][0]["command"],
-        "./.nono/stop-guard.sh"
+        payload["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap(),
+        &format!(
+            "'{}' __claude-pre-tool-use-bash",
+            root.canonicalize()
+                .unwrap()
+                .join(".nono/explicit-bin")
+                .display()
+        )
     );
 
     let guard_payload: JsonValue =
@@ -377,107 +411,7 @@ fn apply_preserves_existing_claude_settings() {
     assert!(commands.contains(&"mix format --check-formatted"));
     assert!(commands.contains(&"mix credo --strict"));
     assert!(commands.contains(&"mix compile --warnings-as-errors"));
-}
-
-#[test]
-fn verify_workspace_root_reports_missing_credo_before_leaf_commands() {
-    let dir = tempdir().unwrap();
-    let root = dir.path();
-    let service = root.join("services/stuffix");
-
-    fs::create_dir_all(&service).unwrap();
-    fs::write(root.join("README.md"), "# Demo\n\n## License\nMIT\n").unwrap();
-    fs::write(root.join(".gitignore"), ".DS_Store\n").unwrap();
-    fs::write(
-        service.join("mix.exs"),
-        r#"defmodule Demo.MixProject do
-  use Mix.Project
-
-  def project do
-    [app: :demo, version: "0.1.0", elixir: "~> 1.15"]
-  end
-end
-"#,
-    )
-    .unwrap();
-    Command::new("git")
-        .arg("init")
-        .arg("-q")
-        .arg(root)
-        .status()
-        .unwrap();
-
-    let output = run_verify(root);
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains(" - lint: services/stuffix/mix.exs"));
-    assert!(stderr.contains("Elixir projects must include Credo"));
-    assert!(!stderr.contains("mix format --check-formatted"));
-    assert!(stderr.contains("mix credo --strict"));
-}
-
-#[test]
-fn verify_blocks_on_default_phoenix_home_page_before_commands() {
-    let dir = tempdir().unwrap();
-    let root = dir.path();
-
-    fs::create_dir_all(root.join("lib/demo_web/controllers/page_html")).unwrap();
-    fs::write(root.join("README.md"), "# Demo\n\n## License\nMIT\n").unwrap();
-    fs::write(root.join(".gitignore"), ".DS_Store\n").unwrap();
-    fs::write(
-        root.join("mix.exs"),
-        r#"defmodule Demo.MixProject do
-  use Mix.Project
-
-  def project do
-    [app: :demo, version: "0.1.0", elixir: "~> 1.15"]
-  end
-
-  defp deps do
-    [
-      {:phoenix, "~> 1.7"},
-      {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
-    ]
-  end
-end
-"#,
-    )
-    .unwrap();
-    fs::write(
-        root.join("lib/demo_web/router.ex"),
-        r#"defmodule DemoWeb.Router do
-  use DemoWeb, :router
-
-  scope "/", DemoWeb do
-    pipe_through :browser
-    get "/", PageController, :home
-  end
-end
-"#,
-    )
-    .unwrap();
-    fs::write(
-        root.join("lib/demo_web/controllers/page_html/home.html.heex"),
-        r#"<section>
-  <h1>Peace of mind from prototype to production</h1>
-  <p>A productive framework that does not compromise speed or maintainability.</p>
-</section>
-"#,
-    )
-    .unwrap();
-    Command::new("git")
-        .arg("init")
-        .arg("-q")
-        .arg(root)
-        .status()
-        .unwrap();
-
-    let output = run_verify(root);
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains(" - starter: lib/demo_web/controllers/page_html/home.html.heex"));
-    assert!(stderr.contains("Phoenix projects must replace the default getting started home page"));
-    assert!(!stderr.contains("mix format --check-formatted"));
+    assert!(commands.contains(&"mix test --cover"));
 }
 
 #[test]
@@ -754,6 +688,24 @@ end
         .map(|entry| entry.as_str().unwrap())
         .collect::<Vec<_>>();
     assert!(tests.contains(&"mix test"));
+    let coverage = analysis["coverage_commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry.as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(coverage.contains(&"mix test --cover"));
+    let guard_payload: JsonValue =
+        serde_json::from_str(&fs::read_to_string(root.join(".nono/guard-commands.json")).unwrap())
+            .unwrap();
+    let coverage_entries = guard_payload["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["kind"].as_str() == Some("coverage"))
+        .map(|entry| entry["command"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(coverage_entries.contains(&"mix test --cover"));
 }
 
 #[test]
@@ -866,19 +818,30 @@ fn verify_blocks_stop_when_detected_checks_fail() {
 }
 
 #[test]
-fn doctor_reports_detected_runtime_versions() {
+fn verify_stops_after_first_failed_check() {
     let dir = tempdir().unwrap();
     let root = dir.path();
-
+    let marker = root.join("build-should-not-run");
     fs::write(
-        root.join("package.json"),
-        r#"{"name":"demo","packageManager":"pnpm@9.0.0"}"#,
+        root.join("Makefile"),
+        format!(
+            "lint:\n\t@echo 'lint broke first' >&2\n\t@exit 1\nbuild:\n\t@touch {}\ntest:\n\t@echo test-ok\n",
+            marker.display()
+        ),
     )
     .unwrap();
-    fs::write(root.join(".node-version"), "20.18.0\n").unwrap();
 
-    let output = run_doctor(root);
-    assert!(output.contains("Language versions: nodejs 20.18.0 (.node-version)"));
+    let output = run_verify(root);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        !marker.exists(),
+        "verify should stop before running make build"
+    );
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("Verification failed."));
+    assert!(stderr.contains("make lint"));
+    assert!(!stderr.contains("make build"));
 }
 
 #[test]

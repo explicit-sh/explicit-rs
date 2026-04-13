@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitCode, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -12,7 +12,7 @@ use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
 use serde_json::Value as JsonValue;
 use serde_yaml::{Mapping as YamlMapping, Value as YamlValue};
 
-use crate::analysis::{Analysis, ServiceRequirement};
+use crate::analysis::{Analysis, MigrationCheck, MigrationCheckKind, ServiceRequirement};
 use crate::host_tools::preferred_command_path;
 use crate::runtime::{devenv_already_running_pid, stale_devenv_cache_detected};
 
@@ -145,8 +145,9 @@ pub fn run_project_checks(
     let hook_client = detect_stop_hook_client(mode);
     let output_style = verify_output_style(mode);
     let checks = project_checks(analysis);
-    let total_checks = checks.len() + project_policy_check_count(analysis);
-    let displayed_checks = displayed_check_count(checks.len(), total_checks);
+    let command_checks = analysis.migration_checks.len() + checks.len();
+    let total_checks = command_checks + project_policy_check_count(analysis);
+    let displayed_checks = displayed_check_count(command_checks, total_checks);
 
     if total_checks == 0 {
         if output_style == VerifyOutputStyle::Interactive {
@@ -178,10 +179,29 @@ pub fn run_project_checks(
         }
     }
 
+    if let Some(failure) = run_migration_checks(
+        root,
+        analysis,
+        mode,
+        output_style,
+        analysis.migration_checks.len(),
+        checks.len(),
+    )? {
+        return report_single_failure(root, mode, hook_client, failure);
+    }
+
     let executions = execute_checks(root, analysis, &checks, output_style)?;
     for execution in executions {
         let check = execution.check;
-        let output = execution.output;
+        let output = maybe_apply_safe_lint_autofix(
+            root,
+            analysis,
+            mode,
+            &check,
+            execution.output,
+            output_style,
+            checks.len(),
+        )?;
         if output.output.status.success() {
             if output_style == VerifyOutputStyle::Interactive {
                 eprintln!(
@@ -212,6 +232,83 @@ pub fn run_project_checks(
     Ok(ExitCode::SUCCESS)
 }
 
+fn maybe_apply_safe_lint_autofix(
+    root: &Path,
+    analysis: &Analysis,
+    mode: VerifyMode,
+    check: &ProjectCheck,
+    output: CheckOutput,
+    output_style: VerifyOutputStyle,
+    total_checks: usize,
+) -> Result<CheckOutput> {
+    if output.output.status.success() || !should_attempt_safe_autofix(mode, check) {
+        return Ok(output);
+    }
+
+    let Some(autofix_command) = safe_lint_autofix_command(&check.command) else {
+        return Ok(output);
+    };
+
+    let autofix_progress =
+        (output_style == VerifyOutputStyle::Interactive).then(|| CommandProgress {
+            note_message: None,
+            live_prefix: format!(
+                "fix  [{}/{}] {:<5}",
+                check.ordinal + 1,
+                total_checks,
+                check.kind
+            ),
+            progress_probe: None,
+            start_message: format!(
+                "fix  [{}/{}] {:<5} {}...",
+                check.ordinal + 1,
+                total_checks,
+                check.kind,
+                autofix_command
+            ),
+            wait_prefix: format!(
+                "fix  [{}/{}] {:<5} {}",
+                check.ordinal + 1,
+                total_checks,
+                check.kind,
+                autofix_command
+            ),
+        });
+    let autofix_output = run_check(root, analysis, &autofix_command, autofix_progress.as_ref())?;
+    if !autofix_output.output.status.success() {
+        return Ok(output);
+    }
+
+    let rerun_progress = check_progress(check, root, total_checks, output_style);
+    let rerun_output = run_check(root, analysis, &check.command, rerun_progress.as_ref())?;
+    if output_style == VerifyOutputStyle::Interactive && rerun_output.output.status.success() {
+        eprintln!(
+            "fix  [{}/{}] {:<5} safe formatter correction passed",
+            check.ordinal + 1,
+            total_checks,
+            check.kind
+        );
+    }
+    Ok(rerun_output)
+}
+
+fn should_attempt_safe_autofix(mode: VerifyMode, check: &ProjectCheck) -> bool {
+    mode != VerifyMode::GitHook && check.kind == "lint"
+}
+
+fn safe_lint_autofix_command(command: &str) -> Option<String> {
+    safe_command_rewrite(command, "mix format --check-formatted", "mix format")
+        .or_else(|| safe_command_rewrite(command, "cargo fmt --check", "cargo fmt"))
+        .or_else(|| safe_command_rewrite(command, "tofu fmt -check", "tofu fmt"))
+        .or_else(|| safe_command_rewrite(command, "terraform fmt -check", "terraform fmt"))
+}
+
+fn safe_command_rewrite(command: &str, needle: &str, replacement: &str) -> Option<String> {
+    command
+        .contains(needle)
+        .then(|| command.replacen(needle, replacement, 1))
+}
+
 fn print_workspace_notes(analysis: &Analysis) {
     for note in analysis.notes.iter().filter(|note| {
         note.starts_with("Workspace: ")
@@ -240,28 +337,161 @@ fn report_single_failure(
 
 fn project_checks(analysis: &Analysis) -> Vec<ProjectCheck> {
     let mut checks = Vec::new();
+    let base_ordinal = analysis.migration_checks.len();
     for command in &analysis.lint_commands {
         checks.push(ProjectCheck {
-            ordinal: checks.len(),
+            ordinal: base_ordinal + checks.len(),
             kind: "lint",
             command: command.clone(),
         });
     }
     for command in &analysis.build_commands {
         checks.push(ProjectCheck {
-            ordinal: checks.len(),
+            ordinal: base_ordinal + checks.len(),
             kind: "build",
             command: command.clone(),
         });
     }
     for command in &analysis.test_commands {
         checks.push(ProjectCheck {
-            ordinal: checks.len(),
+            ordinal: base_ordinal + checks.len(),
             kind: "test",
             command: command.clone(),
         });
     }
+    for command in &analysis.coverage_commands {
+        checks.push(ProjectCheck {
+            ordinal: base_ordinal + checks.len(),
+            kind: "coverage",
+            command: command.clone(),
+        });
+    }
     checks
+}
+
+fn run_migration_checks(
+    root: &Path,
+    analysis: &Analysis,
+    mode: VerifyMode,
+    output_style: VerifyOutputStyle,
+    migration_checks: usize,
+    normal_checks: usize,
+) -> Result<Option<CheckFailure>> {
+    if analysis.migration_checks.is_empty() {
+        return Ok(None);
+    }
+
+    let total_checks = migration_checks + normal_checks;
+    for (index, check) in analysis.migration_checks.iter().enumerate() {
+        let progress =
+            migration_check_progress(index, total_checks, &check.status_command, output_style);
+        let output = run_check(root, analysis, &check.status_command, progress.as_ref())?;
+        if !output.output.status.success() {
+            return Ok(Some(CheckFailure {
+                kind: "migration",
+                subject: check.subject.clone(),
+                exit_code: output.output.status.code(),
+                summary: summarize_failure("migration", &check.status_command, &output.output),
+                duration: Some(output.duration),
+            }));
+        }
+
+        let pending = pending_migration_entries(check, &output.output);
+        if pending.is_empty() {
+            if output_style == VerifyOutputStyle::Interactive {
+                eprintln!(
+                    "ok   {:<9} {} ({})",
+                    "migration",
+                    check.status_command,
+                    format_duration(output.duration)
+                );
+            }
+            continue;
+        }
+
+        if mode == VerifyMode::StopHook {
+            let apply_progress =
+                migration_apply_progress(index, total_checks, &check.apply_command, output_style);
+            let apply_output = run_check(
+                root,
+                analysis,
+                &check.apply_command,
+                apply_progress.as_ref(),
+            )?;
+            if !apply_output.output.status.success() {
+                return Ok(Some(CheckFailure {
+                    kind: "migration",
+                    subject: check.apply_command.clone(),
+                    exit_code: apply_output.output.status.code(),
+                    summary: summarize_failure(
+                        "migration",
+                        &check.apply_command,
+                        &apply_output.output,
+                    ),
+                    duration: Some(apply_output.duration),
+                }));
+            }
+
+            let rerun_progress =
+                migration_check_progress(index, total_checks, &check.status_command, output_style);
+            let rerun_output = run_check(
+                root,
+                analysis,
+                &check.status_command,
+                rerun_progress.as_ref(),
+            )?;
+            if !rerun_output.output.status.success() {
+                return Ok(Some(CheckFailure {
+                    kind: "migration",
+                    subject: check.subject.clone(),
+                    exit_code: rerun_output.output.status.code(),
+                    summary: summarize_failure(
+                        "migration",
+                        &check.status_command,
+                        &rerun_output.output,
+                    ),
+                    duration: Some(rerun_output.duration),
+                }));
+            }
+            let still_pending = pending_migration_entries(check, &rerun_output.output);
+            if !still_pending.is_empty() {
+                return Ok(Some(CheckFailure {
+                    kind: "migration",
+                    subject: check.subject.clone(),
+                    exit_code: None,
+                    summary: format!(
+                        "pending migrations remain after `{}`: {}",
+                        check.apply_command,
+                        format_pending_migration_entries(&still_pending)
+                    ),
+                    duration: Some(rerun_output.duration),
+                }));
+            }
+            if output_style == VerifyOutputStyle::Interactive {
+                eprintln!(
+                    "fix  [{}/{}] migration applied pending migrations with `{}`",
+                    index + 1,
+                    total_checks,
+                    check.apply_command
+                );
+            }
+            continue;
+        }
+
+        return Ok(Some(CheckFailure {
+            kind: "migration",
+            subject: check.subject.clone(),
+            exit_code: None,
+            summary: format!(
+                "pending migrations detected: {}. Run `{}`.",
+                format_pending_migration_entries(&pending),
+                check.apply_command
+            ),
+            duration: Some(output.duration),
+        }));
+    }
+
+    Ok(None)
 }
 
 fn execute_checks(
@@ -270,43 +500,68 @@ fn execute_checks(
     checks: &[ProjectCheck],
     output_style: VerifyOutputStyle,
 ) -> Result<Vec<CheckExecution>> {
+    let mut executions = Vec::new();
+    let mut phase_start = 0;
+    while phase_start < checks.len() {
+        let phase_kind = checks[phase_start].kind;
+        let phase_end = checks[phase_start..]
+            .iter()
+            .position(|check| check.kind != phase_kind)
+            .map(|offset| phase_start + offset)
+            .unwrap_or(checks.len());
+        let phase_checks = &checks[phase_start..phase_end];
+        let mut phase_executions =
+            execute_phase_checks(root, analysis, phase_checks, checks.len(), output_style)?;
+        let phase_failed = phase_executions
+            .iter()
+            .any(|execution| !execution.output.output.status.success());
+        executions.append(&mut phase_executions);
+        if phase_failed {
+            break;
+        }
+        phase_start = phase_end;
+    }
+    Ok(executions)
+}
+
+fn execute_phase_checks(
+    root: &Path,
+    analysis: &Analysis,
+    checks: &[ProjectCheck],
+    total_checks: usize,
+    output_style: VerifyOutputStyle,
+) -> Result<Vec<CheckExecution>> {
     let lanes = build_check_lanes(checks);
     if lanes.is_empty() {
         return Ok(Vec::new());
     }
     if lanes.len() == 1 || should_use_devenv(root) {
-        return lanes
-            .into_iter()
-            .flatten()
-            .map(|check| {
-                let progress = check_progress(&check, root, checks.len(), output_style);
-                let output = run_check(root, analysis, &check.command, progress.as_ref())?;
-                Ok(CheckExecution { check, output })
-            })
-            .collect();
+        let mut executions = Vec::new();
+        for check in lanes.into_iter().flatten() {
+            let progress = check_progress(&check, root, total_checks, output_style);
+            let output = run_check(root, analysis, &check.command, progress.as_ref())?;
+            let succeeded = output.output.status.success();
+            executions.push(CheckExecution { check, output });
+            if !succeeded {
+                break;
+            }
+        }
+        return Ok(executions);
     }
 
     let root = root.to_path_buf();
-    let mut executions = Vec::new();
     let handles = lanes
         .into_iter()
         .map(|lane| {
             let root = root.clone();
             let analysis = analysis.clone();
-            let total_checks = checks.len();
             thread::spawn(move || -> Result<Vec<CheckExecution>> {
-                lane.into_iter()
-                    .map(|check| {
-                        let progress = check_progress(&check, &root, total_checks, output_style);
-                        let output =
-                            run_check(&root, &analysis, &check.command, progress.as_ref())?;
-                        Ok(CheckExecution { check, output })
-                    })
-                    .collect()
+                execute_check_lane(&root, &analysis, &lane, total_checks, output_style)
             })
         })
         .collect::<Vec<_>>();
 
+    let mut executions = Vec::new();
     for handle in handles {
         let lane_results = handle
             .join()
@@ -314,6 +569,29 @@ fn execute_checks(
         executions.extend(lane_results);
     }
     executions.sort_by_key(|execution| execution.check.ordinal);
+    Ok(executions)
+}
+
+fn execute_check_lane(
+    root: &Path,
+    analysis: &Analysis,
+    lane: &[ProjectCheck],
+    total_checks: usize,
+    output_style: VerifyOutputStyle,
+) -> Result<Vec<CheckExecution>> {
+    let mut executions = Vec::new();
+    for check in lane {
+        let progress = check_progress(check, root, total_checks, output_style);
+        let output = run_check(root, analysis, &check.command, progress.as_ref())?;
+        let succeeded = output.output.status.success();
+        executions.push(CheckExecution {
+            check: check.clone(),
+            output,
+        });
+        if !succeeded {
+            break;
+        }
+    }
     Ok(executions)
 }
 
@@ -338,12 +616,11 @@ fn check_lane_key(check: &ProjectCheck) -> String {
     if command.starts_with("cargo fmt") {
         return "cargo-fmt".to_string();
     }
-    if command.starts_with("cargo clippy")
-        || command.starts_with("cargo build")
-        || command.starts_with("cargo test")
-        || command.starts_with("cargo check")
-    {
+    if command.starts_with("cargo ") {
         return "cargo-target".to_string();
+    }
+    if command.starts_with("mix ") {
+        return "mix-target".to_string();
     }
     command.to_string()
 }
@@ -351,7 +628,7 @@ fn check_lane_key(check: &ProjectCheck) -> String {
 fn project_policy_check_count(analysis: &Analysis) -> usize {
     let mut count = 0;
     if analysis.repository.is_git_repository {
-        count += 3;
+        count += 4 + analysis.install_directories.len();
     }
     count += analysis.required_checks.len();
     if analysis.repository.has_workflows() {
@@ -374,6 +651,18 @@ fn first_project_policy_failure(root: &Path, analysis: &Analysis) -> Result<Opti
         }));
     }
 
+    if analysis.repository.is_git_repository
+        && let Some(summary) = first_invalid_readme_local_link(root, analysis)?
+    {
+        return Ok(Some(CheckFailure {
+            kind: "docs",
+            subject: "README.md#Links".to_string(),
+            exit_code: None,
+            summary,
+            duration: None,
+        }));
+    }
+
     if analysis.repository.is_git_repository && !readme_has_license_section(root, analysis)? {
         return Ok(Some(CheckFailure {
             kind: "docs",
@@ -382,6 +671,12 @@ fn first_project_policy_failure(root: &Path, analysis: &Analysis) -> Result<Opti
             summary: "git repositories must end README.md with exactly one `## License` section containing at least one word of paragraph content".to_string(),
             duration: None,
         }));
+    }
+
+    if analysis.repository.is_git_repository
+        && let Some(failure) = first_package_install_directory_failure(root, analysis)?
+    {
+        return Ok(Some(failure));
     }
 
     if analysis.repository.is_git_repository && !ds_store_is_gitignored(root)? {
@@ -492,6 +787,136 @@ fn readme_has_license_section(root: &Path, analysis: &Analysis) -> Result<bool> 
     Ok(markdown_has_terminal_license_section(&contents))
 }
 
+fn first_invalid_readme_local_link(root: &Path, analysis: &Analysis) -> Result<Option<String>> {
+    let Some(readme_path) = analysis.repository.readme_path.as_deref() else {
+        return Ok(None);
+    };
+    let readme_path = root.join(readme_path);
+    let contents = fs::read_to_string(&readme_path)
+        .with_context(|| format!("failed to read {}", readme_path.display()))?;
+    Ok(first_invalid_markdown_local_link(
+        &contents,
+        root,
+        &readme_path,
+    ))
+}
+
+fn first_invalid_markdown_local_link(
+    contents: &str,
+    repo_root: &Path,
+    readme_path: &Path,
+) -> Option<String> {
+    let readme_dir = readme_path.parent().unwrap_or(repo_root);
+    for event in Parser::new(contents) {
+        let destination = match event {
+            Event::Start(Tag::Link { dest_url, .. })
+            | Event::Start(Tag::Image { dest_url, .. }) => dest_url.to_string(),
+            _ => continue,
+        };
+        if let Some(reason) =
+            invalid_local_markdown_link_reason(repo_root, readme_dir, &destination)
+        {
+            return Some(format!(
+                "README.md local file links must be relative, stay inside the git repository, and point to existing files ({reason})"
+            ));
+        }
+    }
+    None
+}
+
+fn invalid_local_markdown_link_reason(
+    repo_root: &Path,
+    readme_dir: &Path,
+    destination: &str,
+) -> Option<String> {
+    let destination = destination.trim();
+    if destination.is_empty() || destination.starts_with('#') {
+        return None;
+    }
+
+    match markdown_link_scheme(destination) {
+        Some("file") => return Some(format!("`{destination}` uses a disallowed file URL")),
+        Some("http" | "https" | "mailto" | "tel") => return None,
+        Some(_) => return None,
+        None => {}
+    }
+
+    let path_part = destination
+        .split(['#', '?'])
+        .next()
+        .unwrap_or(destination)
+        .trim();
+    if path_part.is_empty() {
+        return None;
+    }
+
+    if path_part.starts_with('/') || Path::new(path_part).is_absolute() {
+        return Some(format!("`{destination}` is an absolute path"));
+    }
+
+    let Some(resolved_path) = resolve_relative_markdown_link_path(repo_root, readme_dir, path_part)
+    else {
+        return Some(format!("`{destination}` escapes the git repository"));
+    };
+
+    if !resolved_path.exists() {
+        return Some(format!(
+            "`{destination}` does not exist in the git repository"
+        ));
+    }
+
+    None
+}
+
+fn markdown_link_scheme(destination: &str) -> Option<&str> {
+    let (scheme, rest) = destination.split_once(':')?;
+    if scheme.len() < 2
+        || !scheme.chars().enumerate().all(|(index, ch)| {
+            if index == 0 {
+                ch.is_ascii_alphabetic()
+            } else {
+                ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.')
+            }
+        })
+    {
+        return None;
+    }
+    if rest.is_empty() {
+        return None;
+    }
+    Some(scheme)
+}
+
+fn resolve_relative_markdown_link_path(
+    repo_root: &Path,
+    readme_dir: &Path,
+    link_path: &str,
+) -> Option<PathBuf> {
+    let Ok(base_relative) = readme_dir.strip_prefix(repo_root) else {
+        return None;
+    };
+    let joined = base_relative.join(link_path);
+    let normalized = normalize_relative_repo_path(&joined)?;
+    Some(repo_root.join(normalized))
+}
+
+fn normalize_relative_repo_path(path: &Path) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(segment) => normalized.push(segment),
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(normalized)
+}
+
 fn markdown_has_terminal_license_section(contents: &str) -> bool {
     let mut current_heading_level = None;
     let mut current_heading_text = String::new();
@@ -559,28 +984,101 @@ fn count_words(contents: &str) -> usize {
 }
 
 fn ds_store_is_gitignored(root: &Path) -> Result<bool> {
+    path_is_gitignored(root, ".DS_Store")
+}
+
+fn first_package_install_directory_failure(
+    root: &Path,
+    analysis: &Analysis,
+) -> Result<Option<CheckFailure>> {
+    for directory in &analysis.install_directories {
+        let gitignored = path_is_gitignored(root, directory)?;
+        let tracked = path_has_tracked_git_entries(root, directory)?;
+        if gitignored && !tracked {
+            continue;
+        }
+
+        let summary = if tracked && !gitignored {
+            format!(
+                "package-manager install directory `{directory}` must be gitignored and removed from the repository"
+            )
+        } else if tracked {
+            format!(
+                "package-manager install directory `{directory}` is tracked by git and must be removed from the repository"
+            )
+        } else {
+            format!("package-manager install directory `{directory}` must be gitignored")
+        };
+
+        return Ok(Some(CheckFailure {
+            kind: "ignore",
+            subject: directory.clone(),
+            exit_code: None,
+            summary,
+            duration: None,
+        }));
+    }
+
+    Ok(None)
+}
+
+fn path_is_gitignored(root: &Path, relative_path: &str) -> Result<bool> {
+    for candidate in gitignore_probe_paths(relative_path) {
+        let output = Command::new("git")
+            .current_dir(root)
+            .args(["check-ignore", "--no-index", &candidate])
+            .output()
+            .with_context(|| {
+                format!(
+                    "failed to check ignore rules for `{relative_path}` in {}",
+                    root.display(),
+                )
+            })?;
+
+        if output.status.success() {
+            return Ok(true);
+        }
+        if output.status.code() == Some(1) {
+            continue;
+        }
+
+        anyhow::bail!(
+            "git check-ignore failed while checking `{relative_path}` ignore rules: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(false)
+}
+
+fn gitignore_probe_paths(relative_path: &str) -> Vec<String> {
+    let trimmed = relative_path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return vec![relative_path.to_string()];
+    }
+    vec![
+        trimmed.to_string(),
+        format!("{trimmed}/.explicit-ignore-probe"),
+    ]
+}
+
+fn path_has_tracked_git_entries(root: &Path, relative_path: &str) -> Result<bool> {
     let output = Command::new("git")
         .current_dir(root)
-        .args(["check-ignore", "--no-index", ".DS_Store"])
+        .args(["ls-files", "--cached", "--", relative_path])
         .output()
         .with_context(|| {
             format!(
-                "failed to check .DS_Store ignore rules in {}",
-                root.display()
+                "failed to inspect tracked git entries for `{relative_path}` in {}",
+                root.display(),
             )
         })?;
-
-    if output.status.success() {
-        return Ok(true);
+    if !output.status.success() {
+        anyhow::bail!(
+            "git ls-files failed while checking `{relative_path}`: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
-    if output.status.code() == Some(1) {
-        return Ok(false);
-    }
-
-    anyhow::bail!(
-        "git check-ignore failed while checking .DS_Store ignore rules: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
+    Ok(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
 }
 
 fn audit_workflows(root: &Path, workflow_files: &[String]) -> Result<WorkflowAudit> {
@@ -735,6 +1233,7 @@ fn missing_workflow_commands(analysis: &Analysis, run_steps: &[String]) -> Vec<S
         .iter()
         .chain(analysis.build_commands.iter())
         .chain(analysis.test_commands.iter())
+        .chain(analysis.coverage_commands.iter())
         .collect::<Vec<_>>();
 
     required_checks
@@ -966,6 +1465,44 @@ fn check_progress(
         progress_probe: check_progress_probe(check, root),
         start_message: format!("run  {prefix} {:<5} {}...", check.kind, check.command),
         wait_prefix: format!("wait {prefix} {:<5} {}", check.kind, check.command),
+    })
+}
+
+fn migration_check_progress(
+    ordinal: usize,
+    total_checks: usize,
+    command: &str,
+    output_style: VerifyOutputStyle,
+) -> Option<CommandProgress> {
+    if output_style != VerifyOutputStyle::Interactive {
+        return None;
+    }
+    let prefix = format!("[{}/{}]", ordinal + 1, total_checks);
+    Some(CommandProgress {
+        note_message: None,
+        live_prefix: format!("live {prefix} {:<9}", "migration"),
+        progress_probe: None,
+        start_message: format!("run  {prefix} {:<9} {}...", "migration", command),
+        wait_prefix: format!("wait {prefix} {:<9} {}", "migration", command),
+    })
+}
+
+fn migration_apply_progress(
+    ordinal: usize,
+    total_checks: usize,
+    command: &str,
+    output_style: VerifyOutputStyle,
+) -> Option<CommandProgress> {
+    if output_style != VerifyOutputStyle::Interactive {
+        return None;
+    }
+    let prefix = format!("[{}/{}]", ordinal + 1, total_checks);
+    Some(CommandProgress {
+        note_message: None,
+        live_prefix: format!("fix  {prefix} {:<9}", "migration"),
+        progress_probe: None,
+        start_message: format!("fix  {prefix} {:<9} {}...", "migration", command),
+        wait_prefix: format!("fix  {prefix} {:<9} {}", "migration", command),
     })
 }
 
@@ -1399,6 +1936,39 @@ fn start_verify_services_with_retry(
     }))
 }
 
+fn pending_migration_entries(check: &MigrationCheck, output: &Output) -> Vec<String> {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}\n{stderr}");
+    match check.kind {
+        MigrationCheckKind::Ecto => combined
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("down "))
+            .filter_map(|line| {
+                let parts = line.split_whitespace().collect::<Vec<_>>();
+                if parts.len() < 3 {
+                    return None;
+                }
+                Some(format!("{} {}", parts[1], parts[2]))
+            })
+            .collect(),
+    }
+}
+
+fn format_pending_migration_entries(entries: &[String]) -> String {
+    let preview = entries.iter().take(3).cloned().collect::<Vec<_>>();
+    if entries.len() > preview.len() {
+        format!(
+            "{} (+{} more)",
+            preview.join(", "),
+            entries.len() - preview.len()
+        )
+    } else {
+        preview.join(", ")
+    }
+}
+
 fn summarize_failure(kind: &str, command: &str, output: &Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1414,6 +1984,9 @@ fn summarize_failure(kind: &str, command: &str, output: &Output) -> String {
     }
 
     if is_format_check(command) {
+        if let Some(summary) = summarize_format_failure(&lines) {
+            return summary;
+        }
         return "formatting changes are required".to_string();
     }
 
@@ -1444,6 +2017,30 @@ fn summarize_failure(kind: &str, command: &str, output: &Output) -> String {
             return normalize_summary(line);
         }
         return "one or more tests failed".to_string();
+    }
+
+    if kind == "coverage" {
+        if let Some(line) = pick_line(
+            &lines,
+            &[
+                "fail-under",
+                "coverage is below",
+                "coverage threshold",
+                "[TOTAL]",
+                "TOTAL",
+                "coverage:",
+            ],
+        ) {
+            return normalize_summary(line);
+        }
+        if let Some(line) = lines
+            .iter()
+            .copied()
+            .find(|line| line.contains('%') && line.to_ascii_lowercase().contains("coverage"))
+        {
+            return normalize_summary(line);
+        }
+        return "coverage is below the required threshold or the coverage run failed".to_string();
     }
 
     if let Some(line) = pick_line(
@@ -1481,6 +2078,48 @@ fn fallback_summary(kind: &str, command: &str, exit_code: Option<i32>) -> String
 
 fn is_format_check(command: &str) -> bool {
     command.contains("fmt --check") || command.contains("format --check")
+}
+
+fn summarize_format_failure(lines: &[&str]) -> Option<String> {
+    if let Some(line) = lines
+        .iter()
+        .copied()
+        .find(|line| line.starts_with("Diff in ") && !is_noise_failure_line(line))
+    {
+        return Some(normalize_summary(line));
+    }
+
+    let paths = lines
+        .iter()
+        .copied()
+        .filter(|line| !is_noise_failure_line(line))
+        .filter(|line| looks_like_local_path(line))
+        .take(3)
+        .collect::<Vec<_>>();
+    if !paths.is_empty() {
+        return Some(normalize_summary(&paths.join(", ")));
+    }
+
+    let line = lines
+        .iter()
+        .copied()
+        .find(|line| !is_noise_failure_line(line) && !line.ends_with(':'))?;
+    Some(normalize_summary(line))
+}
+
+fn looks_like_local_path(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.contains(' ') {
+        return false;
+    }
+    if trimmed.starts_with('/') || trimmed.starts_with("./") || trimmed.starts_with("../") {
+        return true;
+    }
+    trimmed.contains('/')
+        && trimmed
+            .rsplit('.')
+            .next()
+            .is_some_and(|ext| ext.chars().all(|ch| ch.is_ascii_alphanumeric()) && ext.len() <= 8)
 }
 
 fn pick_line<'a>(lines: &'a [&'a str], needles: &[&str]) -> Option<&'a str> {
@@ -1816,20 +2455,23 @@ fn shell_quote(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProjectCheck, VerifyMode, build_stop_reason, check_preflight_note, command_in_devenv_shell,
-        command_with_runtime_env, devenv_check_command, devenv_root_for_check_with_env,
-        existing_devenv_root, first_project_policy_failure, humanize_devenv_trace_line,
-        humanize_live_output, is_matching_devenv_root, markdown_has_terminal_license_section,
-        missing_workflow_commands, normalize_summary, prepare_verify_environment, project_checks,
-        service_process_names, shell_quote, should_use_devenv, summarize_failure,
-        tokens_are_subsequence, verify_output_style_with_stderr_terminal, workflow_runs_command,
+        ProjectCheck, VerifyMode, VerifyOutputStyle, build_stop_reason, check_preflight_note,
+        command_in_devenv_shell, command_with_runtime_env, devenv_check_command,
+        devenv_root_for_check_with_env, existing_devenv_root, first_invalid_markdown_local_link,
+        first_project_policy_failure, humanize_devenv_trace_line, humanize_live_output,
+        is_matching_devenv_root, markdown_has_terminal_license_section, missing_workflow_commands,
+        normalize_summary, prepare_verify_environment, project_checks, safe_lint_autofix_command,
+        service_process_names, shell_quote, should_attempt_safe_autofix, should_use_devenv,
+        summarize_failure, tokens_are_subsequence, verify_output_style_with_stderr_terminal,
+        workflow_runs_command,
     };
     use crate::analysis::{
         Analysis, GitHubRepository, GitHubVisibility, ProjectRequirement, RepositoryMetadata,
         RequirementKind, SandboxPlan, ServiceRequirement,
     };
+    use std::fs;
     use std::os::unix::process::ExitStatusExt;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::{Command, Output};
     use std::time::Duration;
 
@@ -1838,6 +2480,7 @@ mod tests {
             root: PathBuf::from("/tmp/project"),
             markers: Vec::new(),
             manifests: Vec::new(),
+            install_directories: Vec::new(),
             detected_languages: Vec::new(),
             detected_versions: Vec::new(),
             language_hints: Vec::new(),
@@ -1846,10 +2489,15 @@ mod tests {
             nix_options: Vec::new(),
             requires_allow_unfree: false,
             deploy_hosts: Vec::new(),
+            deploy_use_ssh_agent: false,
+            deploy_ssh_agent_hosts: Vec::new(),
+            dev_server_commands: Vec::new(),
             lint_commands: vec!["lint-a".to_string()],
             build_commands: vec!["build-a".to_string()],
             test_commands: vec!["test-a".to_string()],
+            coverage_commands: Vec::new(),
             required_checks: Vec::new(),
+            migration_checks: Vec::new(),
             notes: Vec::new(),
             repository: RepositoryMetadata::default(),
             sandbox_plan: SandboxPlan {
@@ -1882,6 +2530,218 @@ mod tests {
         assert_eq!(checks[0].ordinal, 0);
         assert_eq!(checks[1].ordinal, 1);
         assert_eq!(checks[2].ordinal, 2);
+    }
+
+    #[test]
+    fn appends_coverage_checks_after_tests() {
+        let mut analysis = analysis_with_checks();
+        analysis.coverage_commands = vec!["cargo llvm-cov --summary-only".to_string()];
+
+        let checks = project_checks(&analysis);
+        assert_eq!(checks.len(), 4);
+        assert_eq!(checks[3].kind, "coverage");
+        assert_eq!(checks[3].command, "cargo llvm-cov --summary-only");
+        assert_eq!(checks[3].ordinal, 3);
+    }
+
+    #[test]
+    fn parses_pending_ecto_migrations() {
+        let check = crate::analysis::MigrationCheck {
+            kind: crate::analysis::MigrationCheckKind::Ecto,
+            status_command: "mix ecto.migrations".to_string(),
+            apply_command: "mix ecto.migrate".to_string(),
+            subject: "mix.exs#migrations".to_string(),
+        };
+        let output = Output {
+            status: ExitStatusExt::from_raw(0),
+            stdout: b"Repo migrations status\nup   20260401000000 create_users\n down 20260409045614 enable_pg_stat_statements\n down 20260412120000 add_oban_jobs_table\n".to_vec(),
+            stderr: Vec::new(),
+        };
+
+        assert_eq!(
+            super::pending_migration_entries(&check, &output),
+            vec![
+                "20260409045614 enable_pg_stat_statements".to_string(),
+                "20260412120000 add_oban_jobs_table".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn stop_hook_runs_pending_ecto_migrations_before_other_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let migrated = dir.path().join("migrated");
+        let script = dir.path().join("mix");
+        fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+set -eu
+case "$1" in
+  "ecto.migrations")
+    if [ -f "{}" ]; then
+      echo "up 20260413101000 add_processing_to_crawl_urls"
+    else
+      echo "down 20260413101000 add_processing_to_crawl_urls"
+    fi
+    ;;
+  "ecto.migrate")
+    touch "{}"
+    ;;
+  *)
+    echo "unexpected mix invocation: $1" >&2
+    exit 1
+    ;;
+esac
+"#,
+                migrated.display(),
+                migrated.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&script).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script, permissions).unwrap();
+        }
+
+        let mut analysis = analysis_with_checks();
+        analysis.lint_commands.clear();
+        analysis.build_commands.clear();
+        analysis.test_commands.clear();
+        analysis.migration_checks = vec![crate::analysis::MigrationCheck {
+            kind: crate::analysis::MigrationCheckKind::Ecto,
+            status_command: format!("{} ecto.migrations", script.display()),
+            apply_command: format!("{} ecto.migrate", script.display()),
+            subject: "mix.exs#migrations".to_string(),
+        }];
+
+        let failure = super::run_migration_checks(
+            dir.path(),
+            &analysis,
+            VerifyMode::StopHook,
+            VerifyOutputStyle::Compact,
+            analysis.migration_checks.len(),
+            0,
+        )
+        .unwrap();
+
+        assert!(failure.is_none());
+        assert!(migrated.exists());
+    }
+
+    #[test]
+    fn stop_hook_reports_failed_pending_migration_apply_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("mix");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+set -eu
+case "$1" in
+  "ecto.migrations")
+    echo "down 20260413101000 add_processing_to_crawl_urls"
+    ;;
+  "ecto.migrate")
+    echo "migration failed badly" >&2
+    exit 1
+    ;;
+  *)
+    echo "unexpected mix invocation: $1" >&2
+    exit 1
+    ;;
+esac
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&script).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script, permissions).unwrap();
+        }
+
+        let mut analysis = analysis_with_checks();
+        analysis.lint_commands.clear();
+        analysis.build_commands.clear();
+        analysis.test_commands.clear();
+        analysis.migration_checks = vec![crate::analysis::MigrationCheck {
+            kind: crate::analysis::MigrationCheckKind::Ecto,
+            status_command: format!("{} ecto.migrations", script.display()),
+            apply_command: format!("{} ecto.migrate", script.display()),
+            subject: "mix.exs#migrations".to_string(),
+        }];
+
+        let failure = super::run_migration_checks(
+            dir.path(),
+            &analysis,
+            VerifyMode::StopHook,
+            VerifyOutputStyle::Compact,
+            analysis.migration_checks.len(),
+            0,
+        )
+        .unwrap()
+        .expect("expected migration failure");
+
+        assert_eq!(failure.kind, "migration");
+        assert!(failure.summary.contains("migration failed badly"));
+    }
+
+    #[test]
+    fn user_verify_suggests_running_pending_ecto_migrations() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("mix");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+set -eu
+case "$1" in
+  "ecto.migrations")
+    echo "down 20260413101000 add_processing_to_crawl_urls"
+    ;;
+  *)
+    echo "unexpected mix invocation: $1" >&2
+    exit 1
+    ;;
+esac
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&script).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script, permissions).unwrap();
+        }
+
+        let mut analysis = analysis_with_checks();
+        analysis.lint_commands.clear();
+        analysis.build_commands.clear();
+        analysis.test_commands.clear();
+        analysis.migration_checks = vec![crate::analysis::MigrationCheck {
+            kind: crate::analysis::MigrationCheckKind::Ecto,
+            status_command: format!("{} ecto.migrations", script.display()),
+            apply_command: format!("{} ecto.migrate", script.display()),
+            subject: "mix.exs#migrations".to_string(),
+        }];
+
+        let failure = super::run_migration_checks(
+            dir.path(),
+            &analysis,
+            VerifyMode::User,
+            VerifyOutputStyle::Compact,
+            analysis.migration_checks.len(),
+            0,
+        )
+        .unwrap()
+        .expect("expected migration failure");
+
+        assert!(failure.summary.contains("pending migrations detected"));
+        assert!(failure.summary.contains("ecto.migrate"));
     }
 
     #[test]
@@ -2049,6 +2909,35 @@ mod tests {
     }
 
     #[test]
+    fn safe_lint_autofix_rewrites_known_formatter_checks() {
+        assert_eq!(
+            safe_lint_autofix_command("mix format --check-formatted"),
+            Some("mix format".to_string())
+        );
+        assert_eq!(
+            safe_lint_autofix_command("cd 'infra' && tofu fmt -check -recursive"),
+            Some("cd 'infra' && tofu fmt -recursive".to_string())
+        );
+        assert_eq!(
+            safe_lint_autofix_command("cargo fmt --check --all"),
+            Some("cargo fmt --all".to_string())
+        );
+    }
+
+    #[test]
+    fn safe_lint_autofix_ignores_non_formatter_lints_and_git_hooks() {
+        assert_eq!(safe_lint_autofix_command("mix credo --strict"), None);
+        let check = ProjectCheck {
+            ordinal: 0,
+            kind: "lint",
+            command: "mix format --check-formatted".to_string(),
+        };
+        assert!(should_attempt_safe_autofix(VerifyMode::User, &check));
+        assert!(should_attempt_safe_autofix(VerifyMode::StopHook, &check));
+        assert!(!should_attempt_safe_autofix(VerifyMode::GitHook, &check));
+    }
+
+    #[test]
     fn humanizes_devenv_trace_fetch_events() {
         let line = r#"{"fields":{"event":{"activity_kind":"fetch","event":"start","name":"android-ndk-r26b-darwin.zip","url":"https://cache.nixos.org","timestamp":"2026-04-12T06:18:17.052521000Z"}},"level":"TRACE","target":"devenv::activity","timestamp":"2026-04-12T06:18:17.052536Z"}"#;
         assert_eq!(
@@ -2076,13 +2965,23 @@ mod tests {
     }
 
     #[test]
-    fn summarize_format_failures_concisely() {
+    fn summarize_format_failures_include_diff_header_when_available() {
         let summary = summarize_failure(
             "lint",
             "cargo fmt --check",
             &failed_output("", "Diff in src/main.rs:1:\n"),
         );
-        assert_eq!(summary, "formatting changes are required");
+        assert_eq!(summary, "Diff in src/main.rs:1:");
+    }
+
+    #[test]
+    fn summarize_format_failures_include_changed_paths_when_available() {
+        let summary = summarize_failure(
+            "lint",
+            "mix format --check-formatted",
+            &failed_output("", "lib/foo.ex\nlib/bar.ex\n"),
+        );
+        assert_eq!(summary, "lib/foo.ex, lib/bar.ex");
     }
 
     #[test]
@@ -2109,6 +3008,14 @@ mod tests {
             summary,
             "Preset example-preset not found relative to rootDir /tmp/project."
         );
+    }
+
+    #[test]
+    fn summarize_coverage_failures_surfaces_threshold_details() {
+        let output = failed_output("", "TOTAL 412 78.24%\nerror: coverage threshold not met\n");
+        let summary =
+            summarize_failure("coverage", "cargo llvm-cov --fail-under-lines 80", &output);
+        assert_eq!(summary, "coverage threshold not met");
     }
 
     #[test]
@@ -2210,6 +3117,31 @@ mod tests {
     }
 
     #[test]
+    fn requires_repo_relative_readme_links_for_git_repositories() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("README.md"),
+            "# Demo\n\nSee [LICENSE](/Users/example/project/LICENSE).\n\n## License\nMIT\n",
+        )
+        .unwrap();
+
+        let mut analysis = analysis_with_checks();
+        analysis.repository = RepositoryMetadata {
+            is_git_repository: true,
+            readme_path: Some("README.md".to_string()),
+            ..RepositoryMetadata::default()
+        };
+
+        let failure = first_project_policy_failure(dir.path(), &analysis)
+            .unwrap()
+            .expect("expected readme link failure");
+        assert_eq!(failure.kind, "docs");
+        assert_eq!(failure.subject, "README.md#Links");
+        assert!(failure.summary.contains("relative"));
+        assert!(failure.summary.contains("absolute path"));
+    }
+
+    #[test]
     fn requires_ds_store_ignore_for_git_repositories() {
         let dir = tempfile::tempdir().unwrap();
         Command::new("git")
@@ -2236,10 +3168,125 @@ mod tests {
     }
 
     #[test]
+    fn requires_package_install_directories_to_be_gitignored() {
+        let dir = tempfile::tempdir().unwrap();
+        Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(dir.path())
+            .status()
+            .unwrap();
+        std::fs::write(dir.path().join("README.md"), "# Demo\n\n## License\nMIT\n").unwrap();
+
+        let mut analysis = analysis_with_checks();
+        analysis.repository = RepositoryMetadata {
+            is_git_repository: true,
+            readme_path: Some("README.md".to_string()),
+            ..RepositoryMetadata::default()
+        };
+        analysis.install_directories = vec!["node_modules".to_string()];
+
+        let failure = first_project_policy_failure(dir.path(), &analysis)
+            .unwrap()
+            .expect("expected install-directory failure");
+        assert_eq!(failure.kind, "ignore");
+        assert_eq!(failure.subject, "node_modules");
+        assert!(failure.summary.contains("must be gitignored"));
+    }
+
+    #[test]
+    fn requires_removing_tracked_package_install_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(dir.path())
+            .status()
+            .unwrap();
+        std::fs::write(dir.path().join("README.md"), "# Demo\n\n## License\nMIT\n").unwrap();
+        std::fs::write(dir.path().join(".gitignore"), ".DS_Store\nnode_modules/\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("node_modules/pkg")).unwrap();
+        std::fs::write(
+            dir.path().join("node_modules/pkg/index.js"),
+            "module.exports = {};\n",
+        )
+        .unwrap();
+        Command::new("git")
+            .current_dir(dir.path())
+            .args(["add", "-f", "node_modules/pkg/index.js"])
+            .status()
+            .unwrap();
+
+        let mut analysis = analysis_with_checks();
+        analysis.repository = RepositoryMetadata {
+            is_git_repository: true,
+            readme_path: Some("README.md".to_string()),
+            ..RepositoryMetadata::default()
+        };
+        analysis.install_directories = vec!["node_modules".to_string()];
+
+        let failure = first_project_policy_failure(dir.path(), &analysis)
+            .unwrap()
+            .expect("expected tracked install-directory failure");
+        assert_eq!(failure.kind, "ignore");
+        assert_eq!(failure.subject, "node_modules");
+        assert!(failure.summary.contains("tracked by git"));
+    }
+
+    #[test]
     fn accepts_readme_with_license_section_as_last_section() {
         assert!(markdown_has_terminal_license_section(
             "# Demo\n\n## Usage\nTry it.\n\n## License\nMIT\n"
         ));
+    }
+
+    #[test]
+    fn accepts_repo_relative_markdown_links_within_root() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("docs")).unwrap();
+        std::fs::write(dir.path().join("docs/guide.md"), "# Guide\n").unwrap();
+        std::fs::write(dir.path().join("LICENSE"), "MIT\n").unwrap();
+        assert_eq!(
+            first_invalid_markdown_local_link(
+                "# Demo\n\nSee [Guide](docs/guide.md), [License](./LICENSE#mit), and [Site](https://example.com).\n",
+                dir.path(),
+                &dir.path().join("README.md"),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_absolute_markdown_file_links() {
+        let failure = first_invalid_markdown_local_link(
+            "# Demo\n\nSee [License](/Users/example/project/LICENSE).\n",
+            Path::new("/tmp/project"),
+            Path::new("/tmp/project/README.md"),
+        )
+        .expect("expected invalid link");
+        assert!(failure.contains("absolute path"));
+    }
+
+    #[test]
+    fn rejects_markdown_links_that_escape_repo_root() {
+        let failure = first_invalid_markdown_local_link(
+            "# Demo\n\nSee [License](../../LICENSE).\n",
+            Path::new("/tmp/project"),
+            Path::new("/tmp/project/docs/README.md"),
+        )
+        .expect("expected invalid link");
+        assert!(failure.contains("escapes the git repository"));
+    }
+
+    #[test]
+    fn rejects_markdown_links_for_missing_local_files() {
+        let failure = first_invalid_markdown_local_link(
+            "# Demo\n\nSee [Guide](docs/missing.md).\n",
+            Path::new("/tmp/project"),
+            Path::new("/tmp/project/README.md"),
+        )
+        .expect("expected invalid link");
+        assert!(failure.contains("does not exist"));
     }
 
     #[test]
@@ -2303,6 +3350,24 @@ mod tests {
         assert_eq!(failure.subject, "mix.exs");
         assert!(failure.summary.contains("Credo"));
         assert!(failure.summary.contains("mix credo --strict"));
+    }
+
+    #[test]
+    fn requires_coverage_for_projects_with_coverage_requirement() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut analysis = analysis_with_checks();
+        analysis.required_checks = vec![ProjectRequirement {
+            kind: RequirementKind::Coverage,
+            subject: "mix.exs#test_coverage".to_string(),
+            summary: "Elixir projects must enforce at least 80% test coverage.".to_string(),
+        }];
+
+        let failure = first_project_policy_failure(dir.path(), &analysis)
+            .unwrap()
+            .expect("expected coverage requirement");
+        assert_eq!(failure.kind, "coverage");
+        assert_eq!(failure.subject, "mix.exs#test_coverage");
+        assert!(failure.summary.contains("80%"));
     }
 
     #[test]
@@ -2427,30 +3492,48 @@ jobs:
         analysis.repository.readme_path = Some("README.md".to_string());
         std::fs::write(
             dir.path().join("README.md"),
-            "# Demo\n\n## Usage\nTry it.\n",
+            "# Demo\n\nSee [LICENSE](/tmp/demo/LICENSE).\n\n## Usage\nTry it.\n",
         )
         .unwrap();
         let failure = first_project_policy_failure(dir.path(), &analysis)
             .unwrap()
             .expect("expected second failure");
-        assert_eq!(failure.subject, "README.md#License");
+        assert_eq!(failure.subject, "README.md#Links");
 
-        std::fs::write(dir.path().join("README.md"), "# Demo\n\n## License\nMIT\n").unwrap();
+        std::fs::write(
+            dir.path().join("README.md"),
+            "# Demo\n\nSee [README](README.md).\n\n## Usage\nTry it.\n",
+        )
+        .unwrap();
         let failure = first_project_policy_failure(dir.path(), &analysis)
             .unwrap()
             .expect("expected third failure");
+        assert_eq!(failure.subject, "README.md#License");
+
+        std::fs::write(dir.path().join("README.md"), "# Demo\n\n## License\nMIT\n").unwrap();
+        analysis.install_directories = vec!["node_modules".to_string()];
+        let failure = first_project_policy_failure(dir.path(), &analysis)
+            .unwrap()
+            .expect("expected fourth failure");
+        assert_eq!(failure.subject, "node_modules");
+
+        std::fs::write(dir.path().join(".gitignore"), "node_modules/\n").unwrap();
+        analysis.install_directories = Vec::new();
+        let failure = first_project_policy_failure(dir.path(), &analysis)
+            .unwrap()
+            .expect("expected fifth failure");
         assert_eq!(failure.subject, ".gitignore");
 
         std::fs::write(dir.path().join(".gitignore"), ".DS_Store\n").unwrap();
         let failure = first_project_policy_failure(dir.path(), &analysis)
             .unwrap()
-            .expect("expected fourth failure");
+            .expect("expected sixth failure");
         assert_eq!(failure.subject, "mix.exs");
 
         analysis.required_checks = Vec::new();
         let failure = first_project_policy_failure(dir.path(), &analysis)
             .unwrap()
-            .expect("expected fifth failure");
+            .expect("expected seventh failure");
         assert_eq!(failure.subject, "LICENSE");
     }
 
@@ -2474,7 +3557,16 @@ jobs:
     }
 
     #[test]
-    fn cargo_build_family_shares_a_lane() {
+    fn missing_workflow_commands_include_coverage_checks() {
+        let mut analysis = analysis_with_checks();
+        analysis.coverage_commands = vec!["cargo llvm-cov --summary-only".to_string()];
+        let missing =
+            missing_workflow_commands(&analysis, &[String::from("lint-a && build-a && test-a")]);
+        assert_eq!(missing, vec!["cargo llvm-cov --summary-only".to_string()]);
+    }
+
+    #[test]
+    fn cargo_and_mix_build_families_share_lanes() {
         let checks = project_checks(&analysis_with_checks());
         let lanes = super::build_check_lanes(&checks);
         assert_eq!(lanes.len(), 3);
@@ -2512,5 +3604,31 @@ jobs:
         assert_eq!(lanes.len(), 2);
         assert_eq!(lanes[0].len(), 1);
         assert_eq!(lanes[1].len(), 3);
+
+        let mix_checks = [
+            ProjectCheck {
+                ordinal: 0,
+                kind: "lint",
+                command: "mix format --check-formatted".to_string(),
+            },
+            ProjectCheck {
+                ordinal: 1,
+                kind: "build",
+                command: "mix compile --warnings-as-errors".to_string(),
+            },
+            ProjectCheck {
+                ordinal: 2,
+                kind: "test",
+                command: "mix test".to_string(),
+            },
+            ProjectCheck {
+                ordinal: 3,
+                kind: "coverage",
+                command: "mix test --cover".to_string(),
+            },
+        ];
+        let lanes = super::build_check_lanes(&mix_checks);
+        assert_eq!(lanes.len(), 1);
+        assert_eq!(lanes[0].len(), 4);
     }
 }

@@ -57,6 +57,8 @@ enum Command {
     Claude(AgentArgs),
     #[command(hide = true, name = "__sandbox-exec")]
     SandboxExec(SandboxExecArgs),
+    #[command(hide = true, name = "__claude-pre-tool-use-bash")]
+    ClaudePreToolUseBash,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -219,6 +221,7 @@ fn run() -> Result<ExitCode> {
                 &root,
                 &analysis,
                 runtime::LaunchShellOptions {
+                    agent: None,
                     command: args.command.as_deref(),
                     block_network: args.block_network,
                     no_services: args.no_services,
@@ -255,6 +258,10 @@ fn run() -> Result<ExitCode> {
         Command::Claude(args) => launch_agent("claude", args),
         Command::SandboxExec(args) => {
             sandbox::run_sandbox_exec(args.root, args.env_file, args.plan_file, args.command)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::ClaudePreToolUseBash => {
+            hooks::run_claude_pre_tool_use_bash()?;
             Ok(ExitCode::SUCCESS)
         }
     }

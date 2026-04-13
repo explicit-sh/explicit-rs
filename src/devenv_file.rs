@@ -207,6 +207,10 @@ fn insert_new_import(source: &str, attrset: &ast::AttrSet) -> Result<String> {
 }
 
 pub fn render_generated_nix(analysis: &Analysis) -> String {
+    let uses_opentofu_language = analysis
+        .packages
+        .iter()
+        .any(|package| package == "opentofu");
     let mut lines = vec![
         "{ pkgs, config, ... }:".to_string(),
         String::new(),
@@ -225,6 +229,9 @@ pub fn render_generated_nix(analysis: &Analysis) -> String {
 
     lines.push("  packages = [".to_string());
     for package in &analysis.packages {
+        if package == "opentofu" {
+            continue;
+        }
         lines.push(format!(
             "    # {}",
             reason_for_package(analysis, package.as_str())
@@ -236,6 +243,10 @@ pub fn render_generated_nix(analysis: &Analysis) -> String {
     for language in &analysis.detected_languages {
         lines.push(format!("  # {}", reason_for_language(analysis, *language)));
         lines.push(format!("  {}", language.devenv_option()));
+    }
+    if uses_opentofu_language {
+        lines.push(format!("  # {}", reason_for_package(analysis, "opentofu")));
+        lines.push("  languages.opentofu.enable = true;".to_string());
     }
     for version in &analysis.detected_versions {
         for config_line in &version.config_lines {
@@ -297,6 +308,10 @@ fn reason_for_package(analysis: &Analysis, package: &str) -> String {
         "yarn" => "Needed because the project uses Yarn.".to_string(),
         "bun" => "Needed because the project uses Bun.".to_string(),
         "bundler" => "Needed because the project has a Gemfile or Bundlefile.".to_string(),
+        "cargo-llvm-cov" => {
+            "Needed because Rust projects must enforce a minimum line coverage threshold."
+                .to_string()
+        }
         "composer" => "Needed because the project has a composer.json.".to_string(),
         "gnumake" => "Needed because the project has a Makefile.".to_string(),
         "python3" => "Needed to run the detected Python project.".to_string(),
@@ -572,6 +587,7 @@ mod tests {
             root: "/tmp/project".into(),
             markers: vec!["mix.exs".to_string()],
             manifests: Vec::new(),
+            install_directories: Vec::new(),
             detected_languages: vec![LanguageRequirement::Elixir, LanguageRequirement::Rust],
             detected_versions: Vec::new(),
             language_hints: Vec::new(),
@@ -580,10 +596,15 @@ mod tests {
             nix_options: Vec::new(),
             requires_allow_unfree: false,
             deploy_hosts: Vec::new(),
+            deploy_use_ssh_agent: false,
+            deploy_ssh_agent_hosts: Vec::new(),
+            dev_server_commands: Vec::new(),
             lint_commands: Vec::new(),
             build_commands: Vec::new(),
             test_commands: Vec::new(),
+            coverage_commands: Vec::new(),
             required_checks: Vec::new(),
+            migration_checks: Vec::new(),
             notes: vec![
                 "Detected rustler in the Elixir dependencies; enabling Rust because Rustler-backed NIFs need a Rust toolchain.".to_string(),
                 "Detected postgrex in the Elixir dependencies; adding the PostgreSQL client package and enabling PostgreSQL for local development.".to_string(),
@@ -611,5 +632,47 @@ mod tests {
             "# Adding the PostgreSQL client package and enabling PostgreSQL for local development."
         ));
         assert!(rendered.contains("services.postgres.listen_addresses = \"127.0.0.1\";"));
+    }
+
+    #[test]
+    fn renders_opentofu_as_language_module_instead_of_package() {
+        let analysis = Analysis {
+            root: "/tmp/project".into(),
+            markers: vec!["terraform".to_string()],
+            manifests: Vec::new(),
+            install_directories: Vec::new(),
+            detected_languages: Vec::new(),
+            detected_versions: Vec::new(),
+            language_hints: Vec::new(),
+            packages: vec!["opentofu".to_string()],
+            services: Vec::new(),
+            nix_options: Vec::new(),
+            requires_allow_unfree: false,
+            deploy_hosts: Vec::new(),
+            deploy_use_ssh_agent: false,
+            deploy_ssh_agent_hosts: Vec::new(),
+            dev_server_commands: Vec::new(),
+            lint_commands: Vec::new(),
+            build_commands: Vec::new(),
+            test_commands: Vec::new(),
+            coverage_commands: Vec::new(),
+            required_checks: Vec::new(),
+            migration_checks: Vec::new(),
+            notes: Vec::new(),
+            repository: crate::analysis::RepositoryMetadata::default(),
+            sandbox_plan: SandboxPlan {
+                root: "/tmp/project".into(),
+                read_write_files: Vec::new(),
+                read_write_dirs: Vec::new(),
+                read_only_files: Vec::new(),
+                read_only_dirs: Vec::new(),
+                protected_write_files: Vec::new(),
+                notes: Vec::new(),
+            },
+        };
+
+        let rendered = render_generated_nix(&analysis);
+        assert!(rendered.contains("languages.opentofu.enable = true;"));
+        assert!(!rendered.contains("pkgs.opentofu"));
     }
 }

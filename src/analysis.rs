@@ -15,9 +15,21 @@ use toml::Value as TomlValue;
 use crate::host_tools::{host_command_paths, host_command_support_dirs};
 use crate::registry::{self, ProjectContext};
 
+#[path = "heuristics/elixir.rs"]
+mod elixir_heuristics;
+#[path = "heuristics/javascript.rs"]
+mod javascript_heuristics;
+#[path = "heuristics/php.rs"]
+mod php_heuristics;
+#[path = "heuristics/python.rs"]
+mod python_heuristics;
+#[path = "heuristics/ruby.rs"]
+mod ruby_heuristics;
+
 pub const SUPPORT_PACKAGES: &[&str] = &["actionlint", "git", "jq", "nono"];
 const NO_COMMANDS_NOTE: &str = "No explicit lint/build/test commands were discovered, so validation hooks stay advisory until the project exposes them.";
 const EXPLICIT_CONFIG_FILE: &str = "explicit.toml";
+const MINIMUM_COVERAGE_PERCENT: u8 = 80;
 const WORKSPACE_IGNORED_DIRS: &[&str] = &[
     ".git",
     ".devenv",
@@ -200,6 +212,7 @@ impl DetectedVersion {
 #[serde(rename_all = "snake_case")]
 pub enum RequirementKind {
     Lint,
+    Coverage,
     Starter,
 }
 
@@ -207,6 +220,7 @@ impl RequirementKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Lint => "lint",
+            Self::Coverage => "coverage",
             Self::Starter => "starter",
         }
     }
@@ -217,6 +231,20 @@ pub struct ProjectRequirement {
     pub kind: RequirementKind,
     pub subject: String,
     pub summary: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MigrationCheckKind {
+    Ecto,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationCheck {
+    pub kind: MigrationCheckKind,
+    pub status_command: String,
+    pub apply_command: String,
+    pub subject: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -314,6 +342,10 @@ fn default_workspace_auto_discover() -> bool {
 struct DeployConfig {
     #[serde(default)]
     hosts: Vec<String>,
+    #[serde(default)]
+    use_ssh_agent: bool,
+    #[serde(default)]
+    ssh_agent_hosts: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
@@ -391,6 +423,8 @@ pub struct Analysis {
     pub root: PathBuf,
     pub markers: Vec<String>,
     pub manifests: Vec<String>,
+    #[serde(default)]
+    pub install_directories: Vec<String>,
     pub detected_languages: Vec<LanguageRequirement>,
     pub detected_versions: Vec<DetectedVersion>,
     pub language_hints: Vec<String>,
@@ -400,11 +434,21 @@ pub struct Analysis {
     pub requires_allow_unfree: bool,
     #[serde(default)]
     pub deploy_hosts: Vec<String>,
+    #[serde(default)]
+    pub deploy_use_ssh_agent: bool,
+    #[serde(default)]
+    pub deploy_ssh_agent_hosts: Vec<String>,
+    #[serde(default)]
+    pub dev_server_commands: Vec<String>,
     pub lint_commands: Vec<String>,
     pub build_commands: Vec<String>,
     pub test_commands: Vec<String>,
     #[serde(default)]
+    pub coverage_commands: Vec<String>,
+    #[serde(default)]
     pub required_checks: Vec<ProjectRequirement>,
+    #[serde(default)]
+    pub migration_checks: Vec<MigrationCheck>,
     pub notes: Vec<String>,
     pub repository: RepositoryMetadata,
     pub sandbox_plan: SandboxPlan,
@@ -414,16 +458,20 @@ pub struct Analysis {
 struct Builder {
     markers: BTreeSet<String>,
     manifests: BTreeSet<String>,
+    install_directories: BTreeSet<String>,
     languages: BTreeSet<LanguageRequirement>,
     language_hints: BTreeSet<String>,
     packages: BTreeSet<String>,
     services: BTreeSet<ServiceRequirement>,
     nix_options: BTreeSet<String>,
     requires_allow_unfree: bool,
+    dev_server_commands: Vec<String>,
     lint_commands: Vec<String>,
     build_commands: Vec<String>,
     test_commands: Vec<String>,
+    coverage_commands: Vec<String>,
     required_checks: Vec<ProjectRequirement>,
+    migration_checks: Vec<MigrationCheck>,
     notes: Vec<String>,
 }
 
@@ -438,6 +486,10 @@ impl Builder {
 
     fn add_language(&mut self, language: LanguageRequirement) {
         self.languages.insert(language);
+    }
+
+    fn add_install_directory(&mut self, directory: impl Into<String>) {
+        self.install_directories.insert(directory.into());
     }
 
     fn add_package(&mut self, package: impl Into<String>) {
@@ -459,6 +511,13 @@ impl Builder {
         }
     }
 
+    fn add_dev_server(&mut self, command: impl Into<String>) {
+        let command = command.into();
+        if !self.dev_server_commands.contains(&command) {
+            self.dev_server_commands.push(command);
+        }
+    }
+
     fn add_build(&mut self, command: impl Into<String>) {
         let command = command.into();
         if !self.build_commands.contains(&command) {
@@ -473,9 +532,22 @@ impl Builder {
         }
     }
 
+    fn add_coverage(&mut self, command: impl Into<String>) {
+        let command = command.into();
+        if !self.coverage_commands.contains(&command) {
+            self.coverage_commands.push(command);
+        }
+    }
+
     fn add_requirement(&mut self, requirement: ProjectRequirement) {
         if !self.required_checks.contains(&requirement) {
             self.required_checks.push(requirement);
+        }
+    }
+
+    fn add_migration_check(&mut self, check: MigrationCheck) {
+        if !self.migration_checks.contains(&check) {
+            self.migration_checks.push(check);
         }
     }
 
@@ -531,7 +603,7 @@ fn workspace_auto_discovery_enabled(root: &Path) -> Result<bool> {
 fn analyze_single_project(root: &Path) -> Result<Analysis> {
     let mut builder = Builder::default();
     let project_context = ProjectContext::load(root)?;
-    let deploy_hosts = configured_deploy_hosts(root)?;
+    let deploy_settings = configured_deploy_settings(root)?;
     let sandbox_paths = configured_sandbox_paths(root)?;
     for package in SUPPORT_PACKAGES {
         builder.add_package(*package);
@@ -595,6 +667,7 @@ fn analyze_single_project(root: &Path) -> Result<Analysis> {
         root: root.to_path_buf(),
         markers: builder.markers.into_iter().collect(),
         manifests: builder.manifests.into_iter().collect(),
+        install_directories: builder.install_directories.into_iter().collect(),
         detected_languages: builder.languages.iter().copied().collect(),
         detected_versions,
         language_hints: builder.language_hints.into_iter().collect(),
@@ -602,11 +675,16 @@ fn analyze_single_project(root: &Path) -> Result<Analysis> {
         services: builder.services.iter().copied().collect(),
         nix_options: builder.nix_options.into_iter().collect(),
         requires_allow_unfree: builder.requires_allow_unfree,
-        deploy_hosts,
+        deploy_hosts: deploy_settings.hosts,
+        deploy_use_ssh_agent: deploy_settings.use_ssh_agent,
+        deploy_ssh_agent_hosts: deploy_settings.ssh_agent_hosts,
+        dev_server_commands: builder.dev_server_commands,
         lint_commands: builder.lint_commands,
         build_commands: builder.build_commands,
         test_commands: builder.test_commands,
+        coverage_commands: builder.coverage_commands,
         required_checks: builder.required_checks,
+        migration_checks: builder.migration_checks,
         notes: builder.notes.clone(),
         repository,
         sandbox_plan,
@@ -669,6 +747,7 @@ fn merge_workspace_members(analysis: &mut Analysis, discovery: WorkspaceDiscover
     if !analysis.lint_commands.is_empty()
         || !analysis.build_commands.is_empty()
         || !analysis.test_commands.is_empty()
+        || !analysis.coverage_commands.is_empty()
     {
         analysis.notes.retain(|note| note != NO_COMMANDS_NOTE);
     }
@@ -679,6 +758,14 @@ fn merge_workspace_members(analysis: &mut Analysis, discovery: WorkspaceDiscover
 fn merge_member_analysis(analysis: &mut Analysis, member: Analysis, relative: &Path) {
     merge_unique_strings(&mut analysis.markers, member.markers);
     merge_unique_strings(&mut analysis.manifests, member.manifests);
+    merge_unique_strings(
+        &mut analysis.install_directories,
+        member
+            .install_directories
+            .into_iter()
+            .map(|directory| prefix_workspace_path(relative, &directory))
+            .collect(),
+    );
     merge_unique_copy(&mut analysis.detected_languages, member.detected_languages);
 
     let prefixed_versions = member
@@ -693,6 +780,14 @@ fn merge_member_analysis(analysis: &mut Analysis, member: Analysis, relative: &P
     merge_unique_copy(&mut analysis.services, member.services);
     merge_unique_strings(&mut analysis.nix_options, member.nix_options);
     analysis.requires_allow_unfree |= member.requires_allow_unfree;
+    merge_unique_strings(
+        &mut analysis.dev_server_commands,
+        member
+            .dev_server_commands
+            .into_iter()
+            .map(|command| prefix_workspace_command(relative, &command))
+            .collect(),
+    );
     merge_unique_strings(
         &mut analysis.lint_commands,
         member
@@ -717,12 +812,28 @@ fn merge_member_analysis(analysis: &mut Analysis, member: Analysis, relative: &P
             .map(|command| prefix_workspace_command(relative, &command))
             .collect(),
     );
+    merge_unique_strings(
+        &mut analysis.coverage_commands,
+        member
+            .coverage_commands
+            .into_iter()
+            .map(|command| prefix_workspace_command(relative, &command))
+            .collect(),
+    );
     merge_unique_requirements(
         &mut analysis.required_checks,
         member
             .required_checks
             .into_iter()
             .map(|requirement| prefix_requirement_subject(requirement, relative))
+            .collect(),
+    );
+    merge_unique_migration_checks(
+        &mut analysis.migration_checks,
+        member
+            .migration_checks
+            .into_iter()
+            .map(|check| prefix_migration_check(check, relative))
             .collect(),
     );
 }
@@ -734,6 +845,9 @@ fn builder_from_analysis(analysis: &Analysis) -> Builder {
     }
     for manifest in &analysis.manifests {
         builder.add_manifest(manifest.clone());
+    }
+    for directory in &analysis.install_directories {
+        builder.add_install_directory(directory.clone());
     }
     for language in &analysis.detected_languages {
         builder.add_language(*language);
@@ -751,6 +865,9 @@ fn builder_from_analysis(analysis: &Analysis) -> Builder {
         builder.add_nix_option(option.clone());
     }
     builder.requires_allow_unfree = analysis.requires_allow_unfree;
+    for command in &analysis.dev_server_commands {
+        builder.add_dev_server(command.clone());
+    }
     for command in &analysis.lint_commands {
         builder.add_lint(command.clone());
     }
@@ -760,8 +877,14 @@ fn builder_from_analysis(analysis: &Analysis) -> Builder {
     for command in &analysis.test_commands {
         builder.add_test(command.clone());
     }
+    for command in &analysis.coverage_commands {
+        builder.add_coverage(command.clone());
+    }
     for requirement in &analysis.required_checks {
         builder.add_requirement(requirement.clone());
+    }
+    for check in &analysis.migration_checks {
+        builder.add_migration_check(check.clone());
     }
     for note in &analysis.notes {
         builder.add_note(note.clone());
@@ -829,16 +952,30 @@ fn load_workspace_config(root: &Path) -> Result<Option<WorkspaceConfig>> {
     Ok(load_explicit_config(root)?.and_then(|config| config.workspace))
 }
 
-fn configured_deploy_hosts(root: &Path) -> Result<Vec<String>> {
-    let hosts = load_explicit_config(root)?
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ConfiguredDeploySettings {
+    hosts: Vec<String>,
+    use_ssh_agent: bool,
+    ssh_agent_hosts: Vec<String>,
+}
+
+fn configured_deploy_settings(root: &Path) -> Result<ConfiguredDeploySettings> {
+    let deploy = load_explicit_config(root)?
         .and_then(|config| config.deploy)
-        .map(|deploy| deploy.hosts)
         .unwrap_or_default();
-    Ok(hosts
+    Ok(ConfiguredDeploySettings {
+        hosts: normalize_configured_hosts(deploy.hosts),
+        use_ssh_agent: deploy.use_ssh_agent,
+        ssh_agent_hosts: normalize_configured_hosts(deploy.ssh_agent_hosts),
+    })
+}
+
+fn normalize_configured_hosts(hosts: Vec<String>) -> Vec<String> {
+    hosts
         .into_iter()
         .map(|host| host.trim().to_string())
         .filter(|host| !host.is_empty())
-        .collect())
+        .collect()
 }
 
 fn configured_sandbox_paths(root: &Path) -> Result<ConfiguredSandboxPaths> {
@@ -1170,6 +1307,17 @@ fn prefix_requirement_subject(
     requirement
 }
 
+fn prefix_migration_check(mut check: MigrationCheck, relative: &Path) -> MigrationCheck {
+    check.status_command = prefix_workspace_command(relative, &check.status_command);
+    check.apply_command = prefix_workspace_command(relative, &check.apply_command);
+    check.subject = prefix_workspace_path(relative, &check.subject);
+    check
+}
+
+fn prefix_workspace_path(relative: &Path, path: &str) -> String {
+    display_relative_path(&relative.join(path))
+}
+
 fn ensure_workspace_versions_are_compatible(versions: &[DetectedVersion]) -> Result<()> {
     let mut by_runtime = BTreeMap::<RuntimeKind, Vec<&DetectedVersion>>::new();
     for version in versions {
@@ -1251,6 +1399,14 @@ fn merge_unique_requirements(
     target: &mut Vec<ProjectRequirement>,
     values: Vec<ProjectRequirement>,
 ) {
+    for value in values {
+        if !target.contains(&value) {
+            target.push(value);
+        }
+    }
+}
+
+fn merge_unique_migration_checks(target: &mut Vec<MigrationCheck>, values: Vec<MigrationCheck>) {
     for value in values {
         if !target.contains(&value) {
             target.push(value);
@@ -1527,100 +1683,20 @@ fn analyze_common_files(
     builder: &mut Builder,
     context: &ProjectContext,
 ) -> Result<()> {
-    if let Some(payload) = context.package_json() {
-        builder.add_marker("package.json");
-        builder.add_language(LanguageRequirement::JavaScript);
-        builder.add_package("nodejs");
-        let package_manager = payload
-            .get("packageManager")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        let package_dependencies = context
-            .dependencies("javascript")
-            .cloned()
-            .unwrap_or_default();
-        if package_dependencies.contains("react-native") {
-            builder.add_marker("react-native");
-        }
-        if package_dependencies.contains("expo") {
-            builder.add_marker("expo");
-        }
-        if package_manager.starts_with("pnpm@") || root.join("pnpm-lock.yaml").exists() {
-            builder.add_package("pnpm");
-        }
-        if package_manager.starts_with("yarn@") || root.join("yarn.lock").exists() {
-            builder.add_package("yarn");
-        }
-        if package_manager.starts_with("bun@")
-            || root.join("bun.lock").exists()
-            || root.join("bun.lockb").exists()
-        {
-            builder.add_package("bun");
-        }
-        let runner = if builder.packages.contains("pnpm") {
-            "pnpm"
-        } else if builder.packages.contains("yarn") {
-            "yarn"
-        } else if builder.packages.contains("bun") {
-            "bun run"
-        } else {
-            "npm run"
-        };
-        let exec_runner = if builder.packages.contains("pnpm") {
-            "pnpm exec"
-        } else if builder.packages.contains("yarn") {
-            "yarn"
-        } else if builder.packages.contains("bun") {
-            "bunx"
-        } else {
-            "npx"
-        };
-        if let Some(scripts) = payload
-            .get("scripts")
-            .and_then(serde_json::Value::as_object)
-        {
-            if scripts.contains_key("lint") {
-                builder.add_lint(format!("{runner} lint"));
-            }
-            if scripts.contains_key("typecheck") && !scripts.contains_key("lint") {
-                builder.add_lint(format!("{runner} typecheck"));
-            }
-            if scripts.contains_key("build") {
-                builder.add_build(format!("{runner} build"));
-            }
-            let mut discovered_test_script = false;
-            for (name, value) in scripts {
-                if (name == "test" || name.starts_with("test:"))
-                    && value
-                        .as_str()
-                        .map(|script| script_is_verification_ready(name, script))
-                        .unwrap_or(false)
-                {
-                    builder.add_test(format!("{runner} {name}"));
-                    discovered_test_script = true;
-                }
-            }
-            if !discovered_test_script {
-                for command in fallback_javascript_test_commands(&package_dependencies, exec_runner)
-                {
-                    builder.add_test(command);
-                }
-            }
-        } else {
-            for command in fallback_javascript_test_commands(&package_dependencies, exec_runner) {
-                builder.add_test(command);
-            }
-        }
-    }
+    javascript_heuristics::analyze(root, builder, context)?;
 
     let cargo_toml = root.join("Cargo.toml");
     if cargo_toml.exists() {
         builder.add_marker("Cargo.toml");
         builder.add_language(LanguageRequirement::Rust);
+        builder.add_package("cargo-llvm-cov");
         builder.add_build("cargo build --release");
         builder.add_lint("cargo fmt --check");
         builder.add_lint("cargo clippy --all-targets --all-features -- -D warnings");
         builder.add_test("cargo test");
+        builder.add_coverage(format!(
+            "cargo llvm-cov --workspace --all-features --fail-under-lines {MINIMUM_COVERAGE_PERCENT} --summary-only"
+        ));
     }
 
     if root.join("go.mod").exists() {
@@ -1637,79 +1713,9 @@ fn analyze_common_files(
         }
     }
 
-    if root.join("mix.exs").exists() {
-        let elixir_dependencies = context.dependencies("elixir").cloned().unwrap_or_default();
-        builder.add_marker("mix.exs");
-        builder.add_language(LanguageRequirement::Elixir);
-        if elixir_dependencies.contains("phoenix") {
-            builder.add_marker("phoenix");
-        }
-        builder.add_lint("mix format --check-formatted");
-        builder.add_lint("mix credo --strict");
-        builder.add_build("mix compile --warnings-as-errors");
-        builder.add_test("mix test");
-        if !elixir_dependencies.contains("credo") {
-            builder.add_requirement(ProjectRequirement {
-                kind: RequirementKind::Lint,
-                subject: "mix.exs".to_string(),
-                summary: "Elixir projects must include Credo and pass `mix credo --strict`."
-                    .to_string(),
-            });
-        }
-        if let Some(requirement) =
-            detect_phoenix_starter_page_requirement(root, &elixir_dependencies)?
-        {
-            builder.add_requirement(requirement);
-        }
-    }
-
-    if root.join("Gemfile").exists() || root.join("Bundlefile").exists() {
-        let ruby_dependencies = context.dependencies("ruby").cloned().unwrap_or_default();
-        builder.add_marker(if root.join("Gemfile").exists() {
-            "Gemfile"
-        } else {
-            "Bundlefile"
-        });
-        builder.add_language(LanguageRequirement::Ruby);
-        builder.add_package("bundler");
-        if ruby_dependencies.contains("rails") || root.join("bin/rails").exists() {
-            builder.add_marker("rails");
-        }
-        if root.join(".rubocop.yml").exists() {
-            builder.add_lint("bundle exec rubocop");
-        }
-        for command in detect_ruby_test_commands(root, Some(&ruby_dependencies))? {
-            builder.add_test(command);
-        }
-        if let Some(requirement) = detect_rails_starter_page_requirement(root, &ruby_dependencies)?
-        {
-            builder.add_requirement(requirement);
-        }
-    }
-
-    if let Some(payload) = context.composer_json() {
-        builder.add_marker("composer.json");
-        builder.add_language(LanguageRequirement::Php);
-        builder.add_package("composer");
-        if payload
-            .get("scripts")
-            .and_then(serde_json::Value::as_object)
-            .and_then(|scripts| scripts.get("test"))
-            .is_some()
-        {
-            builder.add_test("composer test");
-        } else {
-            let dependencies = context.dependencies("php").cloned().unwrap_or_default();
-            if dependencies.contains("pestphp/pest") {
-                builder.add_test("vendor/bin/pest");
-            } else if dependencies.contains("phpunit/phpunit")
-                || root.join("phpunit.xml").exists()
-                || root.join("phpunit.xml.dist").exists()
-            {
-                builder.add_test("vendor/bin/phpunit");
-            }
-        }
-    }
+    elixir_heuristics::analyze(root, builder, context)?;
+    ruby_heuristics::analyze(root, builder, context)?;
+    php_heuristics::analyze(root, builder, context)?;
 
     if root.join("pom.xml").exists()
         || root.join("build.gradle").exists()
@@ -1734,62 +1740,7 @@ fn analyze_common_files(
         }
     }
 
-    if root.join("requirements.txt").exists()
-        || root.join("pyproject.toml").exists()
-        || root.join("uv.lock").exists()
-        || root.join("poetry.lock").exists()
-    {
-        builder.add_language(LanguageRequirement::Python);
-        let python_dependencies = context.dependencies("python").cloned().unwrap_or_default();
-        let mut has_pytest_tooling =
-            root.join("pytest.ini").exists() || root.join("conftest.py").exists();
-        builder.add_marker(if root.join("pyproject.toml").exists() {
-            "pyproject.toml"
-        } else if root.join("requirements.txt").exists() {
-            "requirements.txt"
-        } else if root.join("uv.lock").exists() {
-            "uv.lock"
-        } else {
-            "poetry.lock"
-        });
-        builder.add_package("python3");
-        if let Some(value) = context.pyproject() {
-            let tool = value.get("tool").and_then(TomlValue::as_table);
-            if tool.and_then(|t| t.get("pytest")).is_some() {
-                has_pytest_tooling = true;
-            }
-            let dependencies = value
-                .get("project")
-                .and_then(|v| v.get("dependencies"))
-                .and_then(TomlValue::as_array)
-                .map(|deps| {
-                    deps.iter()
-                        .filter_map(TomlValue::as_str)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            if tool.and_then(|t| t.get("ruff")).is_some()
-                || dependencies
-                    .iter()
-                    .any(|dep| dep.to_lowercase().contains("ruff"))
-            {
-                builder.add_package("ruff");
-                builder.add_lint("ruff check .");
-            }
-        }
-        if has_pytest_tooling
-            || python_dependencies.contains("pytest")
-            || python_dependencies.contains("pytest-django")
-        {
-            builder.add_test("pytest");
-        } else if root.join("manage.py").exists() && python_dependencies.contains("django") {
-            builder.add_test("python manage.py test");
-        } else if root.join("tox.ini").exists() {
-            builder.add_test("tox");
-        } else if root.join("tests").is_dir() {
-            builder.add_test("python -m unittest discover");
-        }
-    }
+    python_heuristics::analyze(root, builder, context)?;
 
     let makefile = root.join("Makefile");
     if makefile.exists() {
@@ -1816,7 +1767,7 @@ fn analyze_common_files(
     } else if directory_has_direct_terraform_files(root)? {
         builder.add_marker("terraform");
         builder.add_package("opentofu");
-        builder.add_lint("opentofu fmt -check -recursive");
+        builder.add_lint("tofu fmt -check -recursive");
     }
 
     Ok(())
@@ -2826,6 +2777,74 @@ fn detect_rails_starter_page_requirement(
     }))
 }
 
+fn detect_elixir_coverage_requirement(root: &Path) -> Result<Option<ProjectRequirement>> {
+    let mix_exs = root.join("mix.exs");
+    let contents = fs::read_to_string(&mix_exs)
+        .with_context(|| format!("failed to read {}", mix_exs.display()))?;
+    let Some(config) = extract_elixir_test_coverage_config(&contents) else {
+        return Ok(None);
+    };
+
+    if elixir_coverage_summary_is_disabled(config) {
+        return Ok(Some(ProjectRequirement {
+            kind: RequirementKind::Coverage,
+            subject: "mix.exs#test_coverage".to_string(),
+            summary: format!(
+                "Elixir projects must keep `mix test --cover` coverage enforcement enabled with a summary threshold of at least {MINIMUM_COVERAGE_PERCENT}%."
+            ),
+        }));
+    }
+
+    let Some(threshold) = elixir_coverage_threshold(config) else {
+        return Ok(None);
+    };
+    if threshold >= f32::from(MINIMUM_COVERAGE_PERCENT) {
+        return Ok(None);
+    }
+
+    Ok(Some(ProjectRequirement {
+        kind: RequirementKind::Coverage,
+        subject: "mix.exs#test_coverage".to_string(),
+        summary: format!(
+            "Elixir projects must enforce at least {MINIMUM_COVERAGE_PERCENT}% test coverage; `mix.exs` configures {threshold:.1}%."
+        ),
+    }))
+}
+
+fn extract_elixir_test_coverage_config(contents: &str) -> Option<&str> {
+    let start = contents.find("test_coverage:")?;
+    let body = &contents[start..];
+    let open = body.find('[')?;
+    let mut depth = 0usize;
+    let mut end_offset = None;
+    for (index, ch) in body[open..].char_indices() {
+        match ch {
+            '[' => depth += 1,
+            ']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    end_offset = Some(open + index + ch.len_utf8());
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    end_offset.map(|end| &body[..end])
+}
+
+fn elixir_coverage_summary_is_disabled(config: &str) -> bool {
+    Regex::new(r#"summary\s*:\s*false\b"#)
+        .ok()
+        .is_some_and(|regex| regex.is_match(config))
+}
+
+fn elixir_coverage_threshold(config: &str) -> Option<f32> {
+    let regex = Regex::new(r#"threshold\s*:\s*(\d+(?:\.\d+)?)"#).ok()?;
+    let captures = regex.captures(config)?;
+    captures.get(1)?.as_str().parse::<f32>().ok()
+}
+
 fn phoenix_default_home_action(router_contents: &str) -> Option<&'static str> {
     let regex = Regex::new(r#"get\s+["']/["']\s*,\s*PageController\s*,\s*:(home|index)\b"#).ok()?;
     for line in router_contents.lines() {
@@ -2948,6 +2967,35 @@ fn fallback_javascript_test_commands(
     Vec::new()
 }
 
+fn detect_javascript_dev_server_command(
+    dependencies: &BTreeSet<String>,
+    scripts: &serde_json::Map<String, serde_json::Value>,
+    runner: &str,
+) -> Option<String> {
+    let dev_script = scripts.get("dev")?.as_str()?;
+    if script_is_placeholder(dev_script) {
+        return None;
+    }
+
+    let known_dev_server = [
+        "next",
+        "vite",
+        "nuxt",
+        "astro",
+        "@remix-run/dev",
+        "@sveltejs/kit",
+        "@angular/cli",
+    ]
+    .into_iter()
+    .any(|dependency| dependencies.contains(dependency));
+
+    if known_dev_server {
+        return Some(format!("{runner} dev"));
+    }
+
+    None
+}
+
 fn script_is_placeholder(script: &str) -> bool {
     let normalized = script.to_lowercase();
     normalized.contains("no test specified")
@@ -3024,6 +3072,10 @@ fn build_sandbox_plan(root: &Path, builder: &Builder) -> Result<SandboxPlan> {
         read_write_files.insert(path);
     }
 
+    for path in standard_temp_read_write_paths() {
+        insert_path_with_realpath(&mut read_write_dirs, path);
+    }
+
     for language in &builder.languages {
         for path in language.default_cache_dirs(&home) {
             read_write_dirs.insert(path);
@@ -3067,20 +3119,15 @@ fn build_sandbox_plan(root: &Path, builder: &Builder) -> Result<SandboxPlan> {
     ] {
         if let Ok(value) = std::env::var(key) {
             let path = PathBuf::from(value);
-            read_write_dirs.insert(path);
+            insert_path_with_realpath(&mut read_write_dirs, path);
         }
     }
 
-    if let Ok(sock) = std::env::var("SSH_AUTH_SOCK")
-        && let Some(parent) = Path::new(&sock).parent()
-    {
-        read_write_dirs.insert(parent.to_path_buf());
-    }
     if let Ok(address) = std::env::var("DBUS_SESSION_BUS_ADDRESS")
         && let Some(path) = address.strip_prefix("unix:path=")
         && let Some(parent) = Path::new(path).parent()
     {
-        read_write_dirs.insert(parent.to_path_buf());
+        insert_path_with_realpath(&mut read_write_dirs, parent.to_path_buf());
     }
 
     for path in configured_paths.read_write_files {
@@ -3097,6 +3144,8 @@ fn build_sandbox_plan(root: &Path, builder: &Builder) -> Result<SandboxPlan> {
     }
     let explicit_config = root.join(EXPLICIT_CONFIG_FILE);
     if explicit_config.is_file() {
+        read_write_files.remove(&explicit_config);
+        read_only_files.insert(explicit_config.clone());
         protected_write_files.insert(explicit_config);
     }
 
@@ -3140,6 +3189,22 @@ fn standard_device_read_write_paths() -> Vec<PathBuf> {
         PathBuf::from("/dev/stdout"),
         PathBuf::from("/dev/stderr"),
     ]
+}
+
+fn standard_temp_read_write_paths() -> Vec<PathBuf> {
+    vec![
+        PathBuf::from("/tmp"),
+        PathBuf::from("/private/tmp"),
+        PathBuf::from("/var/folders"),
+        PathBuf::from("/private/var/folders"),
+    ]
+}
+
+fn insert_path_with_realpath(paths: &mut BTreeSet<PathBuf>, path: PathBuf) {
+    paths.insert(path.clone());
+    if let Ok(real_path) = fs::canonicalize(&path) {
+        paths.insert(real_path);
+    }
 }
 
 fn referenced_instruction_paths(root: &Path) -> Result<Vec<PathBuf>> {
@@ -3212,6 +3277,14 @@ fn generic_agent_read_write_paths(home: &Path) -> Vec<PathBuf> {
 
 fn generic_agent_read_only_paths(home: &Path) -> Vec<PathBuf> {
     vec![
+        home.join(".agents"),
+        home.join(".profile"),
+        home.join(".bash_profile"),
+        home.join(".bash_login"),
+        home.join(".bashrc"),
+        home.join(".zprofile"),
+        home.join(".zshrc"),
+        home.join(".zshenv"),
         home.join(".gitconfig"),
         home.join(".gitignore"),
         home.join(".gitignore_global"),
@@ -3242,6 +3315,8 @@ fn macos_agent_read_only_paths(home: &Path) -> Vec<PathBuf> {
         PathBuf::from("/Library/Keychains/metadata.keychain-db"),
         PathBuf::from("/Library/Keychains"),
         PathBuf::from("/System/Library/Keychains"),
+        PathBuf::from("/var/select"),
+        PathBuf::from("/private/var/select"),
     ]
 }
 
@@ -3256,12 +3331,13 @@ fn linux_agent_read_only_paths(_home: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Analysis, Builder, EXPLICIT_CONFIG_FILE, LanguageRequirement, NO_COMMANDS_NOTE,
-        RepositoryMetadata, RequirementKind, RuntimeKind, SUPPORT_PACKAGES, SandboxPlan,
-        build_sandbox_plan, configured_sandbox_paths, expand_config_path_value,
-        fallback_javascript_test_commands, platform_agent_read_only_paths,
-        platform_agent_read_write_paths, referenced_instruction_paths, script_is_placeholder,
-        script_is_verification_ready, standard_device_read_write_paths,
+        Analysis, Builder, EXPLICIT_CONFIG_FILE, LanguageRequirement, MINIMUM_COVERAGE_PERCENT,
+        NO_COMMANDS_NOTE, RepositoryMetadata, RequirementKind, RuntimeKind, SUPPORT_PACKAGES,
+        SandboxPlan, build_sandbox_plan, configured_sandbox_paths, expand_config_path_value,
+        fallback_javascript_test_commands, insert_path_with_realpath,
+        platform_agent_read_only_paths, platform_agent_read_write_paths,
+        referenced_instruction_paths, script_is_placeholder, script_is_verification_ready,
+        standard_device_read_write_paths, standard_temp_read_write_paths,
     };
     use std::{collections::BTreeSet, fs, path::PathBuf};
     use tempfile::tempdir;
@@ -3272,6 +3348,7 @@ mod tests {
             root: PathBuf::from("/tmp/project"),
             markers: Vec::new(),
             manifests: Vec::new(),
+            install_directories: Vec::new(),
             detected_languages: Vec::new(),
             detected_versions: Vec::new(),
             language_hints: Vec::new(),
@@ -3287,10 +3364,15 @@ mod tests {
             nix_options: Vec::new(),
             requires_allow_unfree: false,
             deploy_hosts: Vec::new(),
+            deploy_use_ssh_agent: false,
+            deploy_ssh_agent_hosts: Vec::new(),
+            dev_server_commands: Vec::new(),
             lint_commands: Vec::new(),
             build_commands: Vec::new(),
             test_commands: Vec::new(),
+            coverage_commands: Vec::new(),
             required_checks: Vec::new(),
+            migration_checks: Vec::new(),
             notes: Vec::new(),
             repository: RepositoryMetadata::default(),
             sandbox_plan: SandboxPlan {
@@ -3340,6 +3422,32 @@ mod tests {
     }
 
     #[test]
+    fn nextjs_projects_add_dev_server_command() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{
+  "name": "web",
+  "dependencies": {
+    "next": "15.0.0"
+  },
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "lint": "next lint"
+  }
+}"#,
+        )
+        .unwrap();
+
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert_eq!(
+            analysis.dev_server_commands,
+            vec!["npm run dev".to_string()]
+        );
+    }
+
+    #[test]
     fn analysis_skips_debug_test_scripts() {
         let dir = tempdir().unwrap();
         fs::write(
@@ -3372,11 +3480,16 @@ mod tests {
         assert!(read_write.contains(&home.join(".npm")));
         assert!(read_write.contains(&PathBuf::from("/var/run")));
         assert!(read_only.contains(&home.join(".gitconfig")));
+        assert!(read_only.contains(&home.join(".agents")));
+        assert!(read_only.contains(&home.join(".profile")));
+        assert!(read_only.contains(&home.join(".zshrc")));
         assert!(read_only.contains(&home.join(".config/git")));
         assert!(read_only.contains(&home.join("Library/Preferences")));
         assert!(read_only.contains(&home.join("Library/Keychains/login.keychain-db")));
         assert!(read_only.contains(&home.join("Library/Keychains/metadata.keychain-db")));
         assert!(read_only.contains(&PathBuf::from("/Library/Keychains")));
+        assert!(read_only.contains(&PathBuf::from("/var/select")));
+        assert!(read_only.contains(&PathBuf::from("/private/var/select")));
     }
 
     #[test]
@@ -3417,6 +3530,34 @@ mod tests {
         let dir = tempdir().unwrap();
         let plan = build_sandbox_plan(dir.path(), &Builder::default()).unwrap();
         assert!(plan.read_write_files.contains(&PathBuf::from("/dev/null")));
+    }
+
+    #[test]
+    fn includes_tmp_in_default_read_write_paths() {
+        let temp_paths = standard_temp_read_write_paths();
+        assert!(temp_paths.contains(&PathBuf::from("/tmp")));
+        assert!(temp_paths.contains(&PathBuf::from("/private/tmp")));
+        assert!(temp_paths.contains(&PathBuf::from("/var/folders")));
+        assert!(temp_paths.contains(&PathBuf::from("/private/var/folders")));
+
+        let dir = tempdir().unwrap();
+        let plan = build_sandbox_plan(dir.path(), &Builder::default()).unwrap();
+        assert!(plan.read_write_dirs.contains(&PathBuf::from("/tmp")));
+    }
+
+    #[test]
+    fn insert_path_with_realpath_keeps_both_aliases() {
+        let dir = tempdir().unwrap();
+        let real_dir = dir.path().join("real");
+        fs::create_dir_all(&real_dir).unwrap();
+        let alias_dir = dir.path().join("alias");
+        std::os::unix::fs::symlink(&real_dir, &alias_dir).unwrap();
+
+        let mut paths = BTreeSet::new();
+        insert_path_with_realpath(&mut paths, alias_dir.clone());
+
+        assert!(paths.contains(&alias_dir));
+        assert!(paths.contains(&fs::canonicalize(&alias_dir).unwrap()));
     }
 
     #[test]
@@ -3483,6 +3624,12 @@ read_write_dirs = ["runtime-cache"]
         fs::write(dir.path().join(EXPLICIT_CONFIG_FILE), "[sandbox]\n").unwrap();
 
         let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert!(
+            analysis
+                .sandbox_plan
+                .read_only_files
+                .contains(&dir.path().join(EXPLICIT_CONFIG_FILE))
+        );
         assert!(
             analysis
                 .sandbox_plan
@@ -3638,6 +3785,11 @@ read_write_dirs = ["runtime-cache"]
                 .test_commands
                 .contains(&"cd 'apps/mobile' && yarn test".to_string())
         );
+        assert!(
+            analysis
+                .install_directories
+                .contains(&"apps/mobile/node_modules".to_string())
+        );
         assert!(analysis.notes.iter().any(|note| {
             note == "Workspace: merged 2 leaf projects into the root analysis (2 auto-discovered, 0 configured)."
         }));
@@ -3654,6 +3806,35 @@ read_write_dirs = ["runtime-cache"]
                 .any(|note| note.contains("apps/mobile (package.json)"))
         );
         assert!(!analysis.notes.iter().any(|note| note == NO_COMMANDS_NOTE));
+    }
+
+    #[test]
+    fn detects_package_install_directories_for_supported_package_managers() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"demo","scripts":{"test":"vitest run"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("mix.exs"),
+            "defmodule Demo.MixProject do end\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("composer.json"),
+            r#"{"name":"demo/app","require-dev":{"phpunit/phpunit":"^11.0"}}"#,
+        )
+        .unwrap();
+
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert!(
+            analysis
+                .install_directories
+                .contains(&"node_modules".to_string())
+        );
+        assert!(analysis.install_directories.contains(&"deps".to_string()));
+        assert!(analysis.install_directories.contains(&"vendor".to_string()));
     }
 
     #[test]
@@ -3732,7 +3913,35 @@ hosts = ["prod.example.com", "ssh://git@deploy.example.com:2222/app"]
                 "ssh://git@deploy.example.com:2222/app".to_string()
             ]
         );
+        assert!(!analysis.deploy_use_ssh_agent);
+        assert!(analysis.deploy_ssh_agent_hosts.is_empty());
         assert!(!analysis.markers.contains(&"workspace".to_string()));
+    }
+
+    #[test]
+    fn deploy_ssh_agent_settings_load_from_explicit_toml() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("mix.exs"),
+            "defmodule Demo.MixProject do end\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join(EXPLICIT_CONFIG_FILE),
+            r#"[deploy]
+hosts = ["prod.example.com"]
+use_ssh_agent = true
+ssh_agent_hosts = ["prod.example.com", "github.com"]
+"#,
+        )
+        .unwrap();
+
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert!(analysis.deploy_use_ssh_agent);
+        assert_eq!(
+            analysis.deploy_ssh_agent_hosts,
+            vec!["prod.example.com".to_string(), "github.com".to_string()]
+        );
     }
 
     #[test]
@@ -3780,12 +3989,36 @@ hosts = ["prod.example.com"]
         assert!(
             analysis
                 .lint_commands
-                .contains(&"cd 'infra/networking' && opentofu fmt -check -recursive".to_string())
+                .contains(&"cd 'infra/networking' && tofu fmt -check -recursive".to_string())
         );
     }
 
     #[test]
-    fn elixir_projects_add_credo_lint_and_requirement_when_missing() {
+    fn rust_projects_add_coverage_command_and_package() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2021"
+"#,
+        )
+        .unwrap();
+
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert!(analysis.packages.contains(&"cargo-llvm-cov".to_string()));
+        assert!(
+            analysis
+                .coverage_commands
+                .contains(&format!(
+                    "cargo llvm-cov --workspace --all-features --fail-under-lines {MINIMUM_COVERAGE_PERCENT} --summary-only"
+                ))
+        );
+    }
+
+    #[test]
+    fn elixir_projects_add_credo_and_coverage_commands_when_missing() {
         let dir = tempdir().unwrap();
         fs::write(
             dir.path().join("mix.exs"),
@@ -3811,13 +4044,18 @@ end
                 .lint_commands
                 .contains(&"mix credo --strict".to_string())
         );
+        assert!(
+            analysis
+                .coverage_commands
+                .contains(&"mix test --cover".to_string())
+        );
         assert_eq!(analysis.required_checks.len(), 1);
         assert_eq!(analysis.required_checks[0].subject, "mix.exs");
         assert!(analysis.required_checks[0].summary.contains("Credo"));
     }
 
     #[test]
-    fn elixir_projects_with_credo_clear_requirement() {
+    fn elixir_projects_with_credo_clear_lint_requirement() {
         let dir = tempdir().unwrap();
         fs::write(
             dir.path().join("mix.exs"),
@@ -3844,7 +4082,122 @@ end
                 .lint_commands
                 .contains(&"mix credo --strict".to_string())
         );
+        assert!(
+            analysis
+                .coverage_commands
+                .contains(&"mix test --cover".to_string())
+        );
         assert!(analysis.required_checks.is_empty());
+    }
+
+    #[test]
+    fn elixir_projects_require_coverage_threshold_when_summary_is_disabled() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("mix.exs"),
+            r#"defmodule Demo.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :demo,
+      version: "0.1.0",
+      elixir: "~> 1.15",
+      test_coverage: [summary: false]
+    ]
+  end
+
+  defp deps do
+    [
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
+    ]
+  end
+end
+"#,
+        )
+        .unwrap();
+
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        let requirement = analysis
+            .required_checks
+            .iter()
+            .find(|requirement| requirement.kind == RequirementKind::Coverage)
+            .expect("expected coverage requirement");
+        assert_eq!(requirement.subject, "mix.exs#test_coverage");
+        assert!(requirement.summary.contains("mix test --cover"));
+    }
+
+    #[test]
+    fn elixir_projects_require_coverage_threshold_when_below_minimum() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("mix.exs"),
+            r#"defmodule Demo.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :demo,
+      version: "0.1.0",
+      elixir: "~> 1.15",
+      test_coverage: [summary: [threshold: 75]]
+    ]
+  end
+
+  defp deps do
+    [
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
+    ]
+  end
+end
+"#,
+        )
+        .unwrap();
+
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        let requirement = analysis
+            .required_checks
+            .iter()
+            .find(|requirement| requirement.kind == RequirementKind::Coverage)
+            .expect("expected coverage requirement");
+        assert!(requirement.summary.contains("80%"));
+        assert!(requirement.summary.contains("75.0%"));
+    }
+
+    #[test]
+    fn elixir_projects_accept_default_or_stronger_coverage_thresholds() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("mix.exs"),
+            r#"defmodule Demo.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :demo,
+      version: "0.1.0",
+      elixir: "~> 1.15",
+      test_coverage: [summary: [threshold: 85]]
+    ]
+  end
+
+  defp deps do
+    [
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
+    ]
+  end
+end
+"#,
+        )
+        .unwrap();
+
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert!(
+            !analysis
+                .required_checks
+                .iter()
+                .any(|requirement| requirement.kind == RequirementKind::Coverage)
+        );
     }
 
     #[test]
@@ -3910,6 +4263,10 @@ end
                 .contains("Phoenix projects must replace")
         );
         assert!(analysis.markers.contains(&"phoenix".to_string()));
+        assert_eq!(
+            analysis.dev_server_commands,
+            vec!["mix phx.server".to_string()]
+        );
     }
 
     #[test]
@@ -3962,6 +4319,10 @@ end
                 .iter()
                 .any(|requirement| requirement.kind == RequirementKind::Starter)
         );
+        assert_eq!(
+            analysis.dev_server_commands,
+            vec!["mix phx.server".to_string()]
+        );
     }
 
     #[test]
@@ -3994,6 +4355,10 @@ end
         assert_eq!(requirement.subject, "config/routes.rb");
         assert!(requirement.summary.contains("real root route"));
         assert!(analysis.markers.contains(&"rails".to_string()));
+        assert_eq!(
+            analysis.dev_server_commands,
+            vec!["bin/rails server".to_string()]
+        );
     }
 
     #[test]
@@ -4023,6 +4388,10 @@ end
                 .required_checks
                 .iter()
                 .any(|requirement| requirement.kind == RequirementKind::Starter)
+        );
+        assert_eq!(
+            analysis.dev_server_commands,
+            vec!["bin/rails server".to_string()]
         );
     }
 

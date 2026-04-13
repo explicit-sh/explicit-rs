@@ -235,6 +235,7 @@ pub fn launch_live_agent(
         root,
         analysis,
         runtime::LaunchShellOptions {
+            agent: Some(agent),
             command: Some(&command),
             block_network,
             no_services,
@@ -283,6 +284,7 @@ pub fn launch_observed_agent(
         root,
         analysis,
         runtime::LaunchShellOptions {
+            agent: Some(options.agent),
             command: Some(&options.command),
             block_network: options.block_network,
             no_services: options.no_services,
