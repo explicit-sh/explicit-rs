@@ -1195,6 +1195,7 @@ fn classify_workspace_directory(dir: &Path) -> Result<DirectoryClassification> {
     }
 
     for (marker, reason) in [
+        ("Package.swift", "Package.swift"),
         ("mix.exs", "mix.exs"),
         ("go.mod", "go.mod"),
         ("pyproject.toml", "pyproject.toml"),
@@ -1697,6 +1698,22 @@ fn analyze_common_files(
         builder.add_coverage(format!(
             "cargo llvm-cov --workspace --all-features --fail-under-lines {MINIMUM_COVERAGE_PERCENT} --summary-only"
         ));
+    }
+
+    let package_swift = root.join("Package.swift");
+    if package_swift.is_file() {
+        builder.add_marker("Package.swift");
+        builder.add_package("swift");
+        builder.add_build("swift build");
+        builder.add_test("swift test");
+        if package_swift_declares_macos_app(&package_swift)? {
+            builder.add_note(
+                "Detected a SwiftPM macOS app; adding the Swift toolchain plus macOS app install/build access. Xcode and Command Line Tools stay host-level dependencies.",
+            );
+        } else {
+            builder
+                .add_note("Detected a Swift Package Manager project; adding the Swift toolchain.");
+        }
     }
 
     if root.join("go.mod").exists() {
@@ -3082,6 +3099,23 @@ fn build_sandbox_plan(root: &Path, builder: &Builder) -> Result<SandboxPlan> {
         }
     }
 
+    if builder.markers.contains("Package.swift") {
+        for path in macos_swift_read_write_paths(&home) {
+            if path.is_file() {
+                read_write_files.insert(path);
+            } else {
+                insert_path_with_realpath(&mut read_write_dirs, path);
+            }
+        }
+        for path in macos_swift_read_only_paths() {
+            if path.is_file() {
+                read_only_files.insert(path);
+            } else {
+                read_only_dirs.insert(path);
+            }
+        }
+    }
+
     for system_dir in [
         PathBuf::from("/nix"),
         PathBuf::from("/bin"),
@@ -3093,7 +3127,25 @@ fn build_sandbox_plan(root: &Path, builder: &Builder) -> Result<SandboxPlan> {
         read_only_dirs.insert(system_dir);
     }
 
-    for command in ["bash", "sh", "env", "git", "devenv", "codex", "claude"] {
+    let mut host_commands = vec!["bash", "sh", "env", "git", "devenv", "codex", "claude"];
+    if builder.markers.contains("Package.swift") {
+        host_commands.extend([
+            "swift",
+            "xcrun",
+            "xcodebuild",
+            "open",
+            "osascript",
+            "hdiutil",
+            "installer",
+            "pkgutil",
+            "ditto",
+            "codesign",
+            "spctl",
+            "mas",
+        ]);
+    }
+
+    for command in host_commands {
         for path in host_command_paths(command) {
             if let Some(parent) = path.parent() {
                 read_only_dirs.insert(parent.to_path_buf());
@@ -3198,6 +3250,47 @@ fn standard_temp_read_write_paths() -> Vec<PathBuf> {
         PathBuf::from("/var/folders"),
         PathBuf::from("/private/var/folders"),
     ]
+}
+
+fn macos_swift_read_write_paths(home: &Path) -> Vec<PathBuf> {
+    vec![
+        home.join("Applications"),
+        home.join("Downloads"),
+        home.join("Library/Caches/Homebrew"),
+        home.join("Library/Caches/org.swift.swiftpm"),
+        home.join("Library/org.swift.swiftpm"),
+        home.join("Library/Developer"),
+    ]
+}
+
+fn macos_swift_read_only_paths() -> Vec<PathBuf> {
+    let mut paths = vec![
+        PathBuf::from("/Applications"),
+        PathBuf::from("/Library/Developer"),
+        PathBuf::from("/Library/Frameworks"),
+    ];
+    if let Some(developer_dir) = std::process::Command::new("xcode-select")
+        .arg("-p")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|stdout| stdout.trim().to_string())
+        .filter(|stdout| !stdout.is_empty())
+    {
+        paths.push(PathBuf::from(developer_dir));
+    }
+    paths
+}
+
+fn package_swift_declares_macos_app(path: &Path) -> Result<bool> {
+    let contents =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let normalized = contents.replace(char::is_whitespace, "");
+    Ok(normalized.contains("platforms:[.macOS(")
+        || normalized.contains("platforms:[.macos(")
+        || normalized.contains("importSwiftUI")
+        || normalized.contains("importAppKit"))
 }
 
 fn insert_path_with_realpath(paths: &mut BTreeSet<PathBuf>, path: PathBuf) {
@@ -3546,6 +3639,45 @@ mod tests {
     }
 
     #[test]
+    fn swiftpm_projects_gain_macos_app_access_paths() {
+        let home = dirs::home_dir().expect("expected home dir");
+        let applications = home.join("Applications");
+        fs::create_dir_all(&applications).unwrap();
+
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("Sources")).unwrap();
+        fs::write(
+            dir.path().join("Package.swift"),
+            r#"// swift-tools-version: 6.0
+import PackageDescription
+
+let package = Package(
+    name: "Demo",
+    platforms: [.macOS(.v14)],
+    products: [.executable(name: "Demo", targets: ["Demo"])],
+    targets: [.executableTarget(name: "Demo", path: "Sources")]
+)
+"#,
+        )
+        .unwrap();
+
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert!(analysis.packages.contains(&"swift".to_string()));
+        assert!(
+            analysis
+                .notes
+                .iter()
+                .any(|note| note.contains("SwiftPM macOS app"))
+        );
+        assert!(
+            analysis
+                .sandbox_plan
+                .read_write_dirs
+                .contains(&applications)
+        );
+    }
+
+    #[test]
     fn insert_path_with_realpath_keeps_both_aliases() {
         let dir = tempdir().unwrap();
         let real_dir = dir.path().join("real");
@@ -3806,6 +3938,51 @@ read_write_dirs = ["runtime-cache"]
                 .any(|note| note.contains("apps/mobile (package.json)"))
         );
         assert!(!analysis.notes.iter().any(|note| note == NO_COMMANDS_NOTE));
+    }
+
+    #[test]
+    fn auto_discovers_swiftpm_workspace_members() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        let app = dir.path().join("apps/macos-client");
+        fs::create_dir_all(app.join("Sources")).unwrap();
+        fs::write(
+            app.join("Package.swift"),
+            r#"// swift-tools-version: 6.0
+import PackageDescription
+
+let package = Package(
+    name: "MacClient",
+    platforms: [.macOS(.v14)],
+    products: [
+        .executable(name: "MacClient", targets: ["MacClient"])
+    ],
+    targets: [
+        .executableTarget(name: "MacClient", path: "Sources")
+    ]
+)
+"#,
+        )
+        .unwrap();
+
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert!(
+            analysis
+                .build_commands
+                .contains(&"cd 'apps/macos-client' && swift build".to_string())
+        );
+        assert!(
+            analysis
+                .test_commands
+                .contains(&"cd 'apps/macos-client' && swift test".to_string())
+        );
+        assert!(analysis.packages.contains(&"swift".to_string()));
+        assert!(
+            analysis
+                .notes
+                .iter()
+                .any(|note| note.contains("apps/macos-client (Package.swift)"))
+        );
     }
 
     #[test]
