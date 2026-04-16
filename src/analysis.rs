@@ -1704,8 +1704,8 @@ fn analyze_common_files(
     if package_swift.is_file() {
         builder.add_marker("Package.swift");
         builder.add_package("swift");
-        builder.add_build("swift build");
-        builder.add_test("swift test");
+        builder.add_build("swift build --disable-sandbox");
+        builder.add_test("swift test --disable-sandbox");
         if package_swift_declares_macos_app(&package_swift)? {
             builder.add_note(
                 "Detected a SwiftPM macOS app; adding the Swift toolchain plus macOS app install/build access. Xcode and Command Line Tools stay host-level dependencies.",
@@ -3063,6 +3063,9 @@ fn build_sandbox_plan(root: &Path, builder: &Builder) -> Result<SandboxPlan> {
     read_write_dirs.insert(root.join(".claude"));
     read_write_dirs.insert(home.join(".codex"));
     read_write_dirs.insert(home.join(".claude"));
+    if let Some(parent) = root.parent() {
+        insert_path_with_realpath(&mut read_only_dirs, parent.to_path_buf());
+    }
     for path in platform_agent_read_write_paths(&home) {
         if path.is_file() {
             read_write_files.insert(path);
@@ -3127,7 +3130,9 @@ fn build_sandbox_plan(root: &Path, builder: &Builder) -> Result<SandboxPlan> {
         read_only_dirs.insert(system_dir);
     }
 
-    let mut host_commands = vec!["bash", "sh", "env", "git", "devenv", "codex", "claude"];
+    let mut host_commands = vec![
+        "bash", "sh", "env", "git", "devenv", "codex", "claude", "gemini",
+    ];
     if builder.markers.contains("Package.swift") {
         host_commands.extend([
             "swift",
@@ -3347,19 +3352,23 @@ fn platform_agent_read_only_paths(home: &Path) -> Vec<PathBuf> {
 
 fn generic_agent_read_write_paths(home: &Path) -> Vec<PathBuf> {
     vec![
+        home.join(".gemini"),
         home.join(".config/claude"),
         home.join(".config/claude-code"),
         home.join(".config/Anthropic"),
         home.join(".config/codex"),
+        home.join(".config/gemini"),
         home.join(".cache/claude"),
         home.join(".cache/claude-code"),
         home.join(".cache/Anthropic"),
         home.join(".cache/codex"),
+        home.join(".cache/gemini"),
         home.join(".cache/nix"),
         home.join(".local/share/claude"),
         home.join(".local/share/claude-code"),
         home.join(".local/share/Anthropic"),
         home.join(".local/share/codex"),
+        home.join(".local/share/gemini"),
         home.join(".npm"),
         home.join(".pnpm-store"),
         home.join(".bun"),
@@ -3387,7 +3396,6 @@ fn generic_agent_read_only_paths(home: &Path) -> Vec<PathBuf> {
 
 fn macos_agent_read_write_paths(home: &Path) -> Vec<PathBuf> {
     vec![
-        home.join("Library/Keychains"),
         home.join("Library/Application Support/Anthropic"),
         home.join("Library/Application Support/Claude"),
         home.join("Library/Application Support/claude-code"),
@@ -3401,11 +3409,7 @@ fn macos_agent_read_write_paths(home: &Path) -> Vec<PathBuf> {
 
 fn macos_agent_read_only_paths(home: &Path) -> Vec<PathBuf> {
     vec![
-        home.join("Library/Keychains/login.keychain-db"),
-        home.join("Library/Keychains/metadata.keychain-db"),
         home.join("Library/Preferences"),
-        PathBuf::from("/Library/Keychains/login.keychain-db"),
-        PathBuf::from("/Library/Keychains/metadata.keychain-db"),
         PathBuf::from("/Library/Keychains"),
         PathBuf::from("/System/Library/Keychains"),
         PathBuf::from("/var/select"),
@@ -3565,11 +3569,14 @@ mod tests {
         let home = PathBuf::from("/Users/tester");
         let read_write = platform_agent_read_write_paths(&home);
         let read_only = platform_agent_read_only_paths(&home);
-        assert!(read_write.contains(&home.join("Library/Keychains")));
         assert!(read_write.contains(&home.join(".config/codex")));
+        assert!(read_write.contains(&home.join(".gemini")));
+        assert!(read_write.contains(&home.join(".config/gemini")));
         assert!(read_write.contains(&home.join(".cache/codex")));
+        assert!(read_write.contains(&home.join(".cache/gemini")));
         assert!(read_write.contains(&home.join(".cache/nix")));
         assert!(read_write.contains(&home.join(".local/share/codex")));
+        assert!(read_write.contains(&home.join(".local/share/gemini")));
         assert!(read_write.contains(&home.join(".npm")));
         assert!(read_write.contains(&PathBuf::from("/var/run")));
         assert!(read_only.contains(&home.join(".gitconfig")));
@@ -3578,8 +3585,6 @@ mod tests {
         assert!(read_only.contains(&home.join(".zshrc")));
         assert!(read_only.contains(&home.join(".config/git")));
         assert!(read_only.contains(&home.join("Library/Preferences")));
-        assert!(read_only.contains(&home.join("Library/Keychains/login.keychain-db")));
-        assert!(read_only.contains(&home.join("Library/Keychains/metadata.keychain-db")));
         assert!(read_only.contains(&PathBuf::from("/Library/Keychains")));
         assert!(read_only.contains(&PathBuf::from("/var/select")));
         assert!(read_only.contains(&PathBuf::from("/private/var/select")));
@@ -3636,6 +3641,16 @@ mod tests {
         let dir = tempdir().unwrap();
         let plan = build_sandbox_plan(dir.path(), &Builder::default()).unwrap();
         assert!(plan.read_write_dirs.contains(&PathBuf::from("/tmp")));
+    }
+
+    #[test]
+    fn sandbox_plan_includes_repo_parent_for_sibling_discovery() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+
+        let plan = build_sandbox_plan(&repo, &Builder::default()).unwrap();
+        assert!(plan.read_only_dirs.contains(&dir.path().to_path_buf()));
     }
 
     #[test]
@@ -3969,12 +3984,12 @@ let package = Package(
         assert!(
             analysis
                 .build_commands
-                .contains(&"cd 'apps/macos-client' && swift build".to_string())
+                .contains(&"cd 'apps/macos-client' && swift build --disable-sandbox".to_string())
         );
         assert!(
             analysis
                 .test_commands
-                .contains(&"cd 'apps/macos-client' && swift test".to_string())
+                .contains(&"cd 'apps/macos-client' && swift test --disable-sandbox".to_string())
         );
         assert!(analysis.packages.contains(&"swift".to_string()));
         assert!(

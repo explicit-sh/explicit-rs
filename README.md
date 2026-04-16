@@ -50,6 +50,7 @@ explicit doctor
 explicit verify
 explicit shell
 explicit observe
+explicit github-app
 explicit observe codex
 explicit observe list
 explicit observe report --latest
@@ -66,6 +67,7 @@ What each command does:
 - `verify`: refreshes local managed devenv inputs when needed, then runs the detected lint, build, test, workspace, and repository policy checks with short failure summaries
 - `shell`: realizes the `devenv` environment and launches a sandboxed shell for agents or manual use
 - `observe`: attaches to a live agent run in the current project, or falls back to the latest saved report when no live socket exists
+- `github-app`: prints GitHub App creation and XDG config instructions for sandboxed GitHub access
 - `observe codex`: launches Codex, then ingests the new Codex session JSONL into a run-scoped SQLite database
 - `observe list`: lists observed runs under the current project
 - `observe report`: prints a readable report for an observed run
@@ -83,6 +85,7 @@ cargo run -- doctor
 cargo run -- verify
 cargo run -- shell
 cargo run -- observe
+cargo run -- github-app
 cargo run -- observe codex
 cargo run -- observe list
 cargo run -- observe report --latest
@@ -112,6 +115,7 @@ devenv shell
 explicit apply
 explicit doctor
 explicit verify
+explicit github-app
 explicit shell --command codex
 explicit observe
 explicit observe codex
@@ -155,6 +159,54 @@ cargo run -- shell --command 'pwd; command -v cargo; cargo --version'
 `explicit codex ...` and `explicit claude ...` pass everything after the subcommand directly to the agent binary. If you need sandbox-specific controls such as `--root`, `--block-network`, or `--no-services`, use `explicit shell --command ...` instead.
 
 `explicit shell`, `explicit codex`, `explicit claude`, and the observed agent variants also accept `--dangerously-use-end-of-life-versions` if you intentionally need to keep working with a runtime that the embedded `endoflife.date` snapshot marks as unsupported.
+
+## GitHub App Auth
+
+`explicit` can mint short-lived GitHub App installation tokens for sandboxed agents automatically.
+
+Run:
+
+```bash
+explicit github-app
+```
+
+This prints:
+
+- where to create the app in GitHub
+- which permissions to start with
+- which XDG config path `explicit` reads
+- example config
+
+Config lives in the user XDG config path, not in the repository:
+
+- `$XDG_CONFIG_HOME/explicit/config.toml`
+- fallback: `~/.config/explicit/config.toml`
+
+If that file contains a `[github_app]` section, `explicit` uses it by default for agent launches. No repo-local `explicit.toml` setting is needed.
+
+Example:
+
+```toml
+[github_app]
+app_id = 123456
+private_key_file = "github-app.pem"
+
+# optional
+installation_id = 7890123
+base_url = "https://api.github.com"
+extra_repositories = ["my-org/shared-submodule"]
+```
+
+Notes:
+
+- `private_key_file` may be absolute, `~/...`, or relative to the XDG config directory
+- if `installation_id` is omitted, `explicit` looks it up from the current repo GitHub remote
+- minted tokens are short-lived
+- tokens are injected into sandbox env as `GH_TOKEN` and `GITHUB_TOKEN`
+- tokens are not written into project config files or `.nono/runtime/shell-env.json`
+- repository restriction is based on current repo plus same-owner GitHub submodules and any `extra_repositories`
+
+Set `enabled = false` under `[github_app]` to keep the config file present but disable minting.
 
 ## Observability
 
@@ -323,6 +375,30 @@ ssh_agent_hosts = ["deploy-alias", "github.com"]
 Plain SSH aliases from `~/.ssh/config` or `~/.ssh/known_hosts` are valid here too. When deploy hosts are configured, `explicit shell`, `explicit codex`, and `explicit claude` create a project-scoped `.nono/runtime/known_hosts` file from matching entries in your local `~/.ssh/known_hosts`, plus a project-scoped `.nono/runtime/ssh_config` file for opted-in aliases resolved through `ssh -G`. `explicit` also folds in SSH-style Git remote hosts such as `git@github.com:owner/repo.git`, and if a host is still missing locally it attempts `ssh-keyscan` into the project-scoped `known_hosts` file instead of touching the real `~/.ssh/known_hosts`. That runtime `known_hosts` file stays writable inside the sandbox so agents can append safe project-local host keys without widening access to your personal SSH files.
 
 If you set `ssh_agent_hosts`, `explicit` writes `IdentityAgent <host SSH_AUTH_SOCK>` for those hosts into the generated project-scoped `ssh_config`. If you set `use_ssh_agent = true`, it does that for every configured deploy host plus any SSH-style Git remote hosts discovered from the repository. The host agent socket itself is allowed into the sandbox only when one of those options is enabled.
+
+You can also opt into parallel agent routing. When the current project root already has a live `.explicit-observe.sock`, `explicit codex`, `explicit claude`, `explicit observe codex`, and `explicit observe claude` can automatically create or reuse a separate Git worktree and launch the next agent there instead of failing on the shared socket:
+
+```toml
+[parallel]
+enabled = true
+worktree_root = "../.explicit-worktrees/stuffix"
+base_branch = "main"
+branch_prefix = "agents"
+
+[parallel.env]
+DATABASE_URL = "ecto://postgres:postgres@127.0.0.1:5432/stuffix_dev_{slot}"
+PGDATABASE = "stuffix_dev_{slot}"
+MIX_TEST_PARTITION = "{slot}"
+STUFFIX_INSTANCE = "{session}"
+```
+
+Parallel routing reads these environment variables when present:
+
+- `EXPLICIT_PARALLEL_SESSION`: preferred session or issue slug, used for the worktree path and branch name
+- `EXPLICIT_AGENT_ISSUE`: fallback issue slug if `EXPLICIT_PARALLEL_SESSION` is unset
+- `EXPLICIT_PARALLEL_SLOT`: optional numeric slot override used by `{slot}`
+
+If neither session variable is set, `explicit` allocates `slot-02`, `slot-03`, and so on. Each auto-created worktree gets a branch such as `agents/issue-123-fix-login` plus a `.nono/parallel-session.json` file that keeps the assigned slot stable on reuse. The `{slot}`, `{session}`, `{branch}`, and `{worktree}` placeholders in `[parallel.env]` are expanded before the sandbox launches, which makes it practical to isolate development and test databases per concurrent agent while keeping one shared Postgres service process.
 
 `explicit.toml` itself is always treated as read-only inside the sandbox, and on macOS it also gets an explicit deny-write rule so an agent cannot silently expand its own allowlist while it is running.
 

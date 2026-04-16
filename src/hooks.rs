@@ -237,7 +237,7 @@ fn shell_quote(path: &Path) -> String {
 
 fn write_claude_settings(root: &Path) -> Result<()> {
     let dir = root.join(".claude");
-    fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    ensure_config_dir(&dir)?;
     let path = dir.join("settings.local.json");
     let mut payload = read_json_object_or_empty(&path)?;
     let hooks = payload
@@ -257,13 +257,31 @@ fn write_claude_settings(root: &Path) -> Result<()> {
 
 fn write_codex_hooks(root: &Path) -> Result<()> {
     let dir = root.join(".codex");
-    fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    ensure_config_dir(&dir)?;
     let path = dir.join("hooks.json");
     let mut payload = read_json_object_or_empty(&path)?;
-    let object = payload
+    let root_object = payload
         .as_object_mut()
         .context("codex hooks root is not a JSON object")?;
-    object.insert(
+    let legacy_keys = root_object
+        .keys()
+        .filter(|key| key.as_str() != "hooks")
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut legacy_entries = Vec::new();
+    for key in legacy_keys {
+        if let Some(value) = root_object.remove(&key) {
+            legacy_entries.push((key, value));
+        }
+    }
+    let hooks = root_object.entry("hooks").or_insert_with(|| json!({}));
+    let hooks = hooks
+        .as_object_mut()
+        .context("codex hooks entry is not a JSON object")?;
+    for (key, value) in legacy_entries {
+        hooks.entry(key).or_insert(value);
+    }
+    hooks.insert(
         "Stop".to_string(),
         json!([{
             "hooks": [{
@@ -280,7 +298,7 @@ fn write_codex_hooks(root: &Path) -> Result<()> {
 
 fn write_codex_config(root: &Path) -> Result<()> {
     let dir = root.join(".codex");
-    fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    ensure_config_dir(&dir)?;
     let path = dir.join("config.toml");
     let mut payload = read_toml_table_or_empty(&path)?;
     let features = payload
@@ -301,6 +319,32 @@ fn write_if_changed(path: &Path, content: impl AsRef<[u8]>) -> Result<()> {
         return Ok(());
     }
     fs::write(path, content).with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn ensure_config_dir(path: &Path) -> Result<()> {
+    if let Ok(target) = fs::read_link(path) {
+        let resolved = if target.is_absolute() {
+            target
+        } else {
+            path.parent().unwrap_or_else(|| Path::new("/")).join(target)
+        };
+        if resolved == path {
+            fs::remove_file(path)
+                .with_context(|| format!("failed to remove {}", path.display()))?;
+        }
+    }
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                fs::remove_dir_all(path)
+                    .with_context(|| format!("failed to remove {}", path.display()))?;
+            } else {
+                fs::remove_file(path)
+                    .with_context(|| format!("failed to remove {}", path.display()))?;
+            }
+        }
+    }
+    fs::create_dir_all(path).with_context(|| format!("failed to create {}", path.display()))
 }
 
 fn hook_verify_command(root: &Path, stop_hook: bool) -> String {
@@ -678,11 +722,31 @@ mod tests {
         let payload: JsonValue =
             serde_json::from_str(&fs::read_to_string(root.join(".codex/hooks.json")).unwrap())
                 .unwrap();
-        assert!(payload.get("PreToolUse").is_some());
+        assert!(payload["hooks"].get("PreToolUse").is_some());
         assert_eq!(
-            payload["Stop"][0]["hooks"][0]["command"].as_str().unwrap(),
+            payload["hooks"]["Stop"][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap(),
             hook_verify_command(root, true)
         );
+    }
+
+    #[test]
+    fn repairs_self_linked_agent_config_dirs() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        symlink(root.join(".claude"), root.join(".claude")).unwrap();
+        symlink(root.join(".codex"), root.join(".codex")).unwrap();
+
+        write_claude_settings(root).unwrap();
+        write_codex_hooks(root).unwrap();
+        write_codex_config(root).unwrap();
+
+        assert!(root.join(".claude").is_dir());
+        assert!(root.join(".codex").is_dir());
+        assert!(root.join(".claude/settings.local.json").is_file());
+        assert!(root.join(".codex/hooks.json").is_file());
+        assert!(root.join(".codex/config.toml").is_file());
     }
 
     #[test]

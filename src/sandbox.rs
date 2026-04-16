@@ -7,8 +7,11 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use nono::{AccessMode, CapabilitySet, Sandbox};
 use serde::Deserialize;
+use serde_json::Value as JsonValue;
 
 use crate::analysis::SandboxPlan;
+
+const SECRET_ENV_FORWARDING_JSON: &str = "EXPLICIT_SECRET_ENV_FORWARDING_JSON";
 
 #[derive(Debug, Deserialize)]
 struct ShellSpec {
@@ -25,6 +28,8 @@ pub fn run_sandbox_exec(
     let env_map: BTreeMap<String, String> =
         serde_json::from_str(&fs::read_to_string(&env_file).context("failed to read env file")?)
             .context("failed to parse env file")?;
+    let mut env_map = env_map;
+    merge_secret_forwarded_env(&mut env_map)?;
     let plan: SandboxPlan =
         serde_json::from_str(&fs::read_to_string(&plan_file).context("failed to read plan file")?)
             .context("failed to parse plan file")?;
@@ -41,6 +46,24 @@ pub fn run_sandbox_exec(
         .args(&shell.args)
         .exec();
     bail!("failed to exec sandbox shell: {error}")
+}
+
+fn merge_secret_forwarded_env(env_map: &mut BTreeMap<String, String>) -> Result<()> {
+    let Ok(payload) = std::env::var(SECRET_ENV_FORWARDING_JSON) else {
+        return Ok(());
+    };
+    let parsed = serde_json::from_str::<JsonValue>(&payload)
+        .context("failed to parse secret env payload")?;
+    let object = parsed
+        .as_object()
+        .context("secret env payload is not a JSON object")?;
+    for (key, value) in object {
+        let Some(value) = value.as_str() else {
+            continue;
+        };
+        env_map.insert(key.clone(), value.to_string());
+    }
+    Ok(())
 }
 
 fn choose_shell(env_map: &BTreeMap<String, String>, command: &Option<String>) -> ShellSpec {

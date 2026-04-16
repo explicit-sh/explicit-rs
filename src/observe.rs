@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
+use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -27,6 +28,7 @@ pub struct ObservedAgentOptions<'a> {
     pub block_network: bool,
     pub no_services: bool,
     pub dangerously_use_end_of_life_versions: bool,
+    pub extra_env: BTreeMap<String, String>,
 }
 
 pub fn list_runs(root: &Path) -> Result<()> {
@@ -78,6 +80,14 @@ pub fn attach_live_run(root: &Path) -> Result<bool> {
         }
         thread::sleep(Duration::from_millis(750));
     }
+}
+
+pub fn live_socket_active(root: &Path) -> Result<bool> {
+    let socket_path = socket_path(root);
+    if !socket_path.exists() {
+        return Ok(false);
+    }
+    Ok(fetch_live_snapshot(&socket_path).is_ok())
 }
 
 pub fn print_report(root: &Path, run: Option<&str>, latest: bool) -> Result<()> {
@@ -225,6 +235,7 @@ pub fn launch_live_agent(
     block_network: bool,
     no_services: bool,
     dangerously_use_end_of_life_versions: bool,
+    extra_env: BTreeMap<String, String>,
 ) -> Result<ExitCode> {
     let server = LiveRunServer::start(
         root,
@@ -240,7 +251,7 @@ pub fn launch_live_agent(
             block_network,
             no_services,
             dangerously_use_end_of_life_versions,
-            extra_env: None,
+            extra_env: (!extra_env.is_empty()).then_some(&extra_env),
             transcript_path: None,
         },
     )?;
@@ -277,7 +288,8 @@ pub fn launch_observed_agent(
     } else {
         BTreeMap::new()
     };
-    let trace_env = env_trace::build_injection_env(&run.trace_log_path)?;
+    let mut trace_env = env_trace::build_injection_env(&run.trace_log_path)?;
+    trace_env.extend(options.extra_env.clone());
 
     server.update(|snapshot| snapshot.state = "running".to_string());
     let status = runtime::launch_shell(
@@ -289,7 +301,7 @@ pub fn launch_observed_agent(
             block_network: options.block_network,
             no_services: options.no_services,
             dangerously_use_end_of_life_versions: options.dangerously_use_end_of_life_versions,
-            extra_env: Some(&trace_env),
+            extra_env: (!trace_env.is_empty()).then_some(&trace_env),
             transcript_path: Some(&run.transcript_log_path),
         },
     )?;
@@ -690,7 +702,14 @@ fn configure_db(conn: &Connection) -> Result<()> {
 }
 
 fn socket_path(root: &Path) -> PathBuf {
-    root.join(".explicit-observe.sock")
+    let project_socket = root.join(".explicit-observe.sock");
+    if project_socket.as_os_str().len() < 96 {
+        return project_socket;
+    }
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    root.display().to_string().hash(&mut hasher);
+    std::env::temp_dir().join(format!("explicit-observe-{:016x}.sock", hasher.finish()))
 }
 
 fn prepare_socket_path(path: &Path) -> Result<()> {
@@ -1980,7 +1999,11 @@ mod tests {
     use crate::env_trace;
     use rusqlite::Connection;
     use serde_json::json;
-    use std::{fs, path::Path, process::ExitCode};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        process::ExitCode,
+    };
     use tempfile::tempdir;
 
     #[test]
@@ -2371,5 +2394,13 @@ int main(void) {
         prepare_socket_path(&socket).unwrap();
 
         assert!(!socket.exists());
+    }
+
+    #[test]
+    fn long_roots_use_temp_socket_path() {
+        let long_root = PathBuf::from(format!("/tmp/{}", "a".repeat(140)));
+        let socket = socket_path(&long_root);
+        assert!(socket.starts_with(std::env::temp_dir()));
+        assert!(socket.to_string_lossy().contains("explicit-observe-"));
     }
 }

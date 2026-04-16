@@ -135,6 +135,16 @@ pub fn prepare_verify_environment(root: &Path, analysis: &Analysis) -> Result<()
     Ok(())
 }
 
+pub fn session_start_note(root: &Path) -> Result<Option<String>> {
+    let Some(failure) = stop_hook_remote_sync_failure(root)? else {
+        return Ok(None);
+    };
+    Ok(Some(format!(
+        "explicit: {} Finish by pushing branch and creating or updating the pull request before stopping.",
+        failure.summary
+    )))
+}
+
 pub fn run_project_checks(
     root: &Path,
     analysis: &Analysis,
@@ -146,7 +156,7 @@ pub fn run_project_checks(
     let output_style = verify_output_style(mode);
     let checks = project_checks(analysis);
     let command_checks = analysis.migration_checks.len() + checks.len();
-    let total_checks = command_checks + project_policy_check_count(analysis);
+    let total_checks = command_checks + project_policy_check_count(analysis, mode);
     let displayed_checks = displayed_check_count(command_checks, total_checks);
 
     if total_checks == 0 {
@@ -163,7 +173,7 @@ pub fn run_project_checks(
         print_workspace_notes(analysis);
     }
 
-    if let Some(failure) = first_project_policy_failure(root, analysis)? {
+    if let Some(failure) = first_project_policy_failure(root, analysis, mode)? {
         return report_single_failure(root, mode, hook_client, failure);
     }
 
@@ -625,10 +635,13 @@ fn check_lane_key(check: &ProjectCheck) -> String {
     command.to_string()
 }
 
-fn project_policy_check_count(analysis: &Analysis) -> usize {
+fn project_policy_check_count(analysis: &Analysis, mode: VerifyMode) -> usize {
     let mut count = 0;
     if analysis.repository.is_git_repository {
         count += 4 + analysis.install_directories.len();
+        if mode == VerifyMode::StopHook {
+            count += 1;
+        }
     }
     count += analysis.required_checks.len();
     if analysis.repository.has_workflows() {
@@ -640,7 +653,11 @@ fn project_policy_check_count(analysis: &Analysis) -> usize {
     count
 }
 
-fn first_project_policy_failure(root: &Path, analysis: &Analysis) -> Result<Option<CheckFailure>> {
+fn first_project_policy_failure(
+    root: &Path,
+    analysis: &Analysis,
+    mode: VerifyMode,
+) -> Result<Option<CheckFailure>> {
     if analysis.repository.is_git_repository && !analysis.repository.has_readme() {
         return Ok(Some(CheckFailure {
             kind: "docs",
@@ -774,7 +791,104 @@ fn first_project_policy_failure(root: &Path, analysis: &Analysis) -> Result<Opti
         }
     }
 
+    if mode == VerifyMode::StopHook
+        && analysis.repository.is_git_repository
+        && let Some(failure) = stop_hook_remote_sync_failure(root)?
+    {
+        return Ok(Some(failure));
+    }
+
     Ok(None)
+}
+
+fn stop_hook_remote_sync_failure(root: &Path) -> Result<Option<CheckFailure>> {
+    let Some(branch) = git_stdout_optional(root, &["rev-parse", "--abbrev-ref", "HEAD"])? else {
+        return Ok(None);
+    };
+    let branch = branch.trim();
+    if branch.is_empty() || branch == "HEAD" {
+        return Ok(None);
+    }
+
+    let upstream = git_stdout_optional(
+        root,
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ],
+    )?;
+    let Some(upstream) = upstream.map(|value| value.trim().to_string()) else {
+        return Ok(Some(CheckFailure {
+            kind: "git",
+            subject: branch.to_string(),
+            exit_code: None,
+            summary: format!(
+                "branch `{branch}` has no upstream remote branch. Push it and create a pull request before stopping (for example: `git push -u origin HEAD`)."
+            ),
+            duration: None,
+        }));
+    };
+    if upstream.is_empty() {
+        return Ok(None);
+    }
+
+    let ahead = git_stdout(root, &["rev-list", "--count", &format!("{upstream}..HEAD")])?;
+    let ahead = ahead.trim().parse::<usize>().unwrap_or(0);
+    if ahead == 0 {
+        return Ok(None);
+    }
+
+    let commit_word = if ahead == 1 { "commit" } else { "commits" };
+    Ok(Some(CheckFailure {
+        kind: "git",
+        subject: branch.to_string(),
+        exit_code: None,
+        summary: format!(
+            "branch `{branch}` is {ahead} {commit_word} ahead of `{upstream}`. Push your branch and create or update the pull request before stopping."
+        ),
+        duration: None,
+    }))
+}
+
+fn git_stdout(root: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .current_dir(root)
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to run git {}", args.join(" ")))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn git_stdout_optional(root: &Path, args: &[&str]) -> Result<Option<String>> {
+    let output = match Command::new("git").current_dir(root).args(args).output() {
+        Ok(output) => output,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to run git {}", args.join(" ")));
+        }
+    };
+    if output.status.success() {
+        return Ok(Some(
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        ));
+    }
+    if output.status.code() == Some(128) {
+        return Ok(None);
+    }
+    anyhow::bail!(
+        "git {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
 }
 
 fn readme_has_license_section(root: &Path, analysis: &Analysis) -> Result<bool> {
@@ -2461,9 +2575,9 @@ mod tests {
         first_project_policy_failure, humanize_devenv_trace_line, humanize_live_output,
         is_matching_devenv_root, markdown_has_terminal_license_section, missing_workflow_commands,
         normalize_summary, prepare_verify_environment, project_checks, safe_lint_autofix_command,
-        service_process_names, shell_quote, should_attempt_safe_autofix, should_use_devenv,
-        summarize_failure, tokens_are_subsequence, verify_output_style_with_stderr_terminal,
-        workflow_runs_command,
+        service_process_names, session_start_note, shell_quote, should_attempt_safe_autofix,
+        should_use_devenv, summarize_failure, tokens_are_subsequence,
+        verify_output_style_with_stderr_terminal, workflow_runs_command,
     };
     use crate::analysis::{
         Analysis, GitHubRepository, GitHubVisibility, ProjectRequirement, RepositoryMetadata,
@@ -3084,7 +3198,7 @@ esac
             ..RepositoryMetadata::default()
         };
 
-        let failure = first_project_policy_failure(dir.path(), &analysis)
+        let failure = first_project_policy_failure(dir.path(), &analysis, VerifyMode::User)
             .unwrap()
             .expect("expected readme failure");
         assert_eq!(failure.kind, "docs");
@@ -3108,7 +3222,7 @@ esac
             ..RepositoryMetadata::default()
         };
 
-        let failure = first_project_policy_failure(dir.path(), &analysis)
+        let failure = first_project_policy_failure(dir.path(), &analysis, VerifyMode::User)
             .unwrap()
             .expect("expected readme license section failure");
         assert_eq!(failure.kind, "docs");
@@ -3132,7 +3246,7 @@ esac
             ..RepositoryMetadata::default()
         };
 
-        let failure = first_project_policy_failure(dir.path(), &analysis)
+        let failure = first_project_policy_failure(dir.path(), &analysis, VerifyMode::User)
             .unwrap()
             .expect("expected readme link failure");
         assert_eq!(failure.kind, "docs");
@@ -3159,7 +3273,7 @@ esac
             ..RepositoryMetadata::default()
         };
 
-        let failure = first_project_policy_failure(dir.path(), &analysis)
+        let failure = first_project_policy_failure(dir.path(), &analysis, VerifyMode::User)
             .unwrap()
             .expect("expected ds_store ignore failure");
         assert_eq!(failure.kind, "ignore");
@@ -3186,7 +3300,7 @@ esac
         };
         analysis.install_directories = vec!["node_modules".to_string()];
 
-        let failure = first_project_policy_failure(dir.path(), &analysis)
+        let failure = first_project_policy_failure(dir.path(), &analysis, VerifyMode::User)
             .unwrap()
             .expect("expected install-directory failure");
         assert_eq!(failure.kind, "ignore");
@@ -3225,7 +3339,7 @@ esac
         };
         analysis.install_directories = vec!["node_modules".to_string()];
 
-        let failure = first_project_policy_failure(dir.path(), &analysis)
+        let failure = first_project_policy_failure(dir.path(), &analysis, VerifyMode::User)
             .unwrap()
             .expect("expected tracked install-directory failure");
         assert_eq!(failure.kind, "ignore");
@@ -3325,7 +3439,7 @@ esac
             ..RepositoryMetadata::default()
         };
 
-        let failure = first_project_policy_failure(dir.path(), &analysis)
+        let failure = first_project_policy_failure(dir.path(), &analysis, VerifyMode::User)
             .unwrap()
             .expect("expected license failure");
         assert_eq!(failure.kind, "license");
@@ -3343,7 +3457,7 @@ esac
                 .to_string(),
         }];
 
-        let failure = first_project_policy_failure(dir.path(), &analysis)
+        let failure = first_project_policy_failure(dir.path(), &analysis, VerifyMode::User)
             .unwrap()
             .expect("expected credo failure");
         assert_eq!(failure.kind, "lint");
@@ -3362,7 +3476,7 @@ esac
             summary: "Elixir projects must enforce at least 80% test coverage.".to_string(),
         }];
 
-        let failure = first_project_policy_failure(dir.path(), &analysis)
+        let failure = first_project_policy_failure(dir.path(), &analysis, VerifyMode::User)
             .unwrap()
             .expect("expected coverage requirement");
         assert_eq!(failure.kind, "coverage");
@@ -3382,7 +3496,7 @@ esac
                     .to_string(),
         }];
 
-        let failure = first_project_policy_failure(dir.path(), &analysis)
+        let failure = first_project_policy_failure(dir.path(), &analysis, VerifyMode::User)
             .unwrap()
             .expect("expected starter page failure");
         assert_eq!(failure.kind, "starter");
@@ -3427,7 +3541,7 @@ jobs:
             ..RepositoryMetadata::default()
         };
 
-        let failure = first_project_policy_failure(dir.path(), &analysis)
+        let failure = first_project_policy_failure(dir.path(), &analysis, VerifyMode::User)
             .unwrap()
             .expect("expected workflow coverage failure");
         assert_eq!(failure.kind, "ci");
@@ -3451,7 +3565,7 @@ jobs:
             ..RepositoryMetadata::default()
         };
 
-        let failure = first_project_policy_failure(dir.path(), &analysis)
+        let failure = first_project_policy_failure(dir.path(), &analysis, VerifyMode::User)
             .unwrap()
             .expect("expected workflow syntax failure");
         assert_eq!(failure.kind, "ci");
@@ -3484,7 +3598,7 @@ jobs:
                 .to_string(),
         }];
 
-        let failure = first_project_policy_failure(dir.path(), &analysis)
+        let failure = first_project_policy_failure(dir.path(), &analysis, VerifyMode::User)
             .unwrap()
             .expect("expected first failure");
         assert_eq!(failure.subject, "README.md");
@@ -3495,7 +3609,7 @@ jobs:
             "# Demo\n\nSee [LICENSE](/tmp/demo/LICENSE).\n\n## Usage\nTry it.\n",
         )
         .unwrap();
-        let failure = first_project_policy_failure(dir.path(), &analysis)
+        let failure = first_project_policy_failure(dir.path(), &analysis, VerifyMode::User)
             .unwrap()
             .expect("expected second failure");
         assert_eq!(failure.subject, "README.md#Links");
@@ -3505,36 +3619,193 @@ jobs:
             "# Demo\n\nSee [README](README.md).\n\n## Usage\nTry it.\n",
         )
         .unwrap();
-        let failure = first_project_policy_failure(dir.path(), &analysis)
+        let failure = first_project_policy_failure(dir.path(), &analysis, VerifyMode::User)
             .unwrap()
             .expect("expected third failure");
         assert_eq!(failure.subject, "README.md#License");
 
         std::fs::write(dir.path().join("README.md"), "# Demo\n\n## License\nMIT\n").unwrap();
         analysis.install_directories = vec!["node_modules".to_string()];
-        let failure = first_project_policy_failure(dir.path(), &analysis)
+        let failure = first_project_policy_failure(dir.path(), &analysis, VerifyMode::User)
             .unwrap()
             .expect("expected fourth failure");
         assert_eq!(failure.subject, "node_modules");
 
         std::fs::write(dir.path().join(".gitignore"), "node_modules/\n").unwrap();
         analysis.install_directories = Vec::new();
-        let failure = first_project_policy_failure(dir.path(), &analysis)
+        let failure = first_project_policy_failure(dir.path(), &analysis, VerifyMode::User)
             .unwrap()
             .expect("expected fifth failure");
         assert_eq!(failure.subject, ".gitignore");
 
         std::fs::write(dir.path().join(".gitignore"), ".DS_Store\n").unwrap();
-        let failure = first_project_policy_failure(dir.path(), &analysis)
+        let failure = first_project_policy_failure(dir.path(), &analysis, VerifyMode::User)
             .unwrap()
             .expect("expected sixth failure");
         assert_eq!(failure.subject, "mix.exs");
 
         analysis.required_checks = Vec::new();
-        let failure = first_project_policy_failure(dir.path(), &analysis)
+        let failure = first_project_policy_failure(dir.path(), &analysis, VerifyMode::User)
             .unwrap()
             .expect("expected seventh failure");
         assert_eq!(failure.subject, "LICENSE");
+    }
+
+    #[test]
+    fn stop_hook_blocks_when_branch_is_ahead_of_upstream() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = tempfile::tempdir().unwrap();
+
+        Command::new("git")
+            .arg("init")
+            .arg("--bare")
+            .arg(remote.path())
+            .status()
+            .unwrap();
+        Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(dir.path())
+            .status()
+            .unwrap();
+        Command::new("git")
+            .current_dir(dir.path())
+            .args(["config", "user.name", "Explicit Test"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .current_dir(dir.path())
+            .args(["config", "user.email", "explicit@example.com"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .current_dir(dir.path())
+            .args([
+                "remote",
+                "add",
+                "origin",
+                &remote.path().display().to_string(),
+            ])
+            .status()
+            .unwrap();
+
+        fs::write(dir.path().join("README.md"), "# Demo\n\n## License\nMIT\n").unwrap();
+        fs::write(dir.path().join(".gitignore"), ".DS_Store\n").unwrap();
+        Command::new("git")
+            .current_dir(dir.path())
+            .args(["add", "README.md", ".gitignore"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .current_dir(dir.path())
+            .args(["-c", "commit.gpgsign=false", "commit", "-m", "initial"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .current_dir(dir.path())
+            .args(["push", "-u", "origin", "HEAD"])
+            .status()
+            .unwrap();
+
+        fs::write(dir.path().join("local.txt"), "ahead\n").unwrap();
+        Command::new("git")
+            .current_dir(dir.path())
+            .args(["add", "local.txt"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .current_dir(dir.path())
+            .args(["-c", "commit.gpgsign=false", "commit", "-m", "ahead"])
+            .status()
+            .unwrap();
+
+        let mut analysis = analysis_with_checks();
+        analysis.repository = RepositoryMetadata {
+            is_git_repository: true,
+            readme_path: Some("README.md".to_string()),
+            ..RepositoryMetadata::default()
+        };
+
+        let failure = first_project_policy_failure(dir.path(), &analysis, VerifyMode::StopHook)
+            .unwrap()
+            .expect("expected ahead-of-upstream failure");
+        assert_eq!(failure.kind, "git");
+        assert!(failure.summary.contains("ahead"));
+        assert!(failure.summary.contains("Push your branch"));
+        assert!(failure.summary.contains("pull request"));
+    }
+
+    #[test]
+    fn session_start_note_mentions_push_and_pull_request_when_ahead() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = tempfile::tempdir().unwrap();
+
+        Command::new("git")
+            .arg("init")
+            .arg("--bare")
+            .arg(remote.path())
+            .status()
+            .unwrap();
+        Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(dir.path())
+            .status()
+            .unwrap();
+        Command::new("git")
+            .current_dir(dir.path())
+            .args(["config", "user.name", "Explicit Test"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .current_dir(dir.path())
+            .args(["config", "user.email", "explicit@example.com"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .current_dir(dir.path())
+            .args([
+                "remote",
+                "add",
+                "origin",
+                &remote.path().display().to_string(),
+            ])
+            .status()
+            .unwrap();
+        fs::write(dir.path().join("README.md"), "# Demo\n").unwrap();
+        Command::new("git")
+            .current_dir(dir.path())
+            .args(["add", "README.md"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .current_dir(dir.path())
+            .args(["-c", "commit.gpgsign=false", "commit", "-m", "initial"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .current_dir(dir.path())
+            .args(["push", "-u", "origin", "HEAD"])
+            .status()
+            .unwrap();
+        fs::write(dir.path().join("local.txt"), "ahead\n").unwrap();
+        Command::new("git")
+            .current_dir(dir.path())
+            .args(["add", "local.txt"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .current_dir(dir.path())
+            .args(["-c", "commit.gpgsign=false", "commit", "-m", "ahead"])
+            .status()
+            .unwrap();
+
+        let note = session_start_note(dir.path())
+            .unwrap()
+            .expect("expected session start note");
+        assert!(note.contains("ahead"));
+        assert!(note.contains("pushing"));
+        assert!(note.contains("pull request"));
     }
 
     #[test]

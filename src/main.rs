@@ -2,9 +2,11 @@ mod analysis;
 mod devenv_file;
 mod env_trace;
 mod eol;
+mod github_app;
 mod hooks;
 mod host_tools;
 mod observe;
+mod parallel;
 mod registry;
 mod runtime;
 mod sandbox;
@@ -43,6 +45,8 @@ enum Command {
     Shell(ShellArgs),
     #[command(about = "Attach to a live project run or inspect observed Codex telemetry.")]
     Observe(ObserveArgs),
+    #[command(about = "Print GitHub App setup instructions for sandboxed GitHub access.")]
+    GithubApp,
     #[command(
         about = "Launch Codex inside the devenv + nono sandbox.",
         disable_help_flag = true,
@@ -55,6 +59,12 @@ enum Command {
         disable_help_subcommand = true
     )]
     Claude(AgentArgs),
+    #[command(
+        about = "Launch Gemini inside the devenv + nono sandbox.",
+        disable_help_flag = true,
+        disable_help_subcommand = true
+    )]
+    Gemini(AgentArgs),
     #[command(hide = true, name = "__sandbox-exec")]
     SandboxExec(SandboxExecArgs),
     #[command(hide = true, name = "__claude-pre-tool-use-bash")]
@@ -121,6 +131,12 @@ enum ObserveCommand {
         disable_help_subcommand = true
     )]
     Claude(ObserveAgentArgs),
+    #[command(
+        about = "Launch Gemini and save sandbox, env, and runtime telemetry to SQLite.",
+        disable_help_flag = true,
+        disable_help_subcommand = true
+    )]
+    Gemini(ObserveAgentArgs),
     #[command(about = "List observed runs under the current project.")]
     List(CommonArgs),
     #[command(about = "Print a report for an observed run.")]
@@ -235,6 +251,7 @@ fn run() -> Result<ExitCode> {
         Command::Observe(args) => match args.command {
             Some(ObserveCommand::Codex(args)) => launch_observed_agent("codex", args),
             Some(ObserveCommand::Claude(args)) => launch_observed_agent("claude", args),
+            Some(ObserveCommand::Gemini(args)) => launch_observed_agent("gemini", args),
             Some(ObserveCommand::List(args)) => {
                 let root = args.root.canonicalize().context("failed to resolve root")?;
                 observe::list_runs(&root)?;
@@ -254,8 +271,13 @@ fn run() -> Result<ExitCode> {
                 Ok(ExitCode::SUCCESS)
             }
         },
+        Command::GithubApp => {
+            github_app::print_setup_instructions()?;
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Codex(args) => launch_agent("codex", args),
         Command::Claude(args) => launch_agent("claude", args),
+        Command::Gemini(args) => launch_agent("gemini", args),
         Command::SandboxExec(args) => {
             sandbox::run_sandbox_exec(args.root, args.env_file, args.plan_file, args.command)?;
             Ok(ExitCode::SUCCESS)
@@ -271,12 +293,15 @@ fn launch_agent(binary: &str, args: AgentArgs) -> Result<ExitCode> {
     let root = PathBuf::from(".")
         .canonicalize()
         .context("failed to resolve root")?;
-    let analysis = Analysis::analyze(&root)?;
+    let routed = parallel::route_agent_launch(&root, binary)?;
+    let analysis = Analysis::analyze(&routed.root)?;
+    let mut extra_env = routed.extra_env.clone();
+    extra_env.extend(github_app::sandbox_env(&routed.root, &analysis)?);
     let (observe, passthrough_args) = extract_observe_flag(args.args);
-    let command = build_agent_command(binary, &passthrough_args);
+    let command = build_agent_command(&routed.root, binary, &passthrough_args)?;
     if observe {
         return observe::launch_observed_agent(
-            &root,
+            &routed.root,
             &analysis,
             observe::ObservedAgentOptions {
                 agent: binary,
@@ -285,26 +310,31 @@ fn launch_agent(binary: &str, args: AgentArgs) -> Result<ExitCode> {
                 block_network: false,
                 no_services: false,
                 dangerously_use_end_of_life_versions: args.dangerously_use_end_of_life_versions,
+                extra_env,
             },
         );
     }
     observe::launch_live_agent(
-        &root,
+        &routed.root,
         &analysis,
         binary,
         command,
         false,
         false,
         args.dangerously_use_end_of_life_versions,
+        extra_env,
     )
 }
 
 fn launch_observed_agent(binary: &str, args: ObserveAgentArgs) -> Result<ExitCode> {
     let root = args.root.canonicalize().context("failed to resolve root")?;
-    let analysis = Analysis::analyze(&root)?;
-    let command = build_agent_command(binary, &args.args);
+    let routed = parallel::route_agent_launch(&root, binary)?;
+    let analysis = Analysis::analyze(&routed.root)?;
+    let mut extra_env = routed.extra_env.clone();
+    extra_env.extend(github_app::sandbox_env(&routed.root, &analysis)?);
+    let command = build_agent_command(&routed.root, binary, &args.args)?;
     observe::launch_observed_agent(
-        &root,
+        &routed.root,
         &analysis,
         observe::ObservedAgentOptions {
             agent: binary,
@@ -313,19 +343,28 @@ fn launch_observed_agent(binary: &str, args: ObserveAgentArgs) -> Result<ExitCod
             block_network: args.block_network,
             no_services: args.no_services,
             dangerously_use_end_of_life_versions: args.dangerously_use_end_of_life_versions,
+            extra_env,
         },
     )
 }
 
-fn build_agent_command(binary: &str, args: &[String]) -> String {
+fn build_agent_command(root: &PathBuf, binary: &str, args: &[String]) -> Result<String> {
     let executable = preferred_command_path(binary)
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| binary.to_string());
 
-    std::iter::once(shell_escape(&executable))
+    let command = std::iter::once(shell_escape(&executable))
         .chain(args.iter().map(|arg| shell_escape(arg)))
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(" ");
+    if let Some(note) = verify::session_start_note(root)? {
+        return Ok(format!(
+            "printf '%s\\n' {} ; {}",
+            shell_escape(&note),
+            command
+        ));
+    }
+    Ok(command)
 }
 
 fn shell_escape(value: &str) -> String {
@@ -363,9 +402,11 @@ mod tests {
     #[test]
     fn build_agent_command_quotes_arguments_for_shell() {
         let command = build_agent_command(
+            &PathBuf::from("/tmp/project"),
             "codex",
             &[String::from("--prompt"), String::from("hello world")],
-        );
+        )
+        .unwrap();
         assert!(command.ends_with(" --prompt 'hello world'"));
         assert!(command.split_whitespace().next().unwrap().contains("codex"));
     }
@@ -384,6 +425,16 @@ mod tests {
             panic!("expected codex command");
         };
         assert_eq!(args.args, vec!["-m", "gpt-5.4", "--help"]);
+    }
+
+    #[test]
+    fn gemini_subcommand_treats_flags_as_agent_arguments() {
+        let cli = Cli::try_parse_from(["explicit", "gemini", "--model", "2.5-pro", "--help"])
+            .expect("expected gemini args to parse");
+        let Command::Gemini(args) = cli.command else {
+            panic!("expected gemini command");
+        };
+        assert_eq!(args.args, vec!["--model", "2.5-pro", "--help"]);
     }
 
     #[test]
@@ -407,6 +458,13 @@ mod tests {
     }
 
     #[test]
+    fn github_app_subcommand_parses() {
+        let cli =
+            Cli::try_parse_from(["explicit", "github-app"]).expect("expected github-app to parse");
+        assert!(matches!(cli.command, Command::GithubApp));
+    }
+
+    #[test]
     fn observe_claude_subcommand_parses() {
         let cli = Cli::try_parse_from(["explicit", "observe", "claude", "--", "-p", "hello"])
             .expect("expected observe claude to parse");
@@ -418,6 +476,21 @@ mod tests {
                 assert_eq!(args.args, vec!["-p", "hello"]);
             }
             _ => panic!("expected observe claude command"),
+        }
+    }
+
+    #[test]
+    fn observe_gemini_subcommand_parses() {
+        let cli = Cli::try_parse_from(["explicit", "observe", "gemini", "--", "-p", "hello"])
+            .expect("expected observe gemini to parse");
+        let Command::Observe(args) = cli.command else {
+            panic!("expected observe command");
+        };
+        match args.command {
+            Some(ObserveCommand::Gemini(args)) => {
+                assert_eq!(args.args, vec!["-p", "hello"]);
+            }
+            _ => panic!("expected observe gemini command"),
         }
     }
 

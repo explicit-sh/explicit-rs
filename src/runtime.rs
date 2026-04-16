@@ -31,6 +31,8 @@ pub struct LaunchShellOptions<'a> {
     pub transcript_path: Option<&'a Path>,
 }
 
+const SECRET_ENV_FORWARDING_JSON: &str = "EXPLICIT_SECRET_ENV_FORWARDING_JSON";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DeploySshSetup {
     configured_hosts: Vec<String>,
@@ -73,6 +75,7 @@ pub(crate) fn ensure_managed_devenv_files(root: &Path, analysis: &Analysis) -> R
 }
 
 pub fn apply_project(root: &Path, analysis: &Analysis) -> Result<()> {
+    repair_managed_project_dirs(root)?;
     ensure_managed_devenv_files(root, analysis)?;
     fs::create_dir_all(root.join(".nono")).context("failed to create .nono directory")?;
     write_if_changed(
@@ -87,6 +90,39 @@ pub fn apply_project(root: &Path, analysis: &Analysis) -> Result<()> {
     .context("failed to write .nono/sandbox-plan.json")?;
     write_stop_hook_assets(root, analysis)?;
     Ok(())
+}
+
+fn repair_managed_project_dirs(root: &Path) -> Result<()> {
+    for relative in [".devenv", ".nono", ".claude", ".codex"] {
+        ensure_project_directory(root.join(relative))?;
+    }
+    Ok(())
+}
+
+fn ensure_project_directory(path: PathBuf) -> Result<()> {
+    if let Ok(target) = fs::read_link(&path) {
+        let resolved = if target.is_absolute() {
+            target
+        } else {
+            path.parent().unwrap_or_else(|| Path::new("/")).join(target)
+        };
+        if resolved == path {
+            fs::remove_file(&path)
+                .with_context(|| format!("failed to remove {}", path.display()))?;
+        }
+    }
+    if let Ok(metadata) = fs::symlink_metadata(&path) {
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                fs::remove_dir_all(&path)
+                    .with_context(|| format!("failed to remove {}", path.display()))?;
+            } else {
+                fs::remove_file(&path)
+                    .with_context(|| format!("failed to remove {}", path.display()))?;
+            }
+        }
+    }
+    fs::create_dir_all(&path).with_context(|| format!("failed to create {}", path.display()))
 }
 
 fn write_if_changed(path: impl AsRef<Path>, content: impl AsRef<[u8]>) -> Result<()> {
@@ -281,7 +317,9 @@ pub fn launch_shell(
         print_deploy_ssh_summary(&setup);
     }
 
+    prepare_swiftpm_shell_environment(analysis, &mut env_map)?;
     prepare_postgres_shell_environment(root, analysis, &mut env_map)?;
+    allow_tls_certificate_paths(&env_map, &mut plan);
     let _dev_servers = if start_dev_servers {
         Some(start_dev_servers_for_agent(
             root,
@@ -300,8 +338,15 @@ pub fn launch_shell(
     };
     prepare_agent_runtime(options.agent, &runtime_dir, &mut env_map, &mut plan)?;
 
+    let mut secret_env = BTreeMap::new();
     if let Some(extra_env) = options.extra_env {
-        env_map.extend(extra_env.clone());
+        for (key, value) in extra_env {
+            if is_secret_env_key(key) {
+                secret_env.insert(key.clone(), value.clone());
+            } else {
+                env_map.insert(key.clone(), value.clone());
+            }
+        }
     }
     prioritize_launch_executable(&mut env_map, &mut plan, &current_exe);
 
@@ -322,6 +367,7 @@ pub fn launch_shell(
         &plan_file,
         options.command,
         options.transcript_path,
+        &secret_env,
     );
     if options.block_network {
         child.env("DEVENV_NONO_BLOCK_NETWORK", "1");
@@ -543,6 +589,91 @@ fn prepare_postgres_shell_environment(
     Ok(())
 }
 
+fn prepare_swiftpm_shell_environment(
+    analysis: &Analysis,
+    env_map: &mut BTreeMap<String, String>,
+) -> Result<()> {
+    if !cfg!(target_os = "macos")
+        || !analysis
+            .markers
+            .iter()
+            .any(|marker| marker == "Package.swift")
+    {
+        return Ok(());
+    }
+
+    // SwiftPM macOS builds should use the host Xcode/CLT toolchain, not the Nix Apple SDK wrapper
+    // environment. The wrapper vars break manifest compilation with Apple's `/usr/bin/swift`, and
+    // nested SwiftPM sandboxing is already disabled in the generated commands.
+    for key in env_map
+        .keys()
+        .filter(|key| {
+            key == &"DEVELOPER_DIR"
+                || key == &"SDKROOT"
+                || key == &"MACOSX_DEPLOYMENT_TARGET"
+                || key == &"TOOLCHAINS"
+                || key == &"SWIFT_EXEC"
+                || key == &"SWIFT_EXEC_MANIFEST"
+                || key == &"CC"
+                || key == &"CXX"
+                || key == &"CPP"
+                || key == &"CPATH"
+                || key == &"LIBRARY_PATH"
+                || key == &"C_INCLUDE_PATH"
+                || key == &"CPLUS_INCLUDE_PATH"
+                || key == &"OBJC_INCLUDE_PATH"
+                || key == &"CPPFLAGS"
+                || key == &"CFLAGS"
+                || key == &"CXXFLAGS"
+                || key == &"LDFLAGS"
+                || key.starts_with("NIX_")
+        })
+        .cloned()
+        .collect::<Vec<_>>()
+    {
+        env_map.remove(&key);
+    }
+
+    env_map.insert("SWIFTPM_DISABLE_SANDBOX".to_string(), "1".to_string());
+
+    for path in preferred_swiftpm_host_paths() {
+        prepend_path(env_map, &path);
+    }
+
+    Ok(())
+}
+
+fn preferred_swiftpm_host_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    for candidate in [
+        PathBuf::from(
+            "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin",
+        ),
+        PathBuf::from("/Applications/Xcode.app/Contents/Developer/usr/bin"),
+        PathBuf::from("/Library/Developer/CommandLineTools/usr/bin"),
+        PathBuf::from("/usr/bin"),
+    ] {
+        if candidate.exists() && !paths.contains(&candidate) {
+            paths.push(candidate);
+        }
+    }
+
+    for command in ["swift", "swiftc", "xcrun", "xcodebuild"] {
+        for path in host_command_paths(command) {
+            let Some(parent) = path.parent() else {
+                continue;
+            };
+            let parent = parent.to_path_buf();
+            if !paths.contains(&parent) {
+                paths.push(parent);
+            }
+        }
+    }
+
+    paths
+}
+
 fn uses_postgres_shell(analysis: &Analysis) -> bool {
     analysis
         .services
@@ -695,63 +826,82 @@ fn prepare_agent_runtime(
     plan: &mut SandboxPlan,
 ) -> Result<()> {
     match agent {
-        Some("claude") => prepare_claude_home_overlay(runtime_dir, env_map, plan),
+        Some(agent) => prepare_agent_home_overlay(agent, runtime_dir, env_map, plan),
         _ => Ok(()),
     }
 }
 
-fn prepare_claude_home_overlay(
+fn prepare_agent_home_overlay(
+    agent: &str,
     runtime_dir: &Path,
     env_map: &mut BTreeMap<String, String>,
     plan: &mut SandboxPlan,
 ) -> Result<()> {
-    let home = dirs::home_dir().context("failed to resolve home directory for Claude runtime")?;
-    prepare_claude_home_overlay_from(runtime_dir, &home, env_map, plan)
+    let home = dirs::home_dir()
+        .with_context(|| format!("failed to resolve home directory for {agent} runtime"))?;
+    prepare_agent_home_overlay_from(agent, runtime_dir, &home, env_map, plan)
 }
 
-fn prepare_claude_home_overlay_from(
+fn prepare_agent_home_overlay_from(
+    agent: &str,
     runtime_dir: &Path,
     home: &Path,
     env_map: &mut BTreeMap<String, String>,
     plan: &mut SandboxPlan,
 ) -> Result<()> {
-    let overlay_home = runtime_dir.join("claude-home");
+    repair_known_home_self_links(home)?;
+    let overlay_home = runtime_dir.join(format!("{agent}-home"));
     fs::create_dir_all(&overlay_home)
         .with_context(|| format!("failed to create {}", overlay_home.display()))?;
-    remove_stale_claude_overlay_shell_files(&overlay_home)?;
+    remove_stale_overlay_shell_files(&overlay_home)?;
+    ensure_overlay_directory(overlay_home.join(".config"))?;
+    ensure_overlay_directory(overlay_home.join(".cache"))?;
+    ensure_overlay_directory(overlay_home.join(".local/share"))?;
+    ensure_overlay_directory(overlay_home.join(".local/state"))?;
 
-    let claude_dir = home.join(".claude");
-    if claude_dir.exists() {
-        ensure_symlink(&claude_dir, &overlay_home.join(".claude"))?;
-        push_unique_path(&mut plan.read_write_dirs, claude_dir);
-    }
+    mirror_home_backed_sandbox_paths(home, &overlay_home, plan)?;
+    sync_agent_overlay_special_files(agent, home, &overlay_home)?;
+    prepare_agent_overlay_ssh(overlay_home.as_path(), env_map)?;
 
-    let agents_dir = home.join(".agents");
-    if agents_dir.exists() {
-        ensure_symlink(&agents_dir, &overlay_home.join(".agents"))?;
-        push_unique_path(&mut plan.read_only_dirs, agents_dir);
-    }
-
-    let global_config = home.join(".claude.json");
-    if global_config.is_file() {
-        let content = fs::read(&global_config)
-            .with_context(|| format!("failed to read {}", global_config.display()))?;
-        write_if_changed(overlay_home.join(".claude.json"), content)?;
-    }
-
-    prepare_claude_overlay_ssh(overlay_home.as_path(), env_map)?;
+    let xdg_config_home = overlay_home.join(".config");
+    let xdg_cache_home = overlay_home.join(".cache");
+    let xdg_data_home = overlay_home.join(".local/share");
+    let xdg_state_home = overlay_home.join(".local/state");
+    let devenv_home = xdg_state_home.join("devenv");
+    fs::create_dir_all(&devenv_home)
+        .with_context(|| format!("failed to create {}", devenv_home.display()))?;
 
     env_map.insert("EXPLICIT_HOST_HOME".to_string(), home.display().to_string());
     env_map.insert("HOME".to_string(), overlay_home.display().to_string());
+    env_map.insert("ZDOTDIR".to_string(), overlay_home.display().to_string());
+    env_map.insert(
+        "XDG_CONFIG_HOME".to_string(),
+        xdg_config_home.display().to_string(),
+    );
+    env_map.insert(
+        "XDG_CACHE_HOME".to_string(),
+        xdg_cache_home.display().to_string(),
+    );
+    env_map.insert(
+        "XDG_DATA_HOME".to_string(),
+        xdg_data_home.display().to_string(),
+    );
+    env_map.insert(
+        "XDG_STATE_HOME".to_string(),
+        xdg_state_home.display().to_string(),
+    );
+    env_map.insert("DEVENV_HOME".to_string(), devenv_home.display().to_string());
+    env_map.remove("ENV");
+    env_map.remove("BASH_ENV");
     push_unique_path(&mut plan.read_write_dirs, overlay_home.clone());
     plan.notes.push(format!(
-        "Claude home overlay enabled at {}",
-        overlay_home.display()
+        "{agent} home overlay enabled at {}",
+        overlay_home.display(),
     ));
     Ok(())
 }
 
-fn remove_stale_claude_overlay_shell_files(overlay_home: &Path) -> Result<()> {
+fn remove_stale_overlay_shell_files(overlay_home: &Path) -> Result<()> {
     for relative in [
         ".profile",
         ".bash_profile",
@@ -770,7 +920,128 @@ fn remove_stale_claude_overlay_shell_files(overlay_home: &Path) -> Result<()> {
     Ok(())
 }
 
-fn prepare_claude_overlay_ssh(
+fn ensure_overlay_directory(path: PathBuf) -> Result<()> {
+    if let Ok(metadata) = fs::symlink_metadata(&path) {
+        if metadata.file_type().is_symlink() {
+            fs::remove_file(&path)
+                .with_context(|| format!("failed to remove {}", path.display()))?;
+        } else if !metadata.is_dir() {
+            fs::remove_file(&path)
+                .with_context(|| format!("failed to remove {}", path.display()))?;
+        }
+    }
+    fs::create_dir_all(&path).with_context(|| format!("failed to create {}", path.display()))
+}
+
+fn repair_known_home_self_links(home: &Path) -> Result<()> {
+    repair_self_referential_home_symlink(&home.join(".config/git"))?;
+    repair_self_referential_home_symlink(&home.join(".config/git/config"))?;
+    Ok(())
+}
+
+fn mirror_home_backed_sandbox_paths(
+    home: &Path,
+    overlay_home: &Path,
+    plan: &SandboxPlan,
+) -> Result<()> {
+    for path in plan
+        .read_write_dirs
+        .iter()
+        .chain(plan.read_only_dirs.iter())
+        .chain(plan.read_write_files.iter())
+        .chain(plan.read_only_files.iter())
+    {
+        if path == &plan.root || path.starts_with(&plan.root) {
+            continue;
+        }
+        let Ok(relative) = path.strip_prefix(home) else {
+            continue;
+        };
+        if relative.as_os_str().is_empty() || should_skip_overlay_relative_path(relative) {
+            continue;
+        }
+        repair_self_referential_home_symlink(path)?;
+        let link = overlay_home.join(relative);
+        if let Some(parent) = link.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        ensure_symlink(path, &link)?;
+    }
+    Ok(())
+}
+
+fn should_skip_overlay_relative_path(relative: &Path) -> bool {
+    if is_overlay_xdg_root(relative) {
+        return true;
+    }
+    if relative == Path::new("Library/Keychains")
+        || relative.starts_with(Path::new("Library/Keychains"))
+    {
+        return true;
+    }
+    let Some(first) = relative.components().next() else {
+        return true;
+    };
+    let first = first.as_os_str().to_string_lossy();
+    if first == ".ssh" {
+        return true;
+    }
+    matches!(
+        relative.to_string_lossy().as_ref(),
+        ".profile"
+            | ".bash_profile"
+            | ".bash_login"
+            | ".bashrc"
+            | ".zprofile"
+            | ".zshrc"
+            | ".zshenv"
+    )
+}
+
+fn is_overlay_xdg_root(relative: &Path) -> bool {
+    matches!(
+        relative.to_string_lossy().as_ref(),
+        ".config" | ".cache" | ".local/share" | ".local/state"
+    )
+}
+
+fn repair_self_referential_home_symlink(path: &Path) -> Result<()> {
+    let Ok(target) = fs::read_link(path) else {
+        return Ok(());
+    };
+    let resolved = if target.is_absolute() {
+        target
+    } else {
+        path.parent().unwrap_or_else(|| Path::new("/")).join(target)
+    };
+    if resolved == path {
+        fs::remove_file(path).with_context(|| format!("failed to remove {}", path.display()))?;
+        if path.extension().is_some() {
+            fs::write(path, "").with_context(|| format!("failed to repair {}", path.display()))?;
+        } else {
+            fs::create_dir_all(path)
+                .with_context(|| format!("failed to repair {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn sync_agent_overlay_special_files(agent: &str, home: &Path, overlay_home: &Path) -> Result<()> {
+    if agent != "claude" {
+        return Ok(());
+    }
+
+    let global_config = home.join(".claude.json");
+    if global_config.is_file() {
+        let content = fs::read(&global_config)
+            .with_context(|| format!("failed to read {}", global_config.display()))?;
+        write_if_changed(overlay_home.join(".claude.json"), content)?;
+    }
+    Ok(())
+}
+
+fn prepare_agent_overlay_ssh(
     overlay_home: &Path,
     env_map: &BTreeMap<String, String>,
 ) -> Result<()> {
@@ -840,6 +1111,15 @@ fn push_unique_file_with_realpath(paths: &mut Vec<PathBuf>, path: PathBuf) {
     push_unique_path(paths, path.clone());
     if let Ok(real_path) = fs::canonicalize(&path) {
         push_unique_path(paths, real_path);
+    }
+}
+
+fn allow_tls_certificate_paths(env_map: &BTreeMap<String, String>, plan: &mut SandboxPlan) {
+    for key in ["SSL_CERT_FILE", "CURL_CA_BUNDLE", "NIX_SSL_CERT_FILE"] {
+        let Some(value) = env_map.get(key).filter(|value| !value.trim().is_empty()) else {
+            continue;
+        };
+        push_unique_file_with_realpath(&mut plan.read_only_files, PathBuf::from(value));
     }
 }
 
@@ -1500,12 +1780,17 @@ fn build_sandbox_command(
     plan_file: &Path,
     command: Option<&str>,
     transcript_path: Option<&Path>,
+    secret_env: &BTreeMap<String, String>,
 ) -> Command {
     let sandbox_args = sandbox_exec_args(root, env_file, plan_file, command);
     match transcript_path {
-        Some(transcript_path) => {
-            script_wrapped_sandbox_command(current_exe, root, transcript_path, &sandbox_args)
-        }
+        Some(transcript_path) => script_wrapped_sandbox_command(
+            current_exe,
+            root,
+            transcript_path,
+            &sandbox_args,
+            secret_env,
+        ),
         None => {
             let mut child = Command::new(current_exe);
             child
@@ -1514,6 +1799,7 @@ fn build_sandbox_command(
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit())
                 .args(&sandbox_args);
+            apply_secret_env_forwarding(&mut child, secret_env);
             child
         }
     }
@@ -1546,6 +1832,7 @@ fn script_wrapped_sandbox_command(
     root: &Path,
     transcript_path: &Path,
     sandbox_args: &[OsString],
+    secret_env: &BTreeMap<String, String>,
 ) -> Command {
     let transcript_arg = transcript_path
         .strip_prefix(root)
@@ -1588,7 +1875,22 @@ fn script_wrapped_sandbox_command(
         child.arg(current_exe).args(sandbox_args);
     }
 
+    apply_secret_env_forwarding(&mut child, secret_env);
     child
+}
+
+fn apply_secret_env_forwarding(child: &mut Command, secret_env: &BTreeMap<String, String>) {
+    if secret_env.is_empty() {
+        child.env_remove(SECRET_ENV_FORWARDING_JSON);
+        return;
+    }
+    if let Ok(payload) = serde_json::to_string(secret_env) {
+        child.env(SECRET_ENV_FORWARDING_JSON, payload);
+    }
+}
+
+fn is_secret_env_key(key: &str) -> bool {
+    matches!(key, "GH_TOKEN" | "GITHUB_TOKEN")
 }
 
 fn capture_devenv_env(
@@ -1900,7 +2202,7 @@ fn merge_host_agent_paths(env_map: &mut BTreeMap<String, String>) -> Result<()> 
         .flatten()
         .collect::<Vec<_>>();
 
-    for command in ["codex", "claude"] {
+    for command in ["codex", "claude", "gemini"] {
         for path in host_command_paths(command) {
             let Some(parent) = path.parent() else {
                 continue;
@@ -2264,14 +2566,16 @@ fn _write_sandbox_plan(path: &Path, plan: &SandboxPlan) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_sandbox_command, classify_devenv_stderr_line, current_shell_user,
-        deploy_host_lookup_queries, devenv_already_running_pid, doctor_report,
-        effective_ssh_agent_hosts, extract_project_ssh_public_key_files, git_remote_ssh_hosts,
-        harmonize_tls_certificate_env, humanize_process_command, is_plain_ssh_host_alias,
-        parse_process_snapshot, parse_ssh_config_details, parse_ssh_scan_target,
-        postgres_shell_user_ensure_command, prepare_claude_home_overlay_from, prepare_deploy_ssh,
-        prepare_postgres_shell_environment, prepend_path, prioritize_launch_executable,
-        render_project_ssh_config_block, shell_escape_for_env, shell_total_steps, ssh_config_value,
+        allow_tls_certificate_paths, build_sandbox_command, classify_devenv_stderr_line,
+        current_shell_user, deploy_host_lookup_queries, devenv_already_running_pid, doctor_report,
+        effective_ssh_agent_hosts, ensure_project_directory, extract_project_ssh_public_key_files,
+        git_remote_ssh_hosts, harmonize_tls_certificate_env, humanize_process_command,
+        is_overlay_xdg_root, is_plain_ssh_host_alias, parse_process_snapshot,
+        parse_ssh_config_details, parse_ssh_scan_target, postgres_shell_user_ensure_command,
+        preferred_swiftpm_host_paths, prepare_agent_home_overlay_from, prepare_deploy_ssh,
+        prepare_postgres_shell_environment, prepare_swiftpm_shell_environment, prepend_path,
+        prioritize_launch_executable, render_project_ssh_config_block, shell_escape_for_env,
+        shell_total_steps, should_skip_overlay_relative_path, ssh_config_value,
         ssh_host_from_remote_url, stale_devenv_cache_detected, summarize_devenv_failure,
         summarize_process_tree, uses_postgres_shell, write_project_known_hosts,
         write_ssh_wrapper_scripts,
@@ -2283,6 +2587,7 @@ mod tests {
     use std::{
         collections::BTreeMap,
         env, fs,
+        os::unix::fs::symlink,
         path::{Path, PathBuf},
         process::Command,
         sync::{Mutex, OnceLock},
@@ -2526,6 +2831,7 @@ Error:   × Could not bind localhost:5432
             Path::new("/tmp/shell-plan.json"),
             Some("claude -p hello"),
             Some(Path::new("/tmp/console.typescript")),
+            &BTreeMap::new(),
         );
         assert_eq!(command.get_program().to_string_lossy(), "script");
         let args = command
@@ -2723,6 +3029,45 @@ Error:   × Could not bind localhost:5432
     }
 
     #[test]
+    fn prepare_swiftpm_shell_environment_removes_nix_sdk_vars() {
+        let mut analysis = empty_analysis();
+        analysis.markers = vec!["Package.swift".to_string()];
+        let mut env_map = BTreeMap::from([
+            (
+                "PATH".to_string(),
+                "/nix/store/demo/bin:/usr/bin".to_string(),
+            ),
+            (
+                "DEVELOPER_DIR".to_string(),
+                "/nix/store/apple-sdk".to_string(),
+            ),
+            ("SDKROOT".to_string(), "/nix/store/sdk".to_string()),
+            (
+                "NIX_CFLAGS_COMPILE".to_string(),
+                "-isystem /nix/store/include".to_string(),
+            ),
+            ("CC".to_string(), "clang".to_string()),
+        ]);
+
+        prepare_swiftpm_shell_environment(&analysis, &mut env_map).unwrap();
+
+        assert!(!env_map.contains_key("DEVELOPER_DIR"));
+        assert!(!env_map.contains_key("SDKROOT"));
+        assert!(!env_map.contains_key("NIX_CFLAGS_COMPILE"));
+        assert!(!env_map.contains_key("CC"));
+        assert_eq!(
+            env_map.get("SWIFTPM_DISABLE_SANDBOX").map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn preferred_swiftpm_host_paths_include_usr_bin() {
+        let paths = preferred_swiftpm_host_paths();
+        assert!(paths.contains(&PathBuf::from("/usr/bin")));
+    }
+
+    #[test]
     fn uses_postgres_shell_detects_service_or_package() {
         let mut analysis = empty_analysis();
         assert!(!uses_postgres_shell(&analysis));
@@ -2761,18 +3106,23 @@ Error:   × Could not bind localhost:5432
         let mut plan = SandboxPlan {
             root: PathBuf::from("/tmp/project"),
             read_write_files: Vec::new(),
-            read_write_dirs: Vec::new(),
+            read_write_dirs: vec![home.join(".claude")],
             read_only_files: Vec::new(),
-            read_only_dirs: Vec::new(),
+            read_only_dirs: vec![home.join(".agents")],
             protected_write_files: Vec::new(),
             notes: Vec::new(),
         };
 
-        prepare_claude_home_overlay_from(&runtime, &home, &mut env_map, &mut plan).unwrap();
+        prepare_agent_home_overlay_from("claude", &runtime, &home, &mut env_map, &mut plan)
+            .unwrap();
 
         let overlay_home = runtime.join("claude-home");
         assert_eq!(
             env_map.get("HOME").map(String::as_str),
+            Some(overlay_home.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            env_map.get("ZDOTDIR").map(String::as_str),
             Some(overlay_home.to_string_lossy().as_ref())
         );
         assert_eq!(
@@ -2790,12 +3140,12 @@ Error:   × Could not bind localhost:5432
         assert!(
             plan.notes
                 .iter()
-                .any(|note| note.contains("Claude home overlay enabled"))
+                .any(|note| note.contains("claude home overlay enabled"))
         );
     }
 
     #[test]
-    fn claude_runtime_removes_stale_shell_startup_files_from_overlay() {
+    fn agent_runtime_removes_stale_shell_startup_files_from_overlay() {
         let dir = tempdir().unwrap();
         let home = dir.path().join("home");
         let runtime = dir.path().join("runtime");
@@ -2815,12 +3165,13 @@ Error:   × Could not bind localhost:5432
             notes: Vec::new(),
         };
 
-        prepare_claude_home_overlay_from(&runtime, &home, &mut env_map, &mut plan).unwrap();
+        prepare_agent_home_overlay_from("claude", &runtime, &home, &mut env_map, &mut plan)
+            .unwrap();
         assert!(!overlay_home.join(".profile").exists());
     }
 
     #[test]
-    fn claude_runtime_writes_project_scoped_ssh_overlay() {
+    fn agent_runtime_writes_project_scoped_ssh_overlay() {
         let dir = tempdir().unwrap();
         let home = dir.path().join("home");
         let runtime = dir.path().join("runtime");
@@ -2852,7 +3203,8 @@ Error:   × Could not bind localhost:5432
             notes: Vec::new(),
         };
 
-        prepare_claude_home_overlay_from(&runtime, &home, &mut env_map, &mut plan).unwrap();
+        prepare_agent_home_overlay_from("claude", &runtime, &home, &mut env_map, &mut plan)
+            .unwrap();
 
         assert_eq!(
             fs::read_link(overlay_home.join(".ssh/known_hosts")).unwrap(),
@@ -2868,6 +3220,235 @@ Error:   × Could not bind localhost:5432
             ssh_config_value(&runtime.join("known_hosts").display().to_string())
         )));
         assert!(config.contains("  StrictHostKeyChecking yes"));
+    }
+
+    #[test]
+    fn codex_runtime_uses_project_scoped_home_overlay_and_sets_fresh_xdg_paths() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("home");
+        let runtime = dir.path().join("runtime");
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        fs::create_dir_all(home.join(".cargo")).unwrap();
+        fs::write(home.join(".gitconfig"), "[user]\n  name = Demo\n").unwrap();
+        fs::write(home.join(".zshenv"), "source ~/.cargo/env\n").unwrap();
+
+        let mut env_map = BTreeMap::from([
+            ("ENV".to_string(), "/tmp/envrc".to_string()),
+            ("BASH_ENV".to_string(), "/tmp/bashenv".to_string()),
+        ]);
+        let mut plan = SandboxPlan {
+            root: PathBuf::from("/tmp/project"),
+            read_write_files: Vec::new(),
+            read_write_dirs: vec![home.join(".codex"), home.join(".cargo")],
+            read_only_files: vec![home.join(".gitconfig"), home.join(".zshenv")],
+            read_only_dirs: Vec::new(),
+            protected_write_files: Vec::new(),
+            notes: Vec::new(),
+        };
+
+        prepare_agent_home_overlay_from("codex", &runtime, &home, &mut env_map, &mut plan).unwrap();
+
+        let overlay_home = runtime.join("codex-home");
+        assert_eq!(
+            env_map.get("HOME").map(String::as_str),
+            Some(overlay_home.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            env_map.get("XDG_CONFIG_HOME").map(String::as_str),
+            Some(overlay_home.join(".config").to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            env_map.get("DEVENV_HOME").map(String::as_str),
+            Some(
+                overlay_home
+                    .join(".local/state/devenv")
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+        assert!(!env_map.contains_key("ENV"));
+        assert!(!env_map.contains_key("BASH_ENV"));
+        assert_eq!(
+            fs::read_link(overlay_home.join(".codex")).unwrap(),
+            home.join(".codex")
+        );
+        assert_eq!(
+            fs::read_link(overlay_home.join(".cargo")).unwrap(),
+            home.join(".cargo")
+        );
+        assert_eq!(
+            fs::read_link(overlay_home.join(".gitconfig")).unwrap(),
+            home.join(".gitconfig")
+        );
+        assert!(!overlay_home.join(".zshenv").exists());
+    }
+
+    #[test]
+    fn ensure_project_directory_repairs_self_symlink() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(".devenv");
+        symlink(&path, &path).unwrap();
+
+        ensure_project_directory(path.clone()).unwrap();
+
+        assert!(path.is_dir());
+        assert!(fs::symlink_metadata(&path).unwrap().is_dir());
+        assert!(
+            !fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn overlay_skips_xdg_root_symlinks() {
+        assert!(is_overlay_xdg_root(Path::new(".config")));
+        assert!(is_overlay_xdg_root(Path::new(".cache")));
+        assert!(is_overlay_xdg_root(Path::new(".local/share")));
+        assert!(is_overlay_xdg_root(Path::new(".local/state")));
+        assert!(!is_overlay_xdg_root(Path::new(".config/git")));
+    }
+
+    #[test]
+    fn overlay_skips_user_keychain_paths() {
+        assert!(should_skip_overlay_relative_path(Path::new(
+            "Library/Keychains"
+        )));
+        assert!(should_skip_overlay_relative_path(Path::new(
+            "Library/Keychains/login.keychain-db"
+        )));
+        assert!(!should_skip_overlay_relative_path(Path::new(
+            "Library/Preferences"
+        )));
+    }
+
+    #[test]
+    fn codex_runtime_keeps_overlay_xdg_root_as_directory() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("home");
+        let runtime = dir.path().join("runtime");
+        fs::create_dir_all(home.join(".config")).unwrap();
+        fs::create_dir_all(home.join(".config/git")).unwrap();
+        fs::write(home.join(".config/git/config"), "[user]\n  name = Demo\n").unwrap();
+
+        let mut env_map = BTreeMap::new();
+        let mut plan = SandboxPlan {
+            root: PathBuf::from("/tmp/project"),
+            read_write_files: Vec::new(),
+            read_write_dirs: vec![home.join(".config")],
+            read_only_files: vec![home.join(".config/git/config")],
+            read_only_dirs: vec![home.join(".config/git")],
+            protected_write_files: Vec::new(),
+            notes: Vec::new(),
+        };
+
+        prepare_agent_home_overlay_from("codex", &runtime, &home, &mut env_map, &mut plan).unwrap();
+
+        let overlay_home = runtime.join("codex-home");
+        assert!(overlay_home.join(".config").is_dir());
+        assert!(
+            !fs::symlink_metadata(overlay_home.join(".config"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_link(overlay_home.join(".config/git")).unwrap(),
+            home.join(".config/git")
+        );
+    }
+
+    #[test]
+    fn codex_runtime_repairs_broken_host_git_config_symlink() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("home");
+        let runtime = dir.path().join("runtime");
+        fs::create_dir_all(home.join(".config")).unwrap();
+        symlink(home.join(".config/git"), home.join(".config/git")).unwrap();
+
+        let mut env_map = BTreeMap::new();
+        let mut plan = SandboxPlan {
+            root: PathBuf::from("/tmp/project"),
+            read_write_files: Vec::new(),
+            read_write_dirs: Vec::new(),
+            read_only_files: Vec::new(),
+            read_only_dirs: Vec::new(),
+            protected_write_files: Vec::new(),
+            notes: Vec::new(),
+        };
+
+        prepare_agent_home_overlay_from("codex", &runtime, &home, &mut env_map, &mut plan).unwrap();
+
+        let git_dir = home.join(".config/git");
+        assert!(git_dir.is_dir());
+        assert!(
+            !fs::symlink_metadata(&git_dir)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn allow_tls_certificate_paths_adds_realpath_targets() {
+        let dir = tempdir().unwrap();
+        let store = dir.path().join("store");
+        fs::create_dir_all(&store).unwrap();
+        let target = store.join("ca-certificates.crt");
+        fs::write(&target, "cert\n").unwrap();
+        let link = dir.path().join("ca-certificates.crt");
+        symlink(&target, &link).unwrap();
+
+        let env_map = BTreeMap::from([("SSL_CERT_FILE".to_string(), link.display().to_string())]);
+        let mut plan = SandboxPlan {
+            root: PathBuf::from("/tmp/project"),
+            read_write_files: Vec::new(),
+            read_write_dirs: Vec::new(),
+            read_only_files: Vec::new(),
+            read_only_dirs: Vec::new(),
+            protected_write_files: Vec::new(),
+            notes: Vec::new(),
+        };
+
+        allow_tls_certificate_paths(&env_map, &mut plan);
+
+        let canonical_target = fs::canonicalize(&target).unwrap();
+        assert!(plan.read_only_files.contains(&link));
+        assert!(plan.read_only_files.contains(&canonical_target));
+    }
+
+    #[test]
+    fn agent_runtime_does_not_mirror_project_paths_into_overlay_home() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("home");
+        let project = home.join("Projects/demo");
+        let runtime = project.join(".nono/runtime");
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        fs::create_dir_all(project.join(".nono")).unwrap();
+
+        let mut env_map = BTreeMap::new();
+        let mut plan = SandboxPlan {
+            root: project.clone(),
+            read_write_files: Vec::new(),
+            read_write_dirs: vec![home.join(".codex"), project.join(".nono")],
+            read_only_files: Vec::new(),
+            read_only_dirs: vec![project.parent().unwrap().to_path_buf()],
+            protected_write_files: Vec::new(),
+            notes: Vec::new(),
+        };
+
+        prepare_agent_home_overlay_from("codex", &runtime, &home, &mut env_map, &mut plan).unwrap();
+
+        let overlay_home = runtime.join("codex-home");
+        assert_eq!(
+            fs::read_link(overlay_home.join(".codex")).unwrap(),
+            home.join(".codex")
+        );
+        assert_eq!(
+            fs::read_link(overlay_home.join("Projects")).unwrap(),
+            home.join("Projects")
+        );
     }
 
     #[test]

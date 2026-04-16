@@ -147,7 +147,7 @@ fn apply_detects_node_make_and_generates_hooks() {
     let codex_hooks: JsonValue =
         serde_json::from_str(&fs::read_to_string(root.join(".codex/hooks.json")).unwrap()).unwrap();
     assert!(
-        codex_hooks["Stop"][0]["hooks"][0]["command"]
+        codex_hooks["hooks"]["Stop"][0]["hooks"][0]["command"]
             .as_str()
             .unwrap()
             .contains(".nono/explicit-bin")
