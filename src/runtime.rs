@@ -1891,6 +1891,8 @@ fn apply_secret_env_forwarding(child: &mut Command, secret_env: &BTreeMap<String
 
 fn is_secret_env_key(key: &str) -> bool {
     matches!(key, "GH_TOKEN" | "GITHUB_TOKEN")
+        || key.ends_with("_TOKEN")
+        || key.ends_with("_API_KEY")
 }
 
 fn capture_devenv_env(
@@ -2655,6 +2657,14 @@ not-a-row
         let processes = parse_process_snapshot(snapshot);
         assert_eq!(processes.len(), 1);
         assert_eq!(processes.get(&100).unwrap().command, "devenv shell");
+    }
+
+    #[test]
+    fn secret_env_detection_covers_api_keys_and_tokens() {
+        assert!(super::is_secret_env_key("GH_TOKEN"));
+        assert!(super::is_secret_env_key("CONTEXT7_API_KEY"));
+        assert!(super::is_secret_env_key("SOME_SERVICE_TOKEN"));
+        assert!(!super::is_secret_env_key("PGDATABASE"));
     }
 
     #[test]

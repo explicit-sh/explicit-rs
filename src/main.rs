@@ -1,4 +1,5 @@
 mod analysis;
+mod codex_mcp;
 mod devenv_file;
 mod env_trace;
 mod eol;
@@ -296,6 +297,7 @@ fn launch_agent(binary: &str, args: AgentArgs) -> Result<ExitCode> {
     let routed = parallel::route_agent_launch(&root, binary)?;
     let analysis = Analysis::analyze(&routed.root)?;
     let mut extra_env = routed.extra_env.clone();
+    extra_env.extend(codex_mcp::sandbox_env()?);
     extra_env.extend(github_app::sandbox_env(&routed.root, &analysis)?);
     let (observe, passthrough_args) = extract_observe_flag(args.args);
     let command = build_agent_command(&routed.root, binary, &passthrough_args)?;
@@ -331,6 +333,7 @@ fn launch_observed_agent(binary: &str, args: ObserveAgentArgs) -> Result<ExitCod
     let routed = parallel::route_agent_launch(&root, binary)?;
     let analysis = Analysis::analyze(&routed.root)?;
     let mut extra_env = routed.extra_env.clone();
+    extra_env.extend(codex_mcp::sandbox_env()?);
     extra_env.extend(github_app::sandbox_env(&routed.root, &analysis)?);
     let command = build_agent_command(&routed.root, binary, &args.args)?;
     observe::launch_observed_agent(
