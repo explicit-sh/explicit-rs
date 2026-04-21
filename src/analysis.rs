@@ -28,6 +28,7 @@ mod ruby_heuristics;
 
 pub const SUPPORT_PACKAGES: &[&str] = &["actionlint", "git", "jq", "nono"];
 const NO_COMMANDS_NOTE: &str = "No explicit lint/build/test commands were discovered, so validation hooks stay advisory until the project exposes them.";
+const BROWSER_TEST_SANDBOX_NOTE: &str = "Sandbox: detected browser-driven tests; allowing read-only access to installed browser apps such as /Applications/Google Chrome.app.";
 const EXPLICIT_CONFIG_FILE: &str = "explicit.toml";
 const MINIMUM_COVERAGE_PERCENT: u8 = 80;
 const WORKSPACE_IGNORED_DIRS: &[&str] = &[
@@ -1787,7 +1788,63 @@ fn analyze_common_files(
         builder.add_lint("tofu fmt -check -recursive");
     }
 
+    if project_uses_browser_tests(context) {
+        builder.add_note(BROWSER_TEST_SANDBOX_NOTE);
+    }
+
     Ok(())
+}
+
+fn project_uses_browser_tests(context: &ProjectContext) -> bool {
+    has_any_dependency(
+        context.dependencies("javascript"),
+        &[
+            "@playwright/test",
+            "playwright",
+            "cypress",
+            "puppeteer",
+            "puppeteer-core",
+            "selenium-webdriver",
+            "webdriverio",
+            "@wdio/cli",
+            "@wdio/local-runner",
+            "nightwatch",
+            "testcafe",
+            "@web/test-runner",
+            "web-test-runner",
+        ],
+    ) || has_any_dependency(context.dependencies("elixir"), &["wallaby", "hound"])
+        || package_json_scripts_use_browser_tests(context.package_json())
+}
+
+fn has_any_dependency(dependencies: Option<&BTreeSet<String>>, expected: &[&str]) -> bool {
+    let Some(dependencies) = dependencies else {
+        return false;
+    };
+    expected.iter().any(|name| dependencies.contains(*name))
+}
+
+fn package_json_scripts_use_browser_tests(payload: Option<&serde_json::Value>) -> bool {
+    let Some(scripts) = payload
+        .and_then(|value| value.get("scripts"))
+        .and_then(serde_json::Value::as_object)
+    else {
+        return false;
+    };
+
+    scripts.values().any(|value| {
+        let Some(script) = value.as_str() else {
+            return false;
+        };
+        let normalized = script.to_lowercase();
+        normalized.contains("playwright")
+            || normalized.contains("cypress")
+            || normalized.contains("puppeteer")
+            || normalized.contains("selenium")
+            || normalized.contains("webdriverio")
+            || normalized.contains("testcafe")
+            || normalized.contains("nightwatch")
+    })
 }
 
 fn apply_registry_matches(
@@ -3119,6 +3176,16 @@ fn build_sandbox_plan(root: &Path, builder: &Builder) -> Result<SandboxPlan> {
         }
     }
 
+    if builder
+        .notes
+        .iter()
+        .any(|note| note == BROWSER_TEST_SANDBOX_NOTE)
+    {
+        for path in macos_browser_test_read_only_paths() {
+            read_only_dirs.insert(path);
+        }
+    }
+
     for system_dir in [
         PathBuf::from("/nix"),
         PathBuf::from("/bin"),
@@ -3421,6 +3488,14 @@ fn linux_agent_read_write_paths(_home: &Path) -> Vec<PathBuf> {
     Vec::new()
 }
 
+fn macos_browser_test_read_only_paths() -> Vec<PathBuf> {
+    vec![
+        PathBuf::from("/Applications/Google Chrome.app"),
+        PathBuf::from("/Applications/Google Chrome for Testing.app"),
+        PathBuf::from("/Applications/Chromium.app"),
+    ]
+}
+
 fn linux_agent_read_only_paths(_home: &Path) -> Vec<PathBuf> {
     Vec::new()
 }
@@ -3428,13 +3503,14 @@ fn linux_agent_read_only_paths(_home: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Analysis, Builder, EXPLICIT_CONFIG_FILE, LanguageRequirement, MINIMUM_COVERAGE_PERCENT,
-        NO_COMMANDS_NOTE, RepositoryMetadata, RequirementKind, RuntimeKind, SUPPORT_PACKAGES,
-        SandboxPlan, build_sandbox_plan, configured_sandbox_paths, expand_config_path_value,
-        fallback_javascript_test_commands, insert_path_with_realpath,
-        platform_agent_read_only_paths, platform_agent_read_write_paths,
-        referenced_instruction_paths, script_is_placeholder, script_is_verification_ready,
-        standard_device_read_write_paths, standard_temp_read_write_paths,
+        Analysis, BROWSER_TEST_SANDBOX_NOTE, Builder, EXPLICIT_CONFIG_FILE, LanguageRequirement,
+        MINIMUM_COVERAGE_PERCENT, NO_COMMANDS_NOTE, RepositoryMetadata, RequirementKind,
+        RuntimeKind, SUPPORT_PACKAGES, SandboxPlan, build_sandbox_plan, configured_sandbox_paths,
+        expand_config_path_value, fallback_javascript_test_commands, insert_path_with_realpath,
+        macos_browser_test_read_only_paths, platform_agent_read_only_paths,
+        platform_agent_read_write_paths, referenced_instruction_paths, script_is_placeholder,
+        script_is_verification_ready, standard_device_read_write_paths,
+        standard_temp_read_write_paths,
     };
     use std::{collections::BTreeSet, fs, path::PathBuf};
     use tempfile::tempdir;
@@ -3588,6 +3664,75 @@ mod tests {
         assert!(read_only.contains(&PathBuf::from("/Library/Keychains")));
         assert!(read_only.contains(&PathBuf::from("/var/select")));
         assert!(read_only.contains(&PathBuf::from("/private/var/select")));
+    }
+
+    #[test]
+    fn browser_test_paths_include_google_chrome() {
+        let paths = macos_browser_test_read_only_paths();
+        assert!(paths.contains(&PathBuf::from("/Applications/Google Chrome.app")));
+    }
+
+    #[test]
+    fn playwright_projects_gain_browser_app_access_note() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{
+  "name": "browser-tests",
+  "devDependencies": {
+    "@playwright/test": "^1.50.0"
+  }
+}"#,
+        )
+        .unwrap();
+
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert!(
+            analysis
+                .notes
+                .iter()
+                .any(|note| note == BROWSER_TEST_SANDBOX_NOTE)
+        );
+    }
+
+    #[test]
+    fn wallaby_projects_gain_browser_app_access_note() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("mix.exs"),
+            r#"defmodule Demo.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :demo,
+      version: "0.1.0",
+      elixir: "~> 1.17",
+      deps: deps()
+    ]
+  end
+
+  def application do
+    [extra_applications: [:logger]]
+  end
+
+  defp deps do
+    [
+      {:wallaby, "~> 0.30", only: :test}
+    ]
+  end
+end
+"#,
+        )
+        .unwrap();
+
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert!(
+            analysis
+                .notes
+                .iter()
+                .any(|note| note == BROWSER_TEST_SANDBOX_NOTE)
+        );
     }
 
     #[test]
