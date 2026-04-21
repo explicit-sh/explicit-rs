@@ -3131,11 +3131,7 @@ fn build_sandbox_plan(root: &Path, builder: &Builder) -> Result<SandboxPlan> {
         }
     }
     for path in platform_agent_read_only_paths(&home) {
-        if path.is_file() {
-            read_only_files.insert(path);
-        } else {
-            read_only_dirs.insert(path);
-        }
+        insert_read_only_path_with_realpath(&mut read_only_files, &mut read_only_dirs, path);
     }
     for path in referenced_instruction_paths(root)? {
         if path.is_file() {
@@ -3182,7 +3178,7 @@ fn build_sandbox_plan(root: &Path, builder: &Builder) -> Result<SandboxPlan> {
         .any(|note| note == BROWSER_TEST_SANDBOX_NOTE)
     {
         for path in macos_browser_test_read_only_paths() {
-            read_only_dirs.insert(path);
+            insert_read_only_path_with_realpath(&mut read_only_files, &mut read_only_dirs, path);
         }
     }
 
@@ -3372,6 +3368,28 @@ fn insert_path_with_realpath(paths: &mut BTreeSet<PathBuf>, path: PathBuf) {
     }
 }
 
+fn insert_read_only_path_with_realpath(
+    files: &mut BTreeSet<PathBuf>,
+    dirs: &mut BTreeSet<PathBuf>,
+    path: PathBuf,
+) {
+    let metadata = fs::symlink_metadata(&path).ok();
+    if metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.file_type().is_symlink())
+    {
+        if let Ok(real_path) = fs::canonicalize(&path) {
+            insert_read_only_path_with_realpath(files, dirs, real_path);
+        }
+    }
+
+    if path.is_file() {
+        files.insert(path);
+    } else {
+        dirs.insert(path);
+    }
+}
+
 fn referenced_instruction_paths(root: &Path) -> Result<Vec<PathBuf>> {
     let agents_path = root.join("AGENTS.md");
     if !agents_path.exists() {
@@ -3490,6 +3508,8 @@ fn linux_agent_read_write_paths(_home: &Path) -> Vec<PathBuf> {
 
 fn macos_browser_test_read_only_paths() -> Vec<PathBuf> {
     vec![
+        PathBuf::from("/etc/ssl/cert.pem"),
+        PathBuf::from("/etc/ssl/certs/ca-certificates.crt"),
         PathBuf::from("/Applications/Google Chrome.app"),
         PathBuf::from("/Applications/Google Chrome for Testing.app"),
         PathBuf::from("/Applications/Chromium.app"),
@@ -3507,12 +3527,12 @@ mod tests {
         MINIMUM_COVERAGE_PERCENT, NO_COMMANDS_NOTE, RepositoryMetadata, RequirementKind,
         RuntimeKind, SUPPORT_PACKAGES, SandboxPlan, build_sandbox_plan, configured_sandbox_paths,
         expand_config_path_value, fallback_javascript_test_commands, insert_path_with_realpath,
-        macos_browser_test_read_only_paths, platform_agent_read_only_paths,
-        platform_agent_read_write_paths, referenced_instruction_paths, script_is_placeholder,
-        script_is_verification_ready, standard_device_read_write_paths,
-        standard_temp_read_write_paths,
+        insert_read_only_path_with_realpath, macos_browser_test_read_only_paths,
+        platform_agent_read_only_paths, platform_agent_read_write_paths,
+        referenced_instruction_paths, script_is_placeholder, script_is_verification_ready,
+        standard_device_read_write_paths, standard_temp_read_write_paths,
     };
-    use std::{collections::BTreeSet, fs, path::PathBuf};
+    use std::{collections::BTreeSet, fs, os::unix::fs::symlink, path::PathBuf};
     use tempfile::tempdir;
 
     #[test]
@@ -3669,7 +3689,27 @@ mod tests {
     #[test]
     fn browser_test_paths_include_google_chrome() {
         let paths = macos_browser_test_read_only_paths();
+        assert!(paths.contains(&PathBuf::from("/etc/ssl/cert.pem")));
+        assert!(paths.contains(&PathBuf::from("/etc/ssl/certs/ca-certificates.crt")));
         assert!(paths.contains(&PathBuf::from("/Applications/Google Chrome.app")));
+    }
+
+    #[test]
+    fn read_only_path_helper_adds_symlink_realpath_target() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("ca-certificates.crt");
+        fs::write(&target, "demo").unwrap();
+        let link = dir.path().join("cert.pem");
+        symlink(&target, &link).unwrap();
+
+        let mut files = BTreeSet::new();
+        let mut dirs = BTreeSet::new();
+        insert_read_only_path_with_realpath(&mut files, &mut dirs, link.clone());
+
+        let canonical_target = fs::canonicalize(&target).unwrap();
+        assert!(files.contains(&link));
+        assert!(files.contains(&canonical_target));
+        assert!(dirs.is_empty());
     }
 
     #[test]
