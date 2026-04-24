@@ -34,7 +34,7 @@ pub struct ObservedAgentOptions<'a> {
 
 pub fn list_runs(root: &Path) -> Result<()> {
     let mut runs = load_run_rows(root)?;
-    runs.sort_by(|left, right| right.started_at_ms.cmp(&left.started_at_ms));
+    runs.sort_by_key(|right| std::cmp::Reverse(right.started_at_ms));
 
     if runs.is_empty() {
         println!(
@@ -898,7 +898,7 @@ fn load_run_rows(root: &Path) -> Result<Vec<RunRow>> {
 
 fn latest_run_row(root: &Path) -> Result<RunRow> {
     let mut runs = load_run_rows(root)?;
-    runs.sort_by(|left, right| right.started_at_ms.cmp(&left.started_at_ms));
+    runs.sort_by_key(|right| std::cmp::Reverse(right.started_at_ms));
     runs.into_iter().next().with_context(|| {
         format!(
             "no observed runs under {}",
