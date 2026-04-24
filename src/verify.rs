@@ -154,7 +154,7 @@ pub fn run_project_checks(
     let mode = VerifyMode::from_flags(stop_hook, git_hook);
     let hook_client = detect_stop_hook_client(mode);
     let output_style = verify_output_style(mode);
-    let checks = project_checks(analysis);
+    let checks = project_checks(analysis, mode);
     let command_checks = analysis.migration_checks.len() + checks.len();
     let total_checks = command_checks + project_policy_check_count(analysis, mode);
     let displayed_checks = displayed_check_count(command_checks, total_checks);
@@ -345,7 +345,7 @@ fn report_single_failure(
     Ok(ExitCode::from(2))
 }
 
-fn project_checks(analysis: &Analysis) -> Vec<ProjectCheck> {
+fn project_checks(analysis: &Analysis, mode: VerifyMode) -> Vec<ProjectCheck> {
     let mut checks = Vec::new();
     let base_ordinal = analysis.migration_checks.len();
     for command in &analysis.lint_commands {
@@ -369,12 +369,15 @@ fn project_checks(analysis: &Analysis) -> Vec<ProjectCheck> {
             command: command.clone(),
         });
     }
-    for command in &analysis.coverage_commands {
-        checks.push(ProjectCheck {
-            ordinal: base_ordinal + checks.len(),
-            kind: "coverage",
-            command: command.clone(),
-        });
+    // Coverage is skipped in git-hook mode: it belongs in CI, not in pre-push hooks.
+    if mode != VerifyMode::GitHook {
+        for command in &analysis.coverage_commands {
+            checks.push(ProjectCheck {
+                ordinal: base_ordinal + checks.len(),
+                kind: "coverage",
+                command: command.clone(),
+            });
+        }
     }
     checks
 }
@@ -2636,7 +2639,7 @@ mod tests {
 
     #[test]
     fn collects_checks_in_lint_build_test_order() {
-        let checks = project_checks(&analysis_with_checks());
+        let checks = project_checks(&analysis_with_checks(), VerifyMode::User);
         assert_eq!(checks.len(), 3);
         assert_eq!(checks[0].kind, "lint");
         assert_eq!(checks[1].kind, "build");
@@ -2651,11 +2654,35 @@ mod tests {
         let mut analysis = analysis_with_checks();
         analysis.coverage_commands = vec!["cargo llvm-cov --summary-only".to_string()];
 
-        let checks = project_checks(&analysis);
+        let checks = project_checks(&analysis, VerifyMode::User);
         assert_eq!(checks.len(), 4);
         assert_eq!(checks[3].kind, "coverage");
         assert_eq!(checks[3].command, "cargo llvm-cov --summary-only");
         assert_eq!(checks[3].ordinal, 3);
+    }
+
+    #[test]
+    fn git_hook_mode_skips_coverage_checks() {
+        let mut analysis = analysis_with_checks();
+        analysis.coverage_commands = vec!["cargo llvm-cov --summary-only".to_string()];
+
+        let checks = project_checks(&analysis, VerifyMode::GitHook);
+        assert_eq!(
+            checks.len(),
+            3,
+            "coverage should be excluded in git-hook mode"
+        );
+        assert!(checks.iter().all(|c| c.kind != "coverage"));
+    }
+
+    #[test]
+    fn stop_hook_mode_includes_coverage_checks() {
+        let mut analysis = analysis_with_checks();
+        analysis.coverage_commands = vec!["cargo llvm-cov --summary-only".to_string()];
+
+        let checks = project_checks(&analysis, VerifyMode::StopHook);
+        assert_eq!(checks.len(), 4);
+        assert_eq!(checks[3].kind, "coverage");
     }
 
     #[test]
@@ -3838,7 +3865,7 @@ jobs:
 
     #[test]
     fn cargo_and_mix_build_families_share_lanes() {
-        let checks = project_checks(&analysis_with_checks());
+        let checks = project_checks(&analysis_with_checks(), VerifyMode::User);
         let lanes = super::build_check_lanes(&checks);
         assert_eq!(lanes.len(), 3);
         assert_eq!(
