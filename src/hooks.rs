@@ -333,15 +333,15 @@ fn ensure_config_dir(path: &Path) -> Result<()> {
                 .with_context(|| format!("failed to remove {}", path.display()))?;
         }
     }
-    if let Ok(metadata) = fs::symlink_metadata(path) {
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
-            if metadata.is_dir() && !metadata.file_type().is_symlink() {
-                fs::remove_dir_all(path)
-                    .with_context(|| format!("failed to remove {}", path.display()))?;
-            } else {
-                fs::remove_file(path)
-                    .with_context(|| format!("failed to remove {}", path.display()))?;
-            }
+    if let Ok(metadata) = fs::symlink_metadata(path)
+        && (!metadata.is_dir() || metadata.file_type().is_symlink())
+    {
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            fs::remove_dir_all(path)
+                .with_context(|| format!("failed to remove {}", path.display()))?;
+        } else {
+            fs::remove_file(path)
+                .with_context(|| format!("failed to remove {}", path.display()))?;
         }
     }
     fs::create_dir_all(path).with_context(|| format!("failed to create {}", path.display()))

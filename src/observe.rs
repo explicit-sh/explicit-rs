@@ -228,33 +228,45 @@ pub fn print_report(root: &Path, run: Option<&str>, latest: bool) -> Result<()> 
     Ok(())
 }
 
+pub struct LiveAgentOptions {
+    pub agent: String,
+    pub command: String,
+    pub block_network: bool,
+    pub no_services: bool,
+    pub no_sandbox: bool,
+    pub dangerously_use_end_of_life_versions: bool,
+    pub extra_env: BTreeMap<String, String>,
+}
+
 pub fn launch_live_agent(
     root: &Path,
     analysis: &Analysis,
-    agent: &str,
-    command: String,
-    block_network: bool,
-    no_services: bool,
-    no_sandbox: bool,
-    dangerously_use_end_of_life_versions: bool,
-    extra_env: BTreeMap<String, String>,
+    options: LiveAgentOptions,
 ) -> Result<ExitCode> {
     let server = LiveRunServer::start(
         root,
-        LiveRunSnapshot::new(root, agent, &command, false, None, None, None),
+        LiveRunSnapshot::new(
+            root,
+            &options.agent,
+            &options.command,
+            false,
+            None,
+            None,
+            None,
+        ),
     )?;
     server.update(|snapshot| snapshot.state = "running".to_string());
     let status = runtime::launch_shell(
         root,
         analysis,
         runtime::LaunchShellOptions {
-            agent: Some(agent),
-            command: Some(&command),
-            block_network,
-            no_services,
-            no_sandbox,
-            dangerously_use_end_of_life_versions,
-            extra_env: (!extra_env.is_empty()).then_some(&extra_env),
+            agent: Some(&options.agent),
+            command: Some(&options.command),
+            block_network: options.block_network,
+            no_services: options.no_services,
+            no_sandbox: options.no_sandbox,
+            dangerously_use_end_of_life_versions: options.dangerously_use_end_of_life_versions,
+            extra_env: (!options.extra_env.is_empty()).then_some(&options.extra_env),
             transcript_path: None,
             skip_stop_hooks: false,
         },

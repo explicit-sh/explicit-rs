@@ -3384,10 +3384,9 @@ fn insert_read_only_path_with_realpath(
     if metadata
         .as_ref()
         .is_some_and(|metadata| metadata.file_type().is_symlink())
+        && let Ok(real_path) = fs::canonicalize(&path)
     {
-        if let Ok(real_path) = fs::canonicalize(&path) {
-            insert_read_only_path_with_realpath(files, dirs, real_path);
-        }
+        insert_read_only_path_with_realpath(files, dirs, real_path);
     }
 
     if path.is_file() {

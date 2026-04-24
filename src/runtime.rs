@@ -157,15 +157,15 @@ fn ensure_project_directory(path: PathBuf) -> Result<()> {
                 .with_context(|| format!("failed to remove {}", path.display()))?;
         }
     }
-    if let Ok(metadata) = fs::symlink_metadata(&path) {
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
-            if metadata.is_dir() && !metadata.file_type().is_symlink() {
-                fs::remove_dir_all(&path)
-                    .with_context(|| format!("failed to remove {}", path.display()))?;
-            } else {
-                fs::remove_file(&path)
-                    .with_context(|| format!("failed to remove {}", path.display()))?;
-            }
+    if let Ok(metadata) = fs::symlink_metadata(&path)
+        && (!metadata.is_dir() || metadata.file_type().is_symlink())
+    {
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            fs::remove_dir_all(&path)
+                .with_context(|| format!("failed to remove {}", path.display()))?;
+        } else {
+            fs::remove_file(&path)
+                .with_context(|| format!("failed to remove {}", path.display()))?;
         }
     }
     fs::create_dir_all(&path).with_context(|| format!("failed to create {}", path.display()))
@@ -3205,7 +3205,7 @@ Error:   × Could not bind localhost:5432
             ("MIX_LOG".to_string(), log.display().to_string()),
         ]);
 
-        sync_elixir_usage_rules(&[project.clone()], &env_map, &runtime, 2, 3).unwrap();
+        sync_elixir_usage_rules(std::slice::from_ref(&project), &env_map, &runtime, 2, 3).unwrap();
 
         let output = fs::read_to_string(&log).unwrap();
         assert!(output.contains("project::deps.get usage_rules"));

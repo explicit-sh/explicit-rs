@@ -14,7 +14,7 @@ mod runtime;
 mod sandbox;
 mod verify;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use analysis::Analysis;
@@ -383,13 +383,15 @@ fn launch_agent(binary: &str, args: AgentArgs, no_sandbox: bool) -> Result<ExitC
     observe::launch_live_agent(
         &routed.root,
         &analysis,
-        binary,
-        command,
-        false,
-        false,
-        no_sandbox,
-        args.dangerously_use_end_of_life_versions,
-        extra_env,
+        observe::LiveAgentOptions {
+            agent: binary.to_string(),
+            command,
+            block_network: false,
+            no_services: false,
+            no_sandbox,
+            dangerously_use_end_of_life_versions: args.dangerously_use_end_of_life_versions,
+            extra_env,
+        },
     )
 }
 
@@ -421,7 +423,7 @@ fn launch_observed_agent(
     )
 }
 
-fn build_agent_command(root: &PathBuf, binary: &str, args: &[String]) -> Result<String> {
+fn build_agent_command(root: &Path, binary: &str, args: &[String]) -> Result<String> {
     let executable = preferred_command_path(binary)
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| binary.to_string());

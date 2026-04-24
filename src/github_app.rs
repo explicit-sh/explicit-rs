@@ -210,10 +210,10 @@ fn allowed_repository_names(
     extra_repositories: &[String],
 ) -> Result<Vec<String>> {
     let mut slugs = BTreeSet::new();
-    if let Some(github) = &analysis.repository.github {
-        if !github.slug.trim().is_empty() {
-            slugs.insert(github.slug.clone());
-        }
+    if let Some(github) = &analysis.repository.github
+        && !github.slug.trim().is_empty()
+    {
+        slugs.insert(github.slug.clone());
     }
     slugs.extend(github_submodule_slugs(root)?);
     slugs.extend(
