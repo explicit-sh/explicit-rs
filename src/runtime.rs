@@ -26,12 +26,47 @@ pub struct LaunchShellOptions<'a> {
     pub command: Option<&'a str>,
     pub block_network: bool,
     pub no_services: bool,
+    pub no_sandbox: bool,
     pub dangerously_use_end_of_life_versions: bool,
     pub extra_env: Option<&'a BTreeMap<String, String>>,
     pub transcript_path: Option<&'a Path>,
+    pub skip_stop_hooks: bool,
 }
 
 const SECRET_ENV_FORWARDING_JSON: &str = "EXPLICIT_SECRET_ENV_FORWARDING_JSON";
+const ELIXIR_USAGE_RULES_PROJECT_ENTRY: &str = "usage_rules: usage_rules(),";
+const ELIXIR_USAGE_RULES_DEP_ENTRY: &str = r#"{:usage_rules, "~> 1.0", only: [:dev]},"#;
+const ELIXIR_USAGE_RULES_SYNC_COMMAND: &str = "mix usage_rules.sync";
+const ELIXIR_USAGE_RULES_DEPS_GET_COMMAND: &str = "mix deps.get usage_rules";
+const ELIXIR_USAGE_RULES_BLOCK: &str = r#"  defp usage_rules do
+    # Example for those using claude.
+    [
+      file: "CLAUDE.md",
+      # rules to include directly in CLAUDE.md
+      usage_rules: ["usage_rules:all"],
+      skills: [
+        location: ".claude/skills",
+        # build skills that combine multiple usage rules
+        build: [
+          "ash-framework": [
+            # The description tells people how to use this skill.
+            description:
+              "Use this skill working with Ash Framework or any of its extensions. Always consult this when making any domain changes, features or fixes.",
+            # Include all Ash dependencies
+            usage_rules: [:ash, ~r/^ash_/]
+          ],
+          "phoenix-framework": [
+            description:
+              "Use this skill working with Phoenix Framework. Consult this when working with the web layer, controllers, views, liveviews etc.",
+            # Include all Phoenix dependencies
+            usage_rules: [:phoenix, ~r/^phoenix_/]
+          ]
+        ]
+      ]
+    ]
+  end
+
+"#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DeploySshSetup {
@@ -75,7 +110,16 @@ pub(crate) fn ensure_managed_devenv_files(root: &Path, analysis: &Analysis) -> R
 }
 
 pub fn apply_project(root: &Path, analysis: &Analysis) -> Result<()> {
+    apply_project_inner(root, analysis, true)
+}
+
+pub(crate) fn apply_project_no_hooks(root: &Path, analysis: &Analysis) -> Result<()> {
+    apply_project_inner(root, analysis, false)
+}
+
+fn apply_project_inner(root: &Path, analysis: &Analysis, write_hooks: bool) -> Result<()> {
     repair_managed_project_dirs(root)?;
+    ensure_elixir_usage_rules(root, analysis)?;
     ensure_managed_devenv_files(root, analysis)?;
     fs::create_dir_all(root.join(".nono")).context("failed to create .nono directory")?;
     write_if_changed(
@@ -88,7 +132,9 @@ pub fn apply_project(root: &Path, analysis: &Analysis) -> Result<()> {
         serde_json::to_string_pretty(&analysis.sandbox_plan)?,
     )
     .context("failed to write .nono/sandbox-plan.json")?;
-    write_stop_hook_assets(root, analysis)?;
+    if write_hooks {
+        write_stop_hook_assets(root, analysis)?;
+    }
     Ok(())
 }
 
@@ -123,6 +169,175 @@ fn ensure_project_directory(path: PathBuf) -> Result<()> {
         }
     }
     fs::create_dir_all(&path).with_context(|| format!("failed to create {}", path.display()))
+}
+
+fn ensure_elixir_usage_rules(root: &Path, analysis: &Analysis) -> Result<()> {
+    for project_root in elixir_project_roots(root, analysis) {
+        let mix_exs = project_root.join("mix.exs");
+        if !mix_exs.is_file() {
+            continue;
+        }
+
+        let mut contents = fs::read_to_string(&mix_exs)
+            .with_context(|| format!("failed to read {}", mix_exs.display()))?;
+        let mut changed = false;
+
+        if !contents.contains(ELIXIR_USAGE_RULES_PROJECT_ENTRY) {
+            contents = insert_into_project_block(&contents, ELIXIR_USAGE_RULES_PROJECT_ENTRY)
+                .with_context(|| format!("failed to update {}", mix_exs.display()))?;
+            changed = true;
+        }
+        if !contents.contains("defp usage_rules do") {
+            contents = insert_usage_rules_block(&contents)
+                .with_context(|| format!("failed to update {}", mix_exs.display()))?;
+            changed = true;
+        }
+        if !contents.contains("{:usage_rules,") {
+            contents = insert_into_deps_block(&contents, ELIXIR_USAGE_RULES_DEP_ENTRY)
+                .with_context(|| format!("failed to update {}", mix_exs.display()))?;
+            changed = true;
+        }
+
+        if changed {
+            write_if_changed(&mix_exs, contents)?;
+        }
+    }
+    Ok(())
+}
+
+fn elixir_project_roots(root: &Path, analysis: &Analysis) -> Vec<PathBuf> {
+    let mut roots = BTreeSet::new();
+    if root.join("mix.exs").is_file() {
+        roots.insert(root.to_path_buf());
+    }
+
+    for value in analysis
+        .detected_versions
+        .iter()
+        .map(|version| version.source.as_str())
+        .chain(
+            analysis
+                .required_checks
+                .iter()
+                .map(|requirement| requirement.subject.as_str()),
+        )
+    {
+        let Some(mix_exs_path) = mix_exs_path_from_metadata(value) else {
+            continue;
+        };
+        let project_root = match mix_exs_path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => root.join(parent),
+            _ => root.to_path_buf(),
+        };
+        if project_root.join("mix.exs").is_file() {
+            roots.insert(project_root);
+        }
+    }
+
+    roots.into_iter().collect()
+}
+
+fn mix_exs_path_from_metadata(value: &str) -> Option<PathBuf> {
+    let path = Path::new(value.split('#').next()?);
+    (path.file_name()? == "mix.exs").then(|| path.to_path_buf())
+}
+
+fn insert_into_project_block(contents: &str, entry: &str) -> Result<String> {
+    insert_into_mix_list(contents, "def project do", entry)
+}
+
+fn insert_into_deps_block(contents: &str, entry: &str) -> Result<String> {
+    insert_into_mix_list(contents, "defp deps do", entry)
+}
+
+fn insert_into_mix_list(contents: &str, signature: &str, entry: &str) -> Result<String> {
+    let (open, close) = find_mix_list_bounds(contents, signature)?;
+    let list_inner = &contents[open + 1..close];
+    let updated_inner = if list_inner.contains('\n') {
+        rewrite_multiline_mix_list(contents, open, close, entry)
+    } else {
+        rewrite_inline_mix_list(contents, open, close, entry)
+    };
+
+    let mut updated = String::with_capacity(contents.len() + updated_inner.len() + entry.len() + 8);
+    updated.push_str(&contents[..open + 1]);
+    updated.push_str(&updated_inner);
+    updated.push_str(&contents[close..]);
+    Ok(updated)
+}
+
+fn find_mix_list_bounds(contents: &str, signature: &str) -> Result<(usize, usize)> {
+    let start = contents
+        .find(signature)
+        .with_context(|| format!("mix.exs is missing `{signature}`"))?;
+    let body_start = start + signature.len();
+    let suffix = &contents[body_start..];
+    let body_end_offset = suffix
+        .find("\n  end")
+        .or_else(|| suffix.find("\nend"))
+        .or_else(|| suffix.find(" end"))
+        .with_context(|| format!("could not find end of `{signature}` block"))?;
+    let body = &contents[body_start..body_start + body_end_offset];
+    let open = body
+        .find('[')
+        .with_context(|| format!("could not find list start in `{signature}` block"))?;
+    let close = body
+        .rfind(']')
+        .with_context(|| format!("could not find list end in `{signature}` block"))?;
+    Ok((body_start + open, body_start + close))
+}
+
+fn rewrite_inline_mix_list(contents: &str, open: usize, close: usize, entry: &str) -> String {
+    let list_inner = contents[open + 1..close].trim();
+    let inline_entry = entry.trim_end_matches(',');
+    if list_inner.is_empty() {
+        return inline_entry.to_string();
+    }
+    if list_inner.ends_with(',') {
+        format!("{list_inner} {inline_entry}")
+    } else {
+        format!("{list_inner}, {inline_entry}")
+    }
+}
+
+fn rewrite_multiline_mix_list(contents: &str, open: usize, close: usize, entry: &str) -> String {
+    let list_inner = &contents[open + 1..close];
+    let close_line_start = contents[..close]
+        .rfind('\n')
+        .map(|index| index + 1)
+        .unwrap_or(close);
+    let closing_indent = &contents[close_line_start..close];
+    let entry_line = format!("{closing_indent}  {entry}");
+    let trimmed_end = list_inner.trim_end();
+
+    if trimmed_end.trim().is_empty() {
+        return format!("\n{entry_line}\n{closing_indent}");
+    }
+
+    let separator = if trimmed_end.ends_with(',') { "" } else { "," };
+    format!("{trimmed_end}{separator}\n{entry_line}\n{closing_indent}")
+}
+
+fn insert_usage_rules_block(contents: &str) -> Result<String> {
+    for anchor in [
+        "\n  # Configuration for the OTP application.",
+        "\n  def application do",
+        "\n  defp deps do",
+        "\nend\n",
+    ] {
+        if let Some(index) = contents.find(anchor) {
+            let mut updated =
+                String::with_capacity(contents.len() + ELIXIR_USAGE_RULES_BLOCK.len());
+            updated.push_str(&contents[..index]);
+            if !updated.ends_with("\n\n") {
+                updated.push('\n');
+            }
+            updated.push_str(ELIXIR_USAGE_RULES_BLOCK);
+            updated.push_str(&contents[index..]);
+            return Ok(updated);
+        }
+    }
+    bail!("could not find insertion point for `defp usage_rules do`")
 }
 
 fn write_if_changed(path: impl AsRef<Path>, content: impl AsRef<[u8]>) -> Result<()> {
@@ -285,15 +500,32 @@ pub fn launch_shell(
         &analysis.detected_versions,
         options.dangerously_use_end_of_life_versions,
     )?;
-    apply_project(root, analysis)?;
+    if options.skip_stop_hooks {
+        apply_project_no_hooks(root, analysis)?;
+    } else {
+        apply_project(root, analysis)?;
+    }
+    let elixir_project_roots = elixir_project_roots(root, analysis);
     let start_dev_servers = options.agent.is_some() && !analysis.dev_server_commands.is_empty();
+    let syncs_usage_rules = options.agent.is_some() && !elixir_project_roots.is_empty();
     let total_steps = shell_total_steps(
         !options.no_services && !analysis.services.is_empty(),
+        syncs_usage_rules,
         start_dev_servers,
     );
     let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
 
     let mut env_map = capture_devenv_env(root, 1, total_steps)?;
+    let mut secret_env = BTreeMap::new();
+    if let Some(extra_env) = options.extra_env {
+        for (key, value) in extra_env {
+            if is_secret_env_key(key) {
+                secret_env.insert(key.clone(), value.clone());
+            } else {
+                env_map.insert(key.clone(), value.clone());
+            }
+        }
+    }
     if !options.no_services && !analysis.services.is_empty() {
         run_devenv_up(root, 2, total_steps)?;
         if let Err(err) = ensure_postgres_shell_user(root, analysis, &env_map) {
@@ -320,34 +552,36 @@ pub fn launch_shell(
     prepare_swiftpm_shell_environment(analysis, &mut env_map)?;
     prepare_postgres_shell_environment(root, analysis, &mut env_map)?;
     allow_tls_certificate_paths(&env_map, &mut plan);
+    let mut next_step = 2;
+    if !options.no_services && !analysis.services.is_empty() {
+        next_step += 1;
+    }
+    if syncs_usage_rules {
+        sync_elixir_usage_rules(
+            &elixir_project_roots,
+            &env_map,
+            &runtime_dir,
+            next_step,
+            total_steps,
+        )?;
+        next_step += 1;
+    }
     let _dev_servers = if start_dev_servers {
         Some(start_dev_servers_for_agent(
             root,
             &analysis.dev_server_commands,
             &env_map,
             &runtime_dir,
-            if !options.no_services && !analysis.services.is_empty() {
-                3
-            } else {
-                2
-            },
+            next_step,
             total_steps,
         )?)
     } else {
         None
     };
-    prepare_agent_runtime(options.agent, &runtime_dir, &mut env_map, &mut plan)?;
-
-    let mut secret_env = BTreeMap::new();
-    if let Some(extra_env) = options.extra_env {
-        for (key, value) in extra_env {
-            if is_secret_env_key(key) {
-                secret_env.insert(key.clone(), value.clone());
-            } else {
-                env_map.insert(key.clone(), value.clone());
-            }
-        }
+    if start_dev_servers {
+        next_step += 1;
     }
+    prepare_agent_runtime(options.agent, &runtime_dir, &mut env_map, &mut plan)?;
     prioritize_launch_executable(&mut env_map, &mut plan, &current_exe);
 
     write_if_changed(&env_file, serde_json::to_string_pretty(&env_map)?)
@@ -355,11 +589,16 @@ pub fn launch_shell(
     write_if_changed(&plan_file, serde_json::to_string_pretty(&plan)?)
         .context("failed to write shell plan file")?;
 
-    let launch_step = shell_launch_step(
-        !options.no_services && !analysis.services.is_empty(),
-        start_dev_servers,
+    let launch_step = next_step;
+    print_step_start(
+        launch_step,
+        total_steps,
+        if options.no_sandbox {
+            "Launching shell without sandbox"
+        } else {
+            "Launching sandbox shell"
+        },
     );
-    print_step_start(launch_step, total_steps, "Launching sandbox shell");
     let mut child = build_sandbox_command(
         &current_exe,
         root,
@@ -369,6 +608,11 @@ pub fn launch_shell(
         options.transcript_path,
         &secret_env,
     );
+    if options.no_sandbox {
+        child.env("EXPLICIT_NO_SANDBOX", "1");
+    } else {
+        child.env_remove("EXPLICIT_NO_SANDBOX");
+    }
     if options.block_network {
         child.env("DEVENV_NONO_BLOCK_NETWORK", "1");
     } else {
@@ -409,12 +653,117 @@ fn print_workspace_summary(analysis: &Analysis) {
     }
 }
 
-fn shell_total_steps(starts_services: bool, starts_dev_servers: bool) -> usize {
-    2 + usize::from(starts_services) + usize::from(starts_dev_servers)
+fn shell_total_steps(
+    starts_services: bool,
+    syncs_usage_rules: bool,
+    starts_dev_servers: bool,
+) -> usize {
+    2 + usize::from(starts_services)
+        + usize::from(syncs_usage_rules)
+        + usize::from(starts_dev_servers)
 }
 
-fn shell_launch_step(starts_services: bool, starts_dev_servers: bool) -> usize {
-    shell_total_steps(starts_services, starts_dev_servers)
+fn sync_elixir_usage_rules(
+    project_roots: &[PathBuf],
+    env_map: &BTreeMap<String, String>,
+    runtime_dir: &Path,
+    step: usize,
+    total_steps: usize,
+) -> Result<()> {
+    if project_roots.is_empty() {
+        return Ok(());
+    }
+
+    print_step_start(step, total_steps, "Syncing Elixir usage rules");
+    let start = Instant::now();
+    let sync_dir = runtime_dir.join("usage-rules");
+    fs::create_dir_all(&sync_dir)
+        .with_context(|| format!("failed to create {}", sync_dir.display()))?;
+
+    for (index, project_root) in project_roots.iter().enumerate() {
+        let project_name = project_root
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "root".to_string());
+        if usage_rules_dependency_needs_fetch(project_root)? {
+            let deps_log = sync_dir.join(format!("{:02}-{project_name}-deps-get.log", index + 1));
+            run_project_shell_command(
+                project_root,
+                env_map,
+                ELIXIR_USAGE_RULES_DEPS_GET_COMMAND,
+                &deps_log,
+            )?;
+        }
+        let sync_log = sync_dir.join(format!("{:02}-{project_name}-sync.log", index + 1));
+        run_project_shell_command(
+            project_root,
+            env_map,
+            ELIXIR_USAGE_RULES_SYNC_COMMAND,
+            &sync_log,
+        )?;
+    }
+
+    print_step_done(
+        step,
+        total_steps,
+        "Elixir usage rules are synced",
+        start.elapsed(),
+    );
+    Ok(())
+}
+
+fn usage_rules_dependency_needs_fetch(project_root: &Path) -> Result<bool> {
+    if project_root.join("deps/usage_rules").is_dir() {
+        return Ok(false);
+    }
+    let lock = project_root.join("mix.lock");
+    if !lock.is_file() {
+        return Ok(true);
+    }
+    let contents =
+        fs::read_to_string(&lock).with_context(|| format!("failed to read {}", lock.display()))?;
+    Ok(!contents.contains("\"usage_rules\""))
+}
+
+fn run_project_shell_command(
+    project_root: &Path,
+    env_map: &BTreeMap<String, String>,
+    command: &str,
+    log_path: &Path,
+) -> Result<()> {
+    let output = Command::new("/bin/bash")
+        .current_dir(project_root)
+        .env_clear()
+        .envs(env_map)
+        .args(["-c", command])
+        .output()
+        .with_context(|| format!("failed to run `{command}` in {}", project_root.display()))?;
+
+    let mut log = Vec::with_capacity(output.stdout.len() + output.stderr.len());
+    log.extend_from_slice(&output.stdout);
+    log.extend_from_slice(&output.stderr);
+    write_if_changed(log_path, log)
+        .with_context(|| format!("failed to write {}", log_path.display()))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let details = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if details.is_empty() {
+        bail!(
+            "`{command}` failed in {} (log: {})",
+            project_root.display(),
+            log_path.display()
+        );
+    }
+    bail!(
+        "`{command}` failed in {}: {} (log: {})",
+        project_root.display(),
+        details,
+        log_path.display()
+    );
 }
 
 fn start_dev_servers_for_agent(
@@ -443,12 +792,12 @@ fn start_dev_servers_for_agent(
         let stderr_file = log_file
             .try_clone()
             .with_context(|| format!("failed to clone {}", log_path.display()))?;
-        let mut child = Command::new("bash");
+        let mut child = Command::new("/bin/bash");
         child
             .current_dir(root)
             .env_clear()
             .envs(env_map)
-            .args(["-lc", command])
+            .args(["-c", command])
             .stdout(Stdio::from(log_file))
             .stderr(Stdio::from(stderr_file));
         let mut child = child
@@ -700,11 +1049,11 @@ fn ensure_postgres_shell_user(
         return Ok(());
     };
 
-    let output = Command::new("bash")
+    let output = Command::new("/bin/bash")
         .current_dir(root)
         .env_clear()
         .envs(env_map)
-        .args(["-lc", &postgres_shell_user_ensure_command(&user)])
+        .args(["-c", &postgres_shell_user_ensure_command(&user)])
         .output()
         .context("failed to invoke PostgreSQL shell user setup")?;
 
@@ -1319,23 +1668,43 @@ fn ssh_keyscan_known_host_entries(host: &str) -> Result<BTreeSet<String>> {
 
 fn git_remote_ssh_hosts(root: &Path) -> Result<Vec<String>> {
     let git = preferred_command_path("git").unwrap_or_else(|| PathBuf::from("git"));
-    let output = Command::new(&git)
+    let mut hosts = Vec::new();
+    let remotes_output = Command::new(&git)
         .arg("-C")
         .arg(root)
-        .args(["config", "--get-regexp", r"^remote\..*\.url$"])
+        .arg("remote")
         .output()
         .context("failed to inspect git remotes for SSH hosts")?;
-    if !output.status.success() {
+    if !remotes_output.status.success() {
         return Ok(Vec::new());
     }
 
-    let mut hosts = Vec::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let Some((_, url)) = line.split_once(char::is_whitespace) else {
-            continue;
-        };
-        if let Some(host) = ssh_host_from_remote_url(url.trim()) {
-            push_unique_host(&mut hosts, &host);
+    let mut remotes = String::from_utf8_lossy(&remotes_output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|remote| !remote.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    remotes.sort_by_key(|name| if name == "origin" { 0 } else { 1 });
+
+    for remote in remotes {
+        for push in [false, true] {
+            let mut command = Command::new(&git);
+            command.arg("-C").arg(root).arg("remote").arg("get-url");
+            if push {
+                command.arg("--push");
+            }
+            let output = command
+                .arg(&remote)
+                .output()
+                .with_context(|| format!("failed to inspect git remote `{remote}`"))?;
+            if !output.status.success() {
+                continue;
+            }
+            let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if let Some(host) = ssh_host_from_remote_url(&url) {
+                push_unique_host(&mut hosts, &host);
+            }
         }
     }
     Ok(hosts)
@@ -2492,7 +2861,10 @@ fn process_rank(process: &ProcessSnapshot, depth: usize, has_children: bool) -> 
         || lower.contains("javac")
     {
         4
-    } else if lower.starts_with("sh -c") || lower.starts_with("bash -lc") {
+    } else if lower.starts_with("sh -c")
+        || lower.starts_with("bash -c")
+        || lower.starts_with("bash -lc")
+    {
         1
     } else {
         2
@@ -2570,16 +2942,17 @@ mod tests {
     use super::{
         allow_tls_certificate_paths, build_sandbox_command, classify_devenv_stderr_line,
         current_shell_user, deploy_host_lookup_queries, devenv_already_running_pid, doctor_report,
-        effective_ssh_agent_hosts, ensure_project_directory, extract_project_ssh_public_key_files,
-        git_remote_ssh_hosts, harmonize_tls_certificate_env, humanize_process_command,
-        is_overlay_xdg_root, is_plain_ssh_host_alias, parse_process_snapshot,
-        parse_ssh_config_details, parse_ssh_scan_target, postgres_shell_user_ensure_command,
-        preferred_swiftpm_host_paths, prepare_agent_home_overlay_from, prepare_deploy_ssh,
-        prepare_postgres_shell_environment, prepare_swiftpm_shell_environment, prepend_path,
-        prioritize_launch_executable, render_project_ssh_config_block, shell_escape_for_env,
-        shell_total_steps, should_skip_overlay_relative_path, ssh_config_value,
-        ssh_host_from_remote_url, stale_devenv_cache_detected, summarize_devenv_failure,
-        summarize_process_tree, uses_postgres_shell, write_project_known_hosts,
+        effective_ssh_agent_hosts, elixir_project_roots, ensure_project_directory,
+        extract_project_ssh_public_key_files, git_remote_ssh_hosts, harmonize_tls_certificate_env,
+        humanize_process_command, is_overlay_xdg_root, is_plain_ssh_host_alias,
+        mix_exs_path_from_metadata, parse_process_snapshot, parse_ssh_config_details,
+        parse_ssh_scan_target, postgres_shell_user_ensure_command, preferred_swiftpm_host_paths,
+        prepare_agent_home_overlay_from, prepare_deploy_ssh, prepare_postgres_shell_environment,
+        prepare_swiftpm_shell_environment, prepend_path, prioritize_launch_executable,
+        render_project_ssh_config_block, shell_escape_for_env, shell_total_steps,
+        should_skip_overlay_relative_path, ssh_config_value, ssh_host_from_remote_url,
+        stale_devenv_cache_detected, summarize_devenv_failure, summarize_process_tree,
+        sync_elixir_usage_rules, uses_postgres_shell, write_project_known_hosts,
         write_ssh_wrapper_scripts,
     };
     use crate::analysis::{
@@ -2589,7 +2962,7 @@ mod tests {
     use std::{
         collections::BTreeMap,
         env, fs,
-        os::unix::fs::symlink,
+        os::unix::fs::{PermissionsExt, symlink},
         path::{Path, PathBuf},
         process::Command,
         sync::{Mutex, OnceLock},
@@ -2756,10 +3129,88 @@ Error:   × Could not bind localhost:5432
 
     #[test]
     fn shell_total_steps_counts_services_and_dev_servers() {
-        assert_eq!(shell_total_steps(false, false), 2);
-        assert_eq!(shell_total_steps(true, false), 3);
-        assert_eq!(shell_total_steps(false, true), 3);
-        assert_eq!(shell_total_steps(true, true), 4);
+        assert_eq!(shell_total_steps(false, false, false), 2);
+        assert_eq!(shell_total_steps(true, false, false), 3);
+        assert_eq!(shell_total_steps(false, true, false), 3);
+        assert_eq!(shell_total_steps(false, false, true), 3);
+        assert_eq!(shell_total_steps(true, true, true), 5);
+    }
+
+    #[test]
+    fn mix_exs_metadata_paths_are_detected() {
+        assert_eq!(
+            mix_exs_path_from_metadata("services/stuffix/mix.exs#elixir"),
+            Some(PathBuf::from("services/stuffix/mix.exs"))
+        );
+        assert_eq!(
+            mix_exs_path_from_metadata("mix.exs#test_coverage"),
+            Some(PathBuf::from("mix.exs"))
+        );
+        assert_eq!(mix_exs_path_from_metadata("README.md"), None);
+    }
+
+    #[test]
+    fn elixir_project_roots_include_workspace_members() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let service = root.join("services/stuffix");
+        fs::create_dir_all(&service).unwrap();
+        fs::write(root.join("mix.exs"), "defmodule Root do\nend\n").unwrap();
+        fs::write(service.join("mix.exs"), "defmodule Service do\nend\n").unwrap();
+
+        let mut analysis = empty_analysis();
+        analysis.detected_versions = vec![DetectedVersion {
+            runtime: RuntimeKind::Elixir,
+            version: "~> 1.15".to_string(),
+            source: "services/stuffix/mix.exs#elixir".to_string(),
+            kind: VersionKind::Constraint,
+            config_lines: Vec::new(),
+        }];
+
+        assert_eq!(
+            elixir_project_roots(root, &analysis),
+            vec![root.to_path_buf(), service]
+        );
+    }
+
+    #[test]
+    fn sync_elixir_usage_rules_fetches_dependency_before_sync() {
+        let dir = tempdir().unwrap();
+        let project = dir.path().join("project");
+        let runtime = dir.path().join("runtime");
+        let bin = dir.path().join("bin");
+        let log = dir.path().join("mix.log");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&runtime).unwrap();
+        fs::create_dir_all(&bin).unwrap();
+
+        let mix = bin.join("mix");
+        fs::write(
+            &mix,
+            format!(
+                "#!/bin/bash\nset -e\nprintf '%s::%s\\n' \"$PWD\" \"$*\" >> \"{}\"\nif [ \"$1\" = \"deps.get\" ] && [ \"$2\" = \"usage_rules\" ]; then\n  mkdir -p deps/usage_rules\n  exit 0\nfi\nif [ \"$1\" = \"usage_rules.sync\" ]; then\n  exit 0\nfi\nexit 1\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&mix).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&mix, permissions).unwrap();
+
+        let env_map = BTreeMap::from([
+            (
+                "PATH".to_string(),
+                format!("{}:/usr/bin:/bin", bin.display()),
+            ),
+            ("MIX_LOG".to_string(), log.display().to_string()),
+        ]);
+
+        sync_elixir_usage_rules(&[project.clone()], &env_map, &runtime, 2, 3).unwrap();
+
+        let output = fs::read_to_string(&log).unwrap();
+        assert!(output.contains("project::deps.get usage_rules"));
+        assert!(output.contains("project::usage_rules.sync"));
+        assert!(project.join("deps/usage_rules").is_dir());
     }
 
     #[test]
@@ -3609,6 +4060,78 @@ Error:   × Could not bind localhost:5432
                 "deploy.example.com:2222".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn git_remote_ssh_hosts_respects_git_url_rewrites() {
+        let dir = tempdir().unwrap();
+        let git = super::preferred_command_path("git").unwrap_or_else(|| PathBuf::from("git"));
+        Command::new(&git)
+            .arg("init")
+            .arg("-q")
+            .arg(dir.path())
+            .status()
+            .unwrap();
+        Command::new(&git)
+            .arg("-C")
+            .arg(dir.path())
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/example/project.git",
+            ])
+            .status()
+            .unwrap();
+        Command::new(&git)
+            .arg("-C")
+            .arg(dir.path())
+            .args([
+                "config",
+                "url.git@github.com:.insteadof",
+                "https://github.com/",
+            ])
+            .status()
+            .unwrap();
+
+        let hosts = git_remote_ssh_hosts(dir.path()).unwrap();
+        assert_eq!(hosts, vec!["github.com".to_string()]);
+    }
+
+    #[test]
+    fn git_remote_ssh_hosts_respects_push_instead_of_rewrites() {
+        let dir = tempdir().unwrap();
+        let git = super::preferred_command_path("git").unwrap_or_else(|| PathBuf::from("git"));
+        Command::new(&git)
+            .arg("init")
+            .arg("-q")
+            .arg(dir.path())
+            .status()
+            .unwrap();
+        Command::new(&git)
+            .arg("-C")
+            .arg(dir.path())
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/example/project.git",
+            ])
+            .status()
+            .unwrap();
+        Command::new(&git)
+            .arg("-C")
+            .arg(dir.path())
+            .args([
+                "config",
+                "url.ssh://git@github.com/.pushInsteadOf",
+                "https://github.com/",
+            ])
+            .status()
+            .unwrap();
+
+        let hosts = git_remote_ssh_hosts(dir.path()).unwrap();
+        assert_eq!(hosts, vec!["github.com".to_string()]);
     }
 
     #[test]

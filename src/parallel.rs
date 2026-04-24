@@ -216,7 +216,7 @@ fn expand_path(root: &Path, raw: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn git_common_root(root: &Path) -> Result<Option<PathBuf>> {
+pub(crate) fn git_common_root(root: &Path) -> Result<Option<PathBuf>> {
     let output = Command::new("git")
         .current_dir(root)
         .args(["rev-parse", "--git-common-dir"])
@@ -321,7 +321,7 @@ fn next_parallel_slot(worktree_root: &Path) -> u32 {
     candidate
 }
 
-fn ensure_worktree_exists(
+pub(crate) fn ensure_worktree_exists(
     root: &Path,
     target_root: &Path,
     branch: &str,

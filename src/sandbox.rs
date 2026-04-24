@@ -35,8 +35,10 @@ pub fn run_sandbox_exec(
             .context("failed to parse plan file")?;
 
     let shell = choose_shell(&env_map, &command);
-    let capabilities = build_capabilities(&plan)?;
-    apply_sandbox(&capabilities)?;
+    if std::env::var("EXPLICIT_NO_SANDBOX").as_deref() != Ok("1") {
+        let capabilities = build_capabilities(&plan)?;
+        apply_sandbox(&capabilities)?;
+    }
 
     std::env::set_current_dir(&root)
         .with_context(|| format!("failed to enter {}", root.display()))?;

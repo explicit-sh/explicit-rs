@@ -412,6 +412,108 @@ end
     assert!(commands.contains(&"mix credo --strict"));
     assert!(commands.contains(&"mix compile --warnings-as-errors"));
     assert!(commands.contains(&"mix test --cover"));
+
+    let mix_exs = fs::read_to_string(root.join("mix.exs")).unwrap();
+    assert!(mix_exs.contains("usage_rules: usage_rules()"));
+    assert!(mix_exs.contains(r#"{:usage_rules, "~> 1.0", only: [:dev]}"#));
+    assert!(mix_exs.contains("defp usage_rules do"));
+}
+
+#[test]
+fn apply_installs_usage_rules_for_elixir_projects() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+
+    fs::write(
+        root.join("mix.exs"),
+        r#"defmodule Demo.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :demo,
+      version: "0.1.0",
+      elixir: "~> 1.15",
+      deps: deps()
+    ]
+  end
+
+  def application do
+    [
+      extra_applications: [:logger]
+    ]
+  end
+
+  defp deps do
+    [
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
+    ]
+  end
+end
+"#,
+    )
+    .unwrap();
+
+    run_tool(root);
+    run_tool(root);
+
+    let mix_exs = fs::read_to_string(root.join("mix.exs")).unwrap();
+    assert!(mix_exs.contains("usage_rules: usage_rules(),"));
+    assert!(mix_exs.contains(r#"{:usage_rules, "~> 1.0", only: [:dev]}"#));
+    assert!(mix_exs.contains("defp usage_rules do"));
+    assert_eq!(mix_exs.matches("usage_rules: usage_rules(),").count(), 1);
+    assert_eq!(
+        mix_exs
+            .matches(r#"{:usage_rules, "~> 1.0", only: [:dev]}"#)
+            .count(),
+        1
+    );
+    assert_eq!(mix_exs.matches("defp usage_rules do").count(), 1);
+}
+
+#[test]
+fn apply_installs_usage_rules_for_workspace_elixir_projects() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let service = root.join("services/stuffix");
+    Command::new("git")
+        .arg("init")
+        .arg("-q")
+        .arg(root)
+        .status()
+        .unwrap();
+    fs::create_dir_all(&service).unwrap();
+
+    fs::write(
+        service.join("mix.exs"),
+        r#"defmodule Stuffix.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :stuffix,
+      version: "0.1.0",
+      elixir: "~> 1.15",
+      deps: deps()
+    ]
+  end
+
+  defp deps do
+    [
+      {:phoenix, "~> 1.7.0"}
+    ]
+  end
+end
+"#,
+    )
+    .unwrap();
+
+    run_tool(root);
+
+    let mix_exs = fs::read_to_string(service.join("mix.exs")).unwrap();
+    assert!(mix_exs.contains("usage_rules: usage_rules(),"));
+    assert!(mix_exs.contains(r#"{:usage_rules, "~> 1.0", only: [:dev]}"#));
+    assert!(mix_exs.contains("defp usage_rules do"));
 }
 
 #[test]

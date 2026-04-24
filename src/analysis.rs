@@ -28,7 +28,7 @@ mod ruby_heuristics;
 
 pub const SUPPORT_PACKAGES: &[&str] = &["actionlint", "git", "jq", "nono"];
 const NO_COMMANDS_NOTE: &str = "No explicit lint/build/test commands were discovered, so validation hooks stay advisory until the project exposes them.";
-const BROWSER_TEST_SANDBOX_NOTE: &str = "Sandbox: detected browser-driven tests; allowing read-only access to installed browser apps such as /Applications/Google Chrome.app.";
+const BROWSER_TEST_SANDBOX_NOTE: &str = "Sandbox: detected browser-driven tests; allowing browser app bundles plus writable Chrome/Chromium Crashpad directories.";
 const EXPLICIT_CONFIG_FILE: &str = "explicit.toml";
 const MINIMUM_COVERAGE_PERCENT: u8 = 80;
 const WORKSPACE_IGNORED_DIRS: &[&str] = &[
@@ -3177,6 +3177,13 @@ fn build_sandbox_plan(root: &Path, builder: &Builder) -> Result<SandboxPlan> {
         .iter()
         .any(|note| note == BROWSER_TEST_SANDBOX_NOTE)
     {
+        for path in macos_browser_test_read_write_paths(&home) {
+            if path.is_file() {
+                read_write_files.insert(path);
+            } else {
+                insert_path_with_realpath(&mut read_write_dirs, path);
+            }
+        }
         for path in macos_browser_test_read_only_paths() {
             insert_read_only_path_with_realpath(&mut read_only_files, &mut read_only_dirs, path);
         }
@@ -3495,6 +3502,8 @@ fn macos_agent_read_write_paths(home: &Path) -> Vec<PathBuf> {
 fn macos_agent_read_only_paths(home: &Path) -> Vec<PathBuf> {
     vec![
         home.join("Library/Preferences"),
+        PathBuf::from("/etc/ssl/cert.pem"),
+        PathBuf::from("/etc/ssl/certs/ca-certificates.crt"),
         PathBuf::from("/Library/Keychains"),
         PathBuf::from("/System/Library/Keychains"),
         PathBuf::from("/var/select"),
@@ -3508,11 +3517,17 @@ fn linux_agent_read_write_paths(_home: &Path) -> Vec<PathBuf> {
 
 fn macos_browser_test_read_only_paths() -> Vec<PathBuf> {
     vec![
-        PathBuf::from("/etc/ssl/cert.pem"),
-        PathBuf::from("/etc/ssl/certs/ca-certificates.crt"),
         PathBuf::from("/Applications/Google Chrome.app"),
         PathBuf::from("/Applications/Google Chrome for Testing.app"),
         PathBuf::from("/Applications/Chromium.app"),
+    ]
+}
+
+fn macos_browser_test_read_write_paths(home: &Path) -> Vec<PathBuf> {
+    vec![
+        home.join("Library/Application Support/Google/Chrome/Crashpad"),
+        home.join("Library/Application Support/Google/Chrome for Testing/Crashpad"),
+        home.join("Library/Application Support/Chromium/Crashpad"),
     ]
 }
 
@@ -3528,9 +3543,10 @@ mod tests {
         RuntimeKind, SUPPORT_PACKAGES, SandboxPlan, build_sandbox_plan, configured_sandbox_paths,
         expand_config_path_value, fallback_javascript_test_commands, insert_path_with_realpath,
         insert_read_only_path_with_realpath, macos_browser_test_read_only_paths,
-        platform_agent_read_only_paths, platform_agent_read_write_paths,
-        referenced_instruction_paths, script_is_placeholder, script_is_verification_ready,
-        standard_device_read_write_paths, standard_temp_read_write_paths,
+        macos_browser_test_read_write_paths, platform_agent_read_only_paths,
+        platform_agent_read_write_paths, referenced_instruction_paths, script_is_placeholder,
+        script_is_verification_ready, standard_device_read_write_paths,
+        standard_temp_read_write_paths,
     };
     use std::{collections::BTreeSet, fs, os::unix::fs::symlink, path::PathBuf};
     use tempfile::tempdir;
@@ -3681,6 +3697,8 @@ mod tests {
         assert!(read_only.contains(&home.join(".zshrc")));
         assert!(read_only.contains(&home.join(".config/git")));
         assert!(read_only.contains(&home.join("Library/Preferences")));
+        assert!(read_only.contains(&PathBuf::from("/etc/ssl/cert.pem")));
+        assert!(read_only.contains(&PathBuf::from("/etc/ssl/certs/ca-certificates.crt")));
         assert!(read_only.contains(&PathBuf::from("/Library/Keychains")));
         assert!(read_only.contains(&PathBuf::from("/var/select")));
         assert!(read_only.contains(&PathBuf::from("/private/var/select")));
@@ -3689,9 +3707,14 @@ mod tests {
     #[test]
     fn browser_test_paths_include_google_chrome() {
         let paths = macos_browser_test_read_only_paths();
-        assert!(paths.contains(&PathBuf::from("/etc/ssl/cert.pem")));
-        assert!(paths.contains(&PathBuf::from("/etc/ssl/certs/ca-certificates.crt")));
         assert!(paths.contains(&PathBuf::from("/Applications/Google Chrome.app")));
+    }
+
+    #[test]
+    fn browser_test_paths_include_chrome_crashpad() {
+        let home = PathBuf::from("/Users/tester");
+        let paths = macos_browser_test_read_write_paths(&home);
+        assert!(paths.contains(&home.join("Library/Application Support/Google/Chrome/Crashpad")));
     }
 
     #[test]

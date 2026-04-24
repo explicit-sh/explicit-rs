@@ -27,6 +27,7 @@ pub struct ObservedAgentOptions<'a> {
     pub agent_args: &'a [String],
     pub block_network: bool,
     pub no_services: bool,
+    pub no_sandbox: bool,
     pub dangerously_use_end_of_life_versions: bool,
     pub extra_env: BTreeMap<String, String>,
 }
@@ -234,6 +235,7 @@ pub fn launch_live_agent(
     command: String,
     block_network: bool,
     no_services: bool,
+    no_sandbox: bool,
     dangerously_use_end_of_life_versions: bool,
     extra_env: BTreeMap<String, String>,
 ) -> Result<ExitCode> {
@@ -250,9 +252,11 @@ pub fn launch_live_agent(
             command: Some(&command),
             block_network,
             no_services,
+            no_sandbox,
             dangerously_use_end_of_life_versions,
             extra_env: (!extra_env.is_empty()).then_some(&extra_env),
             transcript_path: None,
+            skip_stop_hooks: false,
         },
     )?;
     server.finish(status);
@@ -300,9 +304,11 @@ pub fn launch_observed_agent(
             command: Some(&options.command),
             block_network: options.block_network,
             no_services: options.no_services,
+            no_sandbox: options.no_sandbox,
             dangerously_use_end_of_life_versions: options.dangerously_use_end_of_life_versions,
             extra_env: (!trace_env.is_empty()).then_some(&trace_env),
             transcript_path: Some(&run.transcript_log_path),
+            skip_stop_hooks: false,
         },
     )?;
     server.update(|snapshot| snapshot.state = "ingesting".to_string());

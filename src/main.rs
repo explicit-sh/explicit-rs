@@ -1,5 +1,6 @@
 mod analysis;
 mod codex_mcp;
+mod consult;
 mod devenv_file;
 mod env_trace;
 mod eol;
@@ -28,6 +29,8 @@ use serde_json::json;
     about = "Detect project requirements, manage devenv.nix, and launch a sandboxed agent shell."
 )]
 struct Cli {
+    #[arg(long, global = true, action = ArgAction::SetTrue)]
+    no_sandbox: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -66,6 +69,11 @@ enum Command {
         disable_help_subcommand = true
     )]
     Gemini(AgentArgs),
+    #[command(
+        about = "Consult a helper LLM in a read-only worktree sandbox (non-interactive).",
+        disable_help_subcommand = true
+    )]
+    Consult(ConsultArgs),
     #[command(hide = true, name = "__sandbox-exec")]
     SandboxExec(SandboxExecArgs),
     #[command(hide = true, name = "__claude-pre-tool-use-bash")]
@@ -180,6 +188,43 @@ struct SandboxExecArgs {
     command: Option<String>,
 }
 
+#[derive(Args, Debug, Clone)]
+struct ConsultArgs {
+    #[command(subcommand)]
+    agent: ConsultAgent,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum ConsultAgent {
+    #[command(
+        about = "Consult Claude as a helper LLM.",
+        disable_help_flag = true,
+        disable_help_subcommand = true
+    )]
+    Claude(ConsultAgentArgs),
+    #[command(
+        about = "Consult Codex as a helper LLM.",
+        disable_help_flag = true,
+        disable_help_subcommand = true
+    )]
+    Codex(ConsultAgentArgs),
+    #[command(
+        about = "Consult Gemini as a helper LLM.",
+        disable_help_flag = true,
+        disable_help_subcommand = true
+    )]
+    Gemini(ConsultAgentArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+struct ConsultAgentArgs {
+    /// Resume a previous consult session using its consult_id.
+    #[arg(long)]
+    resume: Option<String>,
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    args: Vec<String>,
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(code) => code,
@@ -191,9 +236,12 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<ExitCode> {
-    let cli = Cli::parse();
+    let Cli {
+        command,
+        no_sandbox,
+    } = Cli::parse();
 
-    match cli.command {
+    match command {
         Command::Scan(args) => {
             let root = args.root.canonicalize().context("failed to resolve root")?;
             let analysis = Analysis::analyze(&root)?;
@@ -242,17 +290,19 @@ fn run() -> Result<ExitCode> {
                     command: args.command.as_deref(),
                     block_network: args.block_network,
                     no_services: args.no_services,
+                    no_sandbox,
                     dangerously_use_end_of_life_versions: args.dangerously_use_end_of_life_versions,
                     extra_env: None,
                     transcript_path: None,
+                    skip_stop_hooks: false,
                 },
             )?;
             Ok(status)
         }
         Command::Observe(args) => match args.command {
-            Some(ObserveCommand::Codex(args)) => launch_observed_agent("codex", args),
-            Some(ObserveCommand::Claude(args)) => launch_observed_agent("claude", args),
-            Some(ObserveCommand::Gemini(args)) => launch_observed_agent("gemini", args),
+            Some(ObserveCommand::Codex(args)) => launch_observed_agent("codex", args, no_sandbox),
+            Some(ObserveCommand::Claude(args)) => launch_observed_agent("claude", args, no_sandbox),
+            Some(ObserveCommand::Gemini(args)) => launch_observed_agent("gemini", args, no_sandbox),
             Some(ObserveCommand::List(args)) => {
                 let root = args.root.canonicalize().context("failed to resolve root")?;
                 observe::list_runs(&root)?;
@@ -276,9 +326,22 @@ fn run() -> Result<ExitCode> {
             github_app::print_setup_instructions()?;
             Ok(ExitCode::SUCCESS)
         }
-        Command::Codex(args) => launch_agent("codex", args),
-        Command::Claude(args) => launch_agent("claude", args),
-        Command::Gemini(args) => launch_agent("gemini", args),
+        Command::Codex(args) => launch_agent("codex", args, no_sandbox),
+        Command::Claude(args) => launch_agent("claude", args, no_sandbox),
+        Command::Gemini(args) => launch_agent("gemini", args, no_sandbox),
+        Command::Consult(args) => {
+            let (binary, agent_args) = match args.agent {
+                ConsultAgent::Claude(a) => ("claude", a),
+                ConsultAgent::Codex(a) => ("codex", a),
+                ConsultAgent::Gemini(a) => ("gemini", a),
+            };
+            consult::launch_consult(
+                binary,
+                agent_args.resume.as_deref(),
+                &agent_args.args,
+                no_sandbox,
+            )
+        }
         Command::SandboxExec(args) => {
             sandbox::run_sandbox_exec(args.root, args.env_file, args.plan_file, args.command)?;
             Ok(ExitCode::SUCCESS)
@@ -290,7 +353,7 @@ fn run() -> Result<ExitCode> {
     }
 }
 
-fn launch_agent(binary: &str, args: AgentArgs) -> Result<ExitCode> {
+fn launch_agent(binary: &str, args: AgentArgs, no_sandbox: bool) -> Result<ExitCode> {
     let root = PathBuf::from(".")
         .canonicalize()
         .context("failed to resolve root")?;
@@ -311,6 +374,7 @@ fn launch_agent(binary: &str, args: AgentArgs) -> Result<ExitCode> {
                 agent_args: &passthrough_args,
                 block_network: false,
                 no_services: false,
+                no_sandbox,
                 dangerously_use_end_of_life_versions: args.dangerously_use_end_of_life_versions,
                 extra_env,
             },
@@ -323,12 +387,17 @@ fn launch_agent(binary: &str, args: AgentArgs) -> Result<ExitCode> {
         command,
         false,
         false,
+        no_sandbox,
         args.dangerously_use_end_of_life_versions,
         extra_env,
     )
 }
 
-fn launch_observed_agent(binary: &str, args: ObserveAgentArgs) -> Result<ExitCode> {
+fn launch_observed_agent(
+    binary: &str,
+    args: ObserveAgentArgs,
+    no_sandbox: bool,
+) -> Result<ExitCode> {
     let root = args.root.canonicalize().context("failed to resolve root")?;
     let routed = parallel::route_agent_launch(&root, binary)?;
     let analysis = Analysis::analyze(&routed.root)?;
@@ -345,6 +414,7 @@ fn launch_observed_agent(binary: &str, args: ObserveAgentArgs) -> Result<ExitCod
             agent_args: &args.args,
             block_network: args.block_network,
             no_services: args.no_services,
+            no_sandbox,
             dangerously_use_end_of_life_versions: args.dangerously_use_end_of_life_versions,
             extra_env,
         },
@@ -507,5 +577,16 @@ mod tests {
         assert_eq!(args.root, PathBuf::from("/tmp/project"));
         assert!(!args.stop_hook);
         assert!(!args.git_hook);
+    }
+
+    #[test]
+    fn global_no_sandbox_flag_parses_before_subcommand() {
+        let cli = Cli::try_parse_from(["explicit", "--no-sandbox", "codex", "resume"])
+            .expect("expected no-sandbox to parse");
+        assert!(cli.no_sandbox);
+        let Command::Codex(args) = cli.command else {
+            panic!("expected codex command");
+        };
+        assert_eq!(args.args, vec!["resume"]);
     }
 }
