@@ -216,7 +216,10 @@ mod tests {
     #[test]
     fn current_executable_returns_some_path() {
         let exe = current_executable();
-        assert!(exe.is_some(), "current_executable should return Some in tests");
+        assert!(
+            exe.is_some(),
+            "current_executable should return Some in tests"
+        );
         let path = exe.unwrap();
         assert!(!path.is_empty());
     }

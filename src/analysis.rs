@@ -4978,7 +4978,11 @@ read_write_files = [\"patch.diff\"]
     fn service_requirement_devenv_option_covers_all_variants() {
         use super::ServiceRequirement;
         assert!(ServiceRequirement::Mysql.devenv_option().contains("mysql"));
-        assert!(ServiceRequirement::Postgres.devenv_option().contains("postgres"));
+        assert!(
+            ServiceRequirement::Postgres
+                .devenv_option()
+                .contains("postgres")
+        );
         assert!(ServiceRequirement::Redis.devenv_option().contains("redis"));
     }
 
@@ -5053,9 +5057,11 @@ read_write_files = [\"patch.diff\"]
         fs::write(dir.path().join("requirements.txt"), "flask\n").unwrap();
         let analysis = Analysis::analyze(dir.path()).unwrap();
         assert!(analysis.markers.contains(&"requirements.txt".to_string()));
-        assert!(analysis
-            .detected_languages
-            .contains(&LanguageRequirement::Python));
+        assert!(
+            analysis
+                .detected_languages
+                .contains(&LanguageRequirement::Python)
+        );
     }
 
     #[test]
@@ -5135,7 +5141,9 @@ read_write_files = [\"patch.diff\"]
             analysis
                 .test_commands
                 .contains(&"python manage.py test".to_string())
-                || analysis.dev_server_commands.contains(&"python manage.py runserver".to_string())
+                || analysis
+                    .dev_server_commands
+                    .contains(&"python manage.py runserver".to_string())
         );
     }
 
@@ -5154,9 +5162,11 @@ read_write_files = [\"patch.diff\"]
         fs::write(dir.path().join("requirements.txt"), "requests\n").unwrap();
         fs::create_dir(dir.path().join("tests")).unwrap();
         let analysis = Analysis::analyze(dir.path()).unwrap();
-        assert!(analysis
-            .test_commands
-            .contains(&"python -m unittest discover".to_string()));
+        assert!(
+            analysis
+                .test_commands
+                .contains(&"python -m unittest discover".to_string())
+        );
     }
 
     // --- PHP heuristic coverage ---
@@ -5170,9 +5180,11 @@ read_write_files = [\"patch.diff\"]
         )
         .unwrap();
         let analysis = Analysis::analyze(dir.path()).unwrap();
-        assert!(analysis
-            .test_commands
-            .contains(&"composer test".to_string()));
+        assert!(
+            analysis
+                .test_commands
+                .contains(&"composer test".to_string())
+        );
     }
 
     #[test]
@@ -5185,9 +5197,11 @@ read_write_files = [\"patch.diff\"]
         .unwrap();
         fs::write(dir.path().join("artisan"), "#!/usr/bin/env php\n").unwrap();
         let analysis = Analysis::analyze(dir.path()).unwrap();
-        assert!(analysis
-            .dev_server_commands
-            .contains(&"php artisan serve".to_string()));
+        assert!(
+            analysis
+                .dev_server_commands
+                .contains(&"php artisan serve".to_string())
+        );
     }
 
     #[test]
@@ -5199,9 +5213,11 @@ read_write_files = [\"patch.diff\"]
         )
         .unwrap();
         let analysis = Analysis::analyze(dir.path()).unwrap();
-        assert!(analysis
-            .test_commands
-            .contains(&"vendor/bin/pest".to_string()));
+        assert!(
+            analysis
+                .test_commands
+                .contains(&"vendor/bin/pest".to_string())
+        );
     }
 
     #[test]
@@ -5210,9 +5226,11 @@ read_write_files = [\"patch.diff\"]
         fs::write(dir.path().join("composer.json"), r#"{"name":"app"}"#).unwrap();
         fs::write(dir.path().join("phpunit.xml"), "<phpunit></phpunit>").unwrap();
         let analysis = Analysis::analyze(dir.path()).unwrap();
-        assert!(analysis
-            .test_commands
-            .contains(&"vendor/bin/phpunit".to_string()));
+        assert!(
+            analysis
+                .test_commands
+                .contains(&"vendor/bin/phpunit".to_string())
+        );
     }
 
     #[test]
@@ -5221,8 +5239,10 @@ read_write_files = [\"patch.diff\"]
         fs::write(dir.path().join("composer.json"), r#"{"name":"app"}"#).unwrap();
         fs::write(dir.path().join("phpunit.xml.dist"), "<phpunit></phpunit>").unwrap();
         let analysis = Analysis::analyze(dir.path()).unwrap();
-        assert!(analysis
-            .test_commands
-            .contains(&"vendor/bin/phpunit".to_string()));
+        assert!(
+            analysis
+                .test_commands
+                .contains(&"vendor/bin/phpunit".to_string())
+        );
     }
 }
