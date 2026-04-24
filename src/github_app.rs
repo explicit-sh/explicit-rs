@@ -664,4 +664,74 @@ mod tests {
         assert!(result.is_none());
         unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
     }
+
+    #[test]
+    fn parse_github_slug_returns_none_for_prefix_without_valid_owner_repo() {
+        // Prefix matches but no slash separating owner from repo.
+        assert_eq!(parse_github_slug("https://github.com/onlyowner"), None);
+        assert_eq!(parse_github_slug("git@github.com:onlyowner.git"), None);
+        assert_eq!(parse_github_slug("https://gitlab.com/owner/repo"), None);
+    }
+
+    #[test]
+    fn github_submodule_slugs_reads_toml_format_gitmodules() {
+        let dir = tempdir().unwrap();
+        // A .gitmodules file that parses as valid TOML (using quoted submodule key).
+        std::fs::write(
+            dir.path().join(".gitmodules"),
+            "\"submodule foo\" = {url = \"https://github.com/owner/toml-repo.git\"}\n",
+        )
+        .unwrap();
+        let slugs = github_submodule_slugs(dir.path()).unwrap();
+        assert!(
+            slugs.contains(&"owner/toml-repo".to_string()),
+            "expected owner/toml-repo, got {slugs:?}"
+        );
+    }
+
+    #[test]
+    fn print_setup_instructions_succeeds_without_panicking() {
+        let dir = tempdir().unwrap();
+        let explicit_dir = dir.path().join("explicit");
+        std::fs::create_dir_all(&explicit_dir).unwrap();
+        // Safety: test-only env manipulation.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path().as_os_str()) };
+        let result = super::print_setup_instructions();
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn resolve_config_path_handles_tilde_prefix() {
+        let home = dirs::home_dir().unwrap();
+        let config_dir = std::path::Path::new("/some/config");
+
+        let result = resolve_config_path(config_dir, "~/keys/app.pem").unwrap();
+        assert_eq!(result, home.join("keys/app.pem"));
+    }
+
+    #[test]
+    fn resolve_config_path_handles_bare_tilde() {
+        let home = dirs::home_dir().unwrap();
+        let config_dir = std::path::Path::new("/some/config");
+        let result = resolve_config_path(config_dir, "~").unwrap();
+        assert_eq!(result, home);
+    }
+
+    #[test]
+    fn resolve_config_path_handles_absolute_path() {
+        let config_dir = std::path::Path::new("/some/config");
+        let result = resolve_config_path(config_dir, "/etc/keys/app.pem").unwrap();
+        assert_eq!(result, std::path::PathBuf::from("/etc/keys/app.pem"));
+    }
+
+    #[test]
+    fn resolve_config_path_handles_relative_path() {
+        let config_dir = std::path::Path::new("/home/user/.config/explicit");
+        let result = resolve_config_path(config_dir, "keys/app.pem").unwrap();
+        assert_eq!(
+            result,
+            std::path::PathBuf::from("/home/user/.config/explicit/keys/app.pem")
+        );
+    }
 }

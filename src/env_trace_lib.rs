@@ -201,3 +201,37 @@ fn unix_millis() -> i64 {
         .map(|value| value.as_millis() as i64)
         .unwrap_or_default()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{c_string_to_owned, current_executable, unix_millis};
+    use std::ffi::CString;
+
+    #[test]
+    fn unix_millis_returns_positive_value() {
+        let ms = unix_millis();
+        assert!(ms > 0, "unix_millis should return a positive timestamp");
+    }
+
+    #[test]
+    fn current_executable_returns_some_path() {
+        let exe = current_executable();
+        assert!(exe.is_some(), "current_executable should return Some in tests");
+        let path = exe.unwrap();
+        assert!(!path.is_empty());
+    }
+
+    #[test]
+    fn c_string_to_owned_converts_correctly() {
+        let cstr = CString::new("hello_env").unwrap();
+        let result = unsafe { c_string_to_owned(cstr.as_ptr()) };
+        assert_eq!(result, "hello_env");
+    }
+
+    #[test]
+    fn c_string_to_owned_handles_empty_string() {
+        let cstr = CString::new("").unwrap();
+        let result = unsafe { c_string_to_owned(cstr.as_ptr()) };
+        assert_eq!(result, "");
+    }
+}

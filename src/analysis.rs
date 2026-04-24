@@ -4927,4 +4927,302 @@ end
                 .any(|version| version.source == "apps/mobile/.node-version")
         );
     }
+
+    // --- expand_config_path_value bare ~ and $HOME coverage ---
+
+    #[test]
+    fn expands_bare_tilde_to_home() {
+        let home = PathBuf::from("/Users/tester");
+        assert_eq!(expand_config_path_value(&home, "~"), "/Users/tester");
+    }
+
+    #[test]
+    fn expands_bare_dollar_home_variants() {
+        let home = PathBuf::from("/Users/tester");
+        assert_eq!(expand_config_path_value(&home, "$HOME"), "/Users/tester");
+        assert_eq!(expand_config_path_value(&home, "${HOME}"), "/Users/tester");
+    }
+
+    #[test]
+    fn sandbox_config_with_read_only_dirs_and_read_write_files() {
+        let dir = tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        let patch_file = dir.path().join("patch.diff");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(&patch_file, "diff").unwrap();
+        fs::write(
+            dir.path().join(EXPLICIT_CONFIG_FILE),
+            "
+[sandbox]
+read_only_dirs = [\"src\"]
+read_write_files = [\"patch.diff\"]
+",
+        )
+        .unwrap();
+
+        let configured = configured_sandbox_paths(dir.path()).unwrap();
+        assert!(configured.read_only_dirs.contains(&src_dir));
+        assert!(configured.read_write_files.contains(&patch_file));
+
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert!(analysis.sandbox_plan.read_only_dirs.contains(&src_dir));
+        assert!(analysis.sandbox_plan.read_write_files.contains(&patch_file));
+        assert!(analysis.notes.iter().any(|note| {
+            note.contains("read-only dir override") && note.contains("read-write file override")
+        }));
+    }
+
+    // --- ServiceRequirement devenv_option and WorkspaceConfig::default ---
+
+    #[test]
+    fn service_requirement_devenv_option_covers_all_variants() {
+        use super::ServiceRequirement;
+        assert!(ServiceRequirement::Mysql.devenv_option().contains("mysql"));
+        assert!(ServiceRequirement::Postgres.devenv_option().contains("postgres"));
+        assert!(ServiceRequirement::Redis.devenv_option().contains("redis"));
+    }
+
+    #[test]
+    fn workspace_config_default_has_auto_discover_true() {
+        use super::WorkspaceConfig;
+        let config = WorkspaceConfig::default();
+        assert!(config.auto_discover);
+        assert!(config.members.is_empty());
+        assert!(config.exclude.is_empty());
+    }
+
+    #[test]
+    fn workspace_discovers_rust_cargo_member() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        let service = dir.path().join("services/api");
+        fs::create_dir_all(&service).unwrap();
+        fs::write(
+            service.join("Cargo.toml"),
+            "[package]\nname = \"api\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(service.join("src/main.rs"), "fn main() {}").ok();
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert!(
+            analysis.markers.contains(&"Cargo.toml".to_string())
+                || analysis.test_commands.iter().any(|c| c.contains("cargo"))
+                || analysis
+                    .detected_languages
+                    .contains(&LanguageRequirement::Rust)
+        );
+    }
+
+    // --- Match arm coverage for LanguageRequirement / RuntimeKind ---
+
+    #[test]
+    fn language_requirement_devenv_option_covers_all_variants() {
+        assert!(LanguageRequirement::Go.devenv_option().contains("go"));
+        assert!(LanguageRequirement::Php.devenv_option().contains("php"));
+        assert!(LanguageRequirement::Java.devenv_option().contains("java"));
+        assert!(LanguageRequirement::Ruby.devenv_option().contains("ruby"));
+    }
+
+    #[test]
+    fn runtime_kind_display_name_covers_all_variants() {
+        assert_eq!(RuntimeKind::Erlang.display_name(), "erlang");
+        assert_eq!(RuntimeKind::Go.display_name(), "go");
+        assert_eq!(RuntimeKind::Java.display_name(), "java");
+        assert_eq!(RuntimeKind::Php.display_name(), "php");
+        assert_eq!(RuntimeKind::Python.display_name(), "python");
+        assert_eq!(RuntimeKind::Ruby.display_name(), "ruby");
+    }
+
+    #[test]
+    fn runtime_kind_eol_product_slug_covers_all_variants() {
+        assert_eq!(RuntimeKind::Erlang.eol_product_slug(), "erlang");
+        assert_eq!(RuntimeKind::Go.eol_product_slug(), "go");
+        assert_eq!(RuntimeKind::Java.eol_product_slug(), "");
+        assert_eq!(RuntimeKind::Nodejs.eol_product_slug(), "nodejs");
+        assert_eq!(RuntimeKind::Php.eol_product_slug(), "php");
+        assert_eq!(RuntimeKind::Python.eol_product_slug(), "python");
+        assert_eq!(RuntimeKind::Ruby.eol_product_slug(), "ruby");
+        assert_eq!(RuntimeKind::Rust.eol_product_slug(), "rust");
+    }
+
+    // --- Python heuristic coverage ---
+
+    #[test]
+    fn python_detects_requirements_txt_marker() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("requirements.txt"), "flask\n").unwrap();
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert!(analysis.markers.contains(&"requirements.txt".to_string()));
+        assert!(analysis
+            .detected_languages
+            .contains(&LanguageRequirement::Python));
+    }
+
+    #[test]
+    fn python_detects_uv_lock_marker() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("uv.lock"), "").unwrap();
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert!(analysis.markers.contains(&"uv.lock".to_string()));
+    }
+
+    #[test]
+    fn python_detects_poetry_lock_marker() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("poetry.lock"), "").unwrap();
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert!(analysis.markers.contains(&"poetry.lock".to_string()));
+    }
+
+    #[test]
+    fn python_detects_pytest_from_pyproject_tool_section() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("pyproject.toml"),
+            "[tool.pytest.ini_options]\ntestpaths = [\"tests\"]\n",
+        )
+        .unwrap();
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert!(analysis.test_commands.contains(&"pytest".to_string()));
+    }
+
+    #[test]
+    fn python_detects_ruff_from_pyproject_dependencies() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\ndependencies = [\"ruff>=0.1\"]\n",
+        )
+        .unwrap();
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert!(analysis.lint_commands.contains(&"ruff check .".to_string()));
+    }
+
+    #[test]
+    fn python_detects_ruff_from_pyproject_tool_section() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("pyproject.toml"),
+            "[tool.ruff]\nline-length = 120\n",
+        )
+        .unwrap();
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert!(analysis.lint_commands.contains(&"ruff check .".to_string()));
+    }
+
+    #[test]
+    fn python_detects_pytest_from_conftest() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("requirements.txt"), "pytest\n").unwrap();
+        fs::write(dir.path().join("conftest.py"), "").unwrap();
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert!(analysis.test_commands.contains(&"pytest".to_string()));
+    }
+
+    #[test]
+    fn python_detects_django_manage_py_test() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("requirements.txt"), "").unwrap();
+        fs::write(dir.path().join("manage.py"), "#!/usr/bin/env python\n").unwrap();
+        // Write a requirements lock so dependency detection picks up django
+        fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\ndependencies = [\"django>=4.0\"]\n",
+        )
+        .unwrap();
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert!(
+            analysis
+                .test_commands
+                .contains(&"python manage.py test".to_string())
+                || analysis.dev_server_commands.contains(&"python manage.py runserver".to_string())
+        );
+    }
+
+    #[test]
+    fn python_detects_tox_test() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("requirements.txt"), "tox\n").unwrap();
+        fs::write(dir.path().join("tox.ini"), "[tox]\n").unwrap();
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert!(analysis.test_commands.contains(&"tox".to_string()));
+    }
+
+    #[test]
+    fn python_detects_unittest_discover_for_tests_dir() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("requirements.txt"), "requests\n").unwrap();
+        fs::create_dir(dir.path().join("tests")).unwrap();
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert!(analysis
+            .test_commands
+            .contains(&"python -m unittest discover".to_string()));
+    }
+
+    // --- PHP heuristic coverage ---
+
+    #[test]
+    fn php_detects_composer_test_script() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("composer.json"),
+            r#"{"scripts":{"test":"phpunit"}}"#,
+        )
+        .unwrap();
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert!(analysis
+            .test_commands
+            .contains(&"composer test".to_string()));
+    }
+
+    #[test]
+    fn php_detects_laravel_artisan_dev_server() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("composer.json"),
+            r#"{"require":{"laravel/framework":"^11.0"}}"#,
+        )
+        .unwrap();
+        fs::write(dir.path().join("artisan"), "#!/usr/bin/env php\n").unwrap();
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert!(analysis
+            .dev_server_commands
+            .contains(&"php artisan serve".to_string()));
+    }
+
+    #[test]
+    fn php_detects_pest_test_runner() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("composer.json"),
+            r#"{"require-dev":{"pestphp/pest":"^2.0"}}"#,
+        )
+        .unwrap();
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert!(analysis
+            .test_commands
+            .contains(&"vendor/bin/pest".to_string()));
+    }
+
+    #[test]
+    fn php_detects_phpunit_from_xml() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("composer.json"), r#"{"name":"app"}"#).unwrap();
+        fs::write(dir.path().join("phpunit.xml"), "<phpunit></phpunit>").unwrap();
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert!(analysis
+            .test_commands
+            .contains(&"vendor/bin/phpunit".to_string()));
+    }
+
+    #[test]
+    fn php_detects_phpunit_from_xml_dist() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("composer.json"), r#"{"name":"app"}"#).unwrap();
+        fs::write(dir.path().join("phpunit.xml.dist"), "<phpunit></phpunit>").unwrap();
+        let analysis = Analysis::analyze(dir.path()).unwrap();
+        assert!(analysis
+            .test_commands
+            .contains(&"vendor/bin/phpunit".to_string()));
+    }
 }

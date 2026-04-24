@@ -21,5 +21,9 @@
     pkgs.sqlite
   ];
   # Detected Rust source files in the repository.
-  languages.rust.enable = true;
+  # llvm-tools-preview component required for cargo-llvm-cov coverage reports.
+  languages.rust = {
+    enable = true;
+    toolchainFile = ./rust-toolchain.toml;
+  };
 }
