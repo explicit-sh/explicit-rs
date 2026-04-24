@@ -428,7 +428,14 @@ fn build_agent_command(root: &Path, binary: &str, args: &[String]) -> Result<Str
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| binary.to_string());
 
+    let mut injected_args: Vec<String> = Vec::new();
+    if binary == "claude" {
+        injected_args.push("--append-system-prompt".to_string());
+        injected_args.push(claude_consult_instructions());
+    }
+
     let command = std::iter::once(shell_escape(&executable))
+        .chain(injected_args.iter().map(|arg| shell_escape(arg)))
         .chain(args.iter().map(|arg| shell_escape(arg)))
         .collect::<Vec<_>>()
         .join(" ");
@@ -440,6 +447,27 @@ fn build_agent_command(root: &Path, binary: &str, args: &[String]) -> Result<Str
         ));
     }
     Ok(command)
+}
+
+fn claude_consult_instructions() -> String {
+    "You have access to `explicit consult` to call other LLMs as sub-consultants in isolated \
+read-only sandboxes (no stop-hook loop). Use it when you need a second opinion, a different \
+model's perspective, or want to delegate a contained sub-task.\n\
+\n\
+Usage:\n\
+  explicit consult gemini -- -p \"Your question\"\n\
+  explicit consult claude -- -p \"Your question\"\n\
+  explicit consult codex -- -p \"Your question\"\n\
+\n\
+Each call prints JSON: {\"consult_id\": \"...\", \"agent\": \"...\", \"exit_code\": 0, \"worktree\": \"...\"}\n\
+\n\
+Resume the same session (conversation history is preserved in the worktree):\n\
+  explicit consult gemini --resume <consult_id> -- -p \"Follow-up question\"\n\
+\n\
+The consulted LLM sees the project in a read-only sandbox and cannot modify files or \
+trigger hooks. Prefer gemini for large-context tasks (long diffs, big files) since it \
+has a larger context window."
+        .to_string()
 }
 
 fn shell_escape(value: &str) -> String {
@@ -651,5 +679,32 @@ mod tests {
             panic!("expected consult command");
         };
         assert!(matches!(args.agent, ConsultAgent::Codex(_)));
+    }
+
+    #[test]
+    fn build_agent_command_injects_append_system_prompt_for_claude() {
+        let command = build_agent_command(&PathBuf::from("/tmp/project"), "claude", &[]).unwrap();
+        assert!(
+            command.contains("--append-system-prompt"),
+            "claude command should contain --append-system-prompt: {command}"
+        );
+        assert!(
+            command.contains("explicit consult"),
+            "injected prompt should mention 'explicit consult': {command}"
+        );
+    }
+
+    #[test]
+    fn build_agent_command_does_not_inject_for_other_agents() {
+        let command = build_agent_command(&PathBuf::from("/tmp/project"), "gemini", &[]).unwrap();
+        assert!(
+            !command.contains("--append-system-prompt"),
+            "gemini command should not have --append-system-prompt: {command}"
+        );
+        let command = build_agent_command(&PathBuf::from("/tmp/project"), "codex", &[]).unwrap();
+        assert!(
+            !command.contains("--append-system-prompt"),
+            "codex command should not have --append-system-prompt: {command}"
+        );
     }
 }
