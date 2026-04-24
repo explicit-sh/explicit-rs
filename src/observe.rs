@@ -2008,10 +2008,12 @@ mod tests {
     use super::{
         ImportSummary, LiveRunServer, LiveRunSnapshot, apply_summary_to_snapshot,
         changed_session_files, collect_file_touches_from_parsed_cmd, configure_db,
-        console_transcript_preview, fetch_live_snapshot, ingest_codex_session_file,
-        ingest_console_transcript_file, ingest_env_trace_file, init_schema, live_transcript_status,
-        prepare_socket_path, sanitize_transcript_preview, snapshot_session_files, socket_path,
-        unique_run_id,
+        console_transcript_preview, fetch_live_snapshot, find_run_row, format_started_at,
+        ingest_codex_session_file, ingest_console_transcript_file, ingest_env_trace_file,
+        init_schema, latest_run_row, list_runs, live_transcript_status, load_run_rows,
+        observability_root, prepare_socket_path, print_report, sanitize_transcript_preview,
+        snapshot_session_files, socket_path, system_time_to_millis, truncate_preview,
+        unique_run_id, unix_millis, walk_jsonl_files,
     };
     #[cfg(target_os = "linux")]
     use crate::env_trace;
@@ -2420,5 +2422,313 @@ int main(void) {
         let socket = socket_path(&long_root);
         assert!(socket.starts_with(std::env::temp_dir()));
         assert!(socket.to_string_lossy().contains("explicit-observe-"));
+    }
+
+    #[test]
+    fn truncate_preview_short_string_passes_through() {
+        assert_eq!(truncate_preview("hello world"), "hello world");
+    }
+
+    #[test]
+    fn truncate_preview_replaces_newlines_with_spaces() {
+        assert_eq!(truncate_preview("line1\nline2"), "line1 line2");
+    }
+
+    #[test]
+    fn truncate_preview_truncates_long_string() {
+        let long = "a".repeat(200);
+        let result = truncate_preview(&long);
+        assert!(result.ends_with('…'));
+        assert!(result.chars().count() <= 121);
+    }
+
+    #[test]
+    fn format_started_at_returns_string_representation() {
+        let result = format_started_at(1_234_567_890_000);
+        assert_eq!(result, "1234567890000");
+    }
+
+    #[test]
+    fn observability_root_appends_nono_observability() {
+        let root = PathBuf::from("/tmp/project");
+        assert_eq!(
+            observability_root(&root),
+            PathBuf::from("/tmp/project/.nono/observability")
+        );
+    }
+
+    #[test]
+    fn system_time_to_millis_returns_positive_for_current_time() {
+        let ms = system_time_to_millis(std::time::SystemTime::now());
+        assert!(ms.is_some());
+        assert!(ms.unwrap() > 0);
+    }
+
+    #[test]
+    fn unix_millis_returns_positive() {
+        assert!(unix_millis() > 0);
+    }
+
+    #[test]
+    fn load_run_rows_returns_empty_when_no_observability_dir() {
+        let dir = tempdir().unwrap();
+        let rows = load_run_rows(dir.path()).unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn list_runs_prints_no_runs_message_when_empty() {
+        let dir = tempdir().unwrap();
+        list_runs(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn walk_jsonl_files_returns_empty_when_no_jsonl() {
+        let dir = tempdir().unwrap();
+        let files = walk_jsonl_files(dir.path()).unwrap();
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn walk_jsonl_files_finds_jsonl_recursively() {
+        let dir = tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(dir.path().join("a.jsonl"), "{}").unwrap();
+        fs::write(sub.join("b.jsonl"), "{}").unwrap();
+        fs::write(dir.path().join("not.txt"), "{}").unwrap();
+        let files = walk_jsonl_files(dir.path()).unwrap();
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().any(|p| p.ends_with("a.jsonl")));
+        assert!(files.iter().any(|p| p.ends_with("b.jsonl")));
+    }
+
+    #[test]
+    fn load_run_rows_reads_sqlite_from_observability_root() {
+        let dir = tempdir().unwrap();
+        let obs_dir = dir.path().join(".nono/observability/run-abc");
+        fs::create_dir_all(&obs_dir).unwrap();
+
+        let db_path = obs_dir.join("events.sqlite");
+        let conn = Connection::open(&db_path).unwrap();
+        configure_db(&conn).unwrap();
+        init_schema(&conn).unwrap();
+        conn.execute(
+            "insert into runs (run_id, agent, root, command, agent_args_json, started_at_ms, status, analysis_json, sandbox_plan_json) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params!["run-abc", "claude", "/tmp", "claude", "[]", 1000i64, "completed", "{}", "{}"],
+        ).unwrap();
+
+        let rows = load_run_rows(dir.path()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].run_id, "run-abc");
+        assert_eq!(rows[0].agent, "claude");
+    }
+
+    #[test]
+    fn latest_run_row_returns_most_recent() {
+        let dir = tempdir().unwrap();
+
+        for (id, ts) in [("run-old", 1000i64), ("run-new", 2000i64)] {
+            let obs_dir = dir.path().join(format!(".nono/observability/{id}"));
+            fs::create_dir_all(&obs_dir).unwrap();
+            let db_path = obs_dir.join("events.sqlite");
+            let conn = Connection::open(&db_path).unwrap();
+            configure_db(&conn).unwrap();
+            init_schema(&conn).unwrap();
+            conn.execute(
+                "insert into runs (run_id, agent, root, command, agent_args_json, started_at_ms, status, analysis_json, sandbox_plan_json) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![id, "codex", "/tmp", "codex", "[]", ts, "completed", "{}", "{}"],
+            ).unwrap();
+        }
+
+        let row = latest_run_row(dir.path()).unwrap();
+        assert_eq!(row.run_id, "run-new");
+    }
+
+    #[test]
+    fn find_run_row_returns_matching_run() {
+        let dir = tempdir().unwrap();
+        let obs_dir = dir.path().join(".nono/observability/run-xyz");
+        fs::create_dir_all(&obs_dir).unwrap();
+        let db_path = obs_dir.join("events.sqlite");
+        let conn = Connection::open(&db_path).unwrap();
+        configure_db(&conn).unwrap();
+        init_schema(&conn).unwrap();
+        conn.execute(
+            "insert into runs (run_id, agent, root, command, agent_args_json, started_at_ms, status, analysis_json, sandbox_plan_json) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params!["run-xyz", "gemini", "/tmp", "gemini", "[]", 1000i64, "running", "{}", "{}"],
+        ).unwrap();
+
+        let row = find_run_row(dir.path(), "run-xyz").unwrap();
+        assert_eq!(row.agent, "gemini");
+    }
+
+    #[test]
+    fn find_run_row_errors_for_unknown_run_id() {
+        let dir = tempdir().unwrap();
+        let result = find_run_row(dir.path(), "nonexistent");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("nonexistent"));
+    }
+
+    #[test]
+    fn list_runs_prints_run_details_when_runs_exist() {
+        let dir = tempdir().unwrap();
+        let obs_dir = dir.path().join(".nono/observability/run-list-test");
+        fs::create_dir_all(&obs_dir).unwrap();
+        let db_path = obs_dir.join("events.sqlite");
+        let conn = Connection::open(&db_path).unwrap();
+        configure_db(&conn).unwrap();
+        init_schema(&conn).unwrap();
+        conn.execute(
+            "insert into runs (run_id, agent, root, command, agent_args_json, started_at_ms, status, analysis_json, sandbox_plan_json) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params!["run-list-test", "claude", "/tmp", "claude", "[]", 5000i64, "completed", "{}", "{}"],
+        ).unwrap();
+
+        list_runs(dir.path()).unwrap();
+    }
+
+    fn make_run_db(obs_dir: &std::path::Path, run_id: &str) -> Connection {
+        fs::create_dir_all(obs_dir).unwrap();
+        let db_path = obs_dir.join("events.sqlite");
+        let conn = Connection::open(&db_path).unwrap();
+        configure_db(&conn).unwrap();
+        init_schema(&conn).unwrap();
+        conn.execute(
+            "insert into runs (run_id, agent, root, command, agent_args_json, started_at_ms, status, analysis_json, sandbox_plan_json) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![run_id, "claude", "/tmp", "claude", "[]", 9000i64, "completed", "{}", "{}"],
+        ).unwrap();
+        conn
+    }
+
+    #[test]
+    fn print_report_works_for_minimal_run() {
+        let dir = tempdir().unwrap();
+        let run_id = "run-report-minimal";
+        let obs_dir = dir.path().join(format!(".nono/observability/{run_id}"));
+        make_run_db(&obs_dir, run_id);
+        print_report(dir.path(), Some(run_id), false).unwrap();
+    }
+
+    #[test]
+    fn print_report_works_for_latest_run() {
+        let dir = tempdir().unwrap();
+        let run_id = "run-report-latest";
+        let obs_dir = dir.path().join(format!(".nono/observability/{run_id}"));
+        make_run_db(&obs_dir, run_id);
+        print_report(dir.path(), None, true).unwrap();
+    }
+
+    #[test]
+    fn print_report_with_messages_and_commands() {
+        let dir = tempdir().unwrap();
+        let run_id = "run-report-full";
+        let obs_dir = dir.path().join(format!(".nono/observability/{run_id}"));
+        let conn = make_run_db(&obs_dir, run_id);
+
+        // Insert messages
+        conn.execute(
+            "insert into messages (run_id, session_id, role, content, created_at) values (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![run_id, "s1", "user", "What is 2+2?", "2026-01-01T00:00:00Z"],
+        ).unwrap();
+        conn.execute(
+            "insert into messages (run_id, session_id, role, content, created_at) values (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![run_id, "s1", "assistant", "4", "2026-01-01T00:00:01Z"],
+        ).unwrap();
+
+        // Insert exec command
+        conn.execute(
+            "insert into exec_commands (run_id, session_id, turn_id, call_id, shell_command, cwd, exit_code, duration_ms, aggregated_output, created_at, raw_json) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            rusqlite::params![run_id, "s1", "t1", "c1", "cargo test", "/tmp", 0i32, 100i64, "ok", "2026-01-01T00:00:02Z", "{}"],
+        ).unwrap();
+
+        print_report(dir.path(), Some(run_id), false).unwrap();
+    }
+
+    #[test]
+    fn print_report_errors_for_unknown_run_id() {
+        let dir = tempdir().unwrap();
+        let result = print_report(dir.path(), Some("no-such-run"), false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn print_report_with_file_touches_and_env_accesses() {
+        let dir = tempdir().unwrap();
+        let run_id = "run-report-rich";
+        let obs_dir = dir.path().join(format!(".nono/observability/{run_id}"));
+        let conn = make_run_db(&obs_dir, run_id);
+
+        // Insert file touches
+        conn.execute(
+            "insert into file_touches (run_id, session_id, turn_id, created_at, path, op, source) values (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![run_id, "s1", "t1", "2026-01-01T00:00:00Z", "/tmp/foo.rs", "read", "exec_command"],
+        ).unwrap();
+        conn.execute(
+            "insert into file_touches (run_id, session_id, turn_id, created_at, path, op, source) values (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![run_id, "s1", "t1", "2026-01-01T00:00:01Z", "/tmp/foo.rs", "write", "patch"],
+        ).unwrap();
+
+        // Insert env accesses
+        conn.execute(
+            "insert into env_accesses (run_id, created_at_ms, process_id, parent_process_id, operation, key, found, value, executable, raw_json) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![run_id, 9000i64, 100i32, 1i32, "getenv", "PATH", 1i32, "/usr/bin", "/bin/bash", "{}"],
+        ).unwrap();
+
+        // Insert failed exec command
+        conn.execute(
+            "insert into exec_commands (run_id, session_id, turn_id, call_id, shell_command, cwd, exit_code, duration_ms, aggregated_output, created_at, raw_json) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            rusqlite::params![run_id, "s1", "t1", "c1", "cargo test", "/tmp", 1i32, 200i64, "FAILED", "2026-01-01T00:00:02Z", "{}"],
+        ).unwrap();
+
+        // Insert console transcript
+        conn.execute(
+            "insert into console_transcripts (run_id, captured_at_ms, byte_count, content) values (?1, ?2, ?3, ?4)",
+            rusqlite::params![run_id, 9000i64, 50i64, "line1\nline2\n"],
+        ).unwrap();
+
+        // Should succeed and exercise all non-empty branches
+        print_report(dir.path(), Some(run_id), false).unwrap();
+    }
+
+    #[test]
+    fn top_commands_returns_rows_for_run() {
+        let dir = tempdir().unwrap();
+        let run_id = "run-top-cmds";
+        let obs_dir = dir.path().join(format!(".nono/observability/{run_id}"));
+        let conn = make_run_db(&obs_dir, run_id);
+        let db_path = obs_dir.join("events.sqlite");
+
+        conn.execute(
+            "insert into exec_commands (run_id, session_id, turn_id, call_id, shell_command, cwd, exit_code, duration_ms, aggregated_output, created_at, raw_json) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            rusqlite::params![run_id, "s1", "t1", "c1", "cargo test", "/tmp", 0i32, 100i64, "ok", "2026-01-01T00:00:00Z", "{}"],
+        ).unwrap();
+
+        let query_conn = Connection::open(&db_path).unwrap();
+        let rows = super::top_commands(&query_conn, run_id).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].command, "cargo test");
+        assert_eq!(rows[0].count, 1);
+        assert_eq!(rows[0].failures, 0);
+    }
+
+    #[test]
+    fn failed_commands_returns_failed_rows() {
+        let dir = tempdir().unwrap();
+        let run_id = "run-failed-cmds";
+        let obs_dir = dir.path().join(format!(".nono/observability/{run_id}"));
+        let conn = make_run_db(&obs_dir, run_id);
+        let db_path = obs_dir.join("events.sqlite");
+
+        conn.execute(
+            "insert into exec_commands (run_id, session_id, turn_id, call_id, shell_command, cwd, exit_code, duration_ms, aggregated_output, created_at, raw_json) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            rusqlite::params![run_id, "s1", "t1", "c2", "mix test", "/tmp", 1i32, 500i64, "FAILED 2", "2026-01-01T00:00:00Z", "{}"],
+        ).unwrap();
+
+        let query_conn = Connection::open(&db_path).unwrap();
+        let rows = super::failed_commands(&query_conn, run_id).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].command, "mix test");
+        assert_eq!(rows[0].exit_code, 1);
     }
 }

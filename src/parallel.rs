@@ -448,12 +448,15 @@ fn sanitize_branch_component(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ParallelConfig, ParallelSessionMetadata, next_parallel_slot, render_parallel_env,
-        sanitize_branch_component, sanitize_session_name, write_session_metadata,
+        ParallelConfig, ParallelSessionMetadata, current_session_metadata, ensure_worktree_exists,
+        expand_path, git_common_root, load_parallel_config, next_parallel_slot,
+        render_parallel_env, requested_slot, sanitize_branch_component, sanitize_session_name,
+        write_session_metadata,
     };
     use std::collections::BTreeMap;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
     use tempfile::tempdir;
 
     #[test]
@@ -536,5 +539,285 @@ mod tests {
             env: BTreeMap::new(),
         };
         assert!(!config.enabled);
+    }
+
+    #[test]
+    fn expand_path_absolute_passes_through() {
+        let root = PathBuf::from("/some/root");
+        let result = expand_path(&root, "/absolute/path").unwrap();
+        assert_eq!(result, PathBuf::from("/absolute/path"));
+    }
+
+    #[test]
+    fn expand_path_relative_joins_to_root() {
+        let root = PathBuf::from("/some/root");
+        let result = expand_path(&root, "relative/path").unwrap();
+        assert_eq!(result, PathBuf::from("/some/root/relative/path"));
+    }
+
+    #[test]
+    fn expand_path_tilde_slash_resolves_to_home() {
+        let root = PathBuf::from("/some/root");
+        let result = expand_path(&root, "~/workspace").unwrap();
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(result, home.join("workspace"));
+    }
+
+    #[test]
+    fn expand_path_bare_tilde_resolves_to_home() {
+        let root = PathBuf::from("/some/root");
+        let result = expand_path(&root, "~").unwrap();
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(result, home);
+    }
+
+    #[test]
+    fn load_parallel_config_returns_enabled_defaults_when_no_file() {
+        let dir = tempdir().unwrap();
+        let config = load_parallel_config(dir.path()).unwrap();
+        assert!(config.enabled);
+        assert!(config.worktree_root.is_none());
+    }
+
+    #[test]
+    fn load_parallel_config_reads_toml_file() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("explicit.toml"),
+            "[parallel]\nenabled = false\nworktree_root = \"~/worktrees\"\n",
+        )
+        .unwrap();
+        let config = load_parallel_config(dir.path()).unwrap();
+        assert!(!config.enabled);
+        assert_eq!(config.worktree_root.as_deref(), Some("~/worktrees"));
+    }
+
+    #[test]
+    fn load_parallel_config_returns_enabled_default_when_no_parallel_section() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("explicit.toml"), "# no parallel section\n").unwrap();
+        let config = load_parallel_config(dir.path()).unwrap();
+        assert!(config.enabled);
+    }
+
+    #[test]
+    fn current_session_metadata_returns_none_when_no_file() {
+        let dir = tempdir().unwrap();
+        let meta = current_session_metadata(dir.path()).unwrap();
+        assert!(meta.is_none());
+    }
+
+    #[test]
+    fn current_session_metadata_reads_existing_file() {
+        let dir = tempdir().unwrap();
+        let nono_dir = dir.path().join(".nono");
+        fs::create_dir_all(&nono_dir).unwrap();
+        write_session_metadata(
+            &nono_dir.join("parallel-session.json"),
+            &ParallelSessionMetadata {
+                slot: 3,
+                session: "slot-03".to_string(),
+                branch: "codex/slot-03".to_string(),
+            },
+        )
+        .unwrap();
+        let meta = current_session_metadata(dir.path()).unwrap().unwrap();
+        assert_eq!(meta.slot, 3);
+        assert_eq!(meta.session, "slot-03");
+        assert_eq!(meta.branch, "codex/slot-03");
+    }
+
+    fn make_parallel_config_with_slot_key(key: &str) -> ParallelConfig {
+        ParallelConfig {
+            enabled: true,
+            worktree_root: None,
+            base_branch: None,
+            branch_prefix: None,
+            session_env_key: None,
+            slot_env_key: Some(key.to_string()),
+            issue_env_key: None,
+            env: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn requested_slot_returns_none_when_env_not_set() {
+        let config = make_parallel_config_with_slot_key("EXPLICIT_TEST_SLOT_UNSET_UNIQUE_XYZ");
+        // Safety: test-only, single-threaded context for env manipulation.
+        unsafe { std::env::remove_var("EXPLICIT_TEST_SLOT_UNSET_UNIQUE_XYZ") };
+        assert!(requested_slot(&config).unwrap().is_none());
+    }
+
+    #[test]
+    fn requested_slot_parses_valid_env_value() {
+        let key = "EXPLICIT_TEST_SLOT_VALID_UNIQUE_XYZ";
+        // Safety: test-only, single-threaded context for env manipulation.
+        unsafe { std::env::set_var(key, "5") };
+        let config = make_parallel_config_with_slot_key(key);
+        let slot = requested_slot(&config).unwrap();
+        assert_eq!(slot, Some(5));
+        unsafe { std::env::remove_var(key) };
+    }
+
+    #[test]
+    fn requested_slot_errors_on_zero() {
+        let key = "EXPLICIT_TEST_SLOT_ZERO_UNIQUE_XYZ";
+        // Safety: test-only, single-threaded context for env manipulation.
+        unsafe { std::env::set_var(key, "0") };
+        let config = make_parallel_config_with_slot_key(key);
+        assert!(requested_slot(&config).is_err());
+        unsafe { std::env::remove_var(key) };
+    }
+
+    #[test]
+    fn requested_slot_returns_none_for_empty_value() {
+        let key = "EXPLICIT_TEST_SLOT_EMPTY_UNIQUE_XYZ";
+        // Safety: test-only, single-threaded context for env manipulation.
+        unsafe { std::env::set_var(key, "") };
+        let config = make_parallel_config_with_slot_key(key);
+        let slot = requested_slot(&config).unwrap();
+        assert!(slot.is_none());
+        unsafe { std::env::remove_var(key) };
+    }
+
+    #[test]
+    fn requested_slot_errors_on_non_integer() {
+        let key = "EXPLICIT_TEST_SLOT_NONINT_UNIQUE_XYZ";
+        // Safety: test-only, single-threaded context for env manipulation.
+        unsafe { std::env::set_var(key, "notanumber") };
+        let config = make_parallel_config_with_slot_key(key);
+        assert!(requested_slot(&config).is_err());
+        unsafe { std::env::remove_var(key) };
+    }
+
+    #[test]
+    fn route_agent_launch_routes_to_worktree_for_session_request() {
+        use super::route_agent_launch;
+
+        let session_key = "EXPLICIT_TEST_SESSION_ROUTE_UNIQUE_XYZ";
+        let dir = tempdir().unwrap();
+        init_git_repo(dir.path());
+
+        fs::write(
+            dir.path().join("explicit.toml"),
+            format!(
+                "[parallel]\nenabled = true\nsession_env_key = \"{session_key}\"\nworktree_root = \"worktrees\"\n"
+            ),
+        )
+        .unwrap();
+
+        // Safety: test-only env manipulation.
+        unsafe { std::env::set_var(session_key, "issue-42") };
+        let result = route_agent_launch(dir.path(), "codex");
+        unsafe { std::env::remove_var(session_key) };
+
+        let routed = result.unwrap();
+        assert!(
+            routed.root.to_string_lossy().contains("issue-42"),
+            "expected worktree path to contain issue-42, got: {}",
+            routed.root.display()
+        );
+        assert_eq!(
+            routed
+                .extra_env
+                .get("EXPLICIT_PARALLEL_SESSION")
+                .map(String::as_str),
+            Some("issue-42")
+        );
+        assert!(routed.extra_env.contains_key("EXPLICIT_PARALLEL_BRANCH"));
+    }
+
+    #[test]
+    fn route_agent_launch_returns_unchanged_root_when_disabled() {
+        use super::route_agent_launch;
+
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("explicit.toml"),
+            "[parallel]\nenabled = false\n",
+        )
+        .unwrap();
+
+        let routed = route_agent_launch(dir.path(), "claude").unwrap();
+        assert_eq!(routed.root, dir.path());
+        assert!(routed.extra_env.is_empty());
+    }
+
+    #[test]
+    fn git_common_root_returns_none_for_non_git_dir() {
+        let dir = tempdir().unwrap();
+        let result = git_common_root(dir.path()).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn git_common_root_returns_some_for_git_repo() {
+        let dir = tempdir().unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let result = git_common_root(dir.path()).unwrap();
+        assert!(result.is_some());
+    }
+
+    fn init_git_repo(path: &Path) {
+        Command::new("git")
+            .args(["init"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        fs::write(path.join("README.md"), "init").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "--no-gpg-sign", "-m", "init"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+    }
+
+    #[test]
+    fn ensure_worktree_exists_creates_new_worktree() {
+        let dir = tempdir().unwrap();
+        init_git_repo(dir.path());
+        let worktree_path = dir.path().join("wt/feature-branch");
+        ensure_worktree_exists(dir.path(), &worktree_path, "feature-branch", None).unwrap();
+        assert!(worktree_path.join(".git").exists());
+    }
+
+    #[test]
+    fn ensure_worktree_exists_is_idempotent() {
+        let dir = tempdir().unwrap();
+        init_git_repo(dir.path());
+        let worktree_path = dir.path().join("wt/idempotent-branch");
+        ensure_worktree_exists(dir.path(), &worktree_path, "idempotent-branch", None).unwrap();
+        ensure_worktree_exists(dir.path(), &worktree_path, "idempotent-branch", None).unwrap();
+        assert!(worktree_path.join(".git").exists());
+    }
+
+    #[test]
+    fn ensure_worktree_exists_errors_on_non_worktree_dir() {
+        let dir = tempdir().unwrap();
+        init_git_repo(dir.path());
+        let existing_dir = dir.path().join("not-a-worktree");
+        fs::create_dir_all(&existing_dir).unwrap();
+        fs::write(existing_dir.join("file.txt"), "data").unwrap();
+        let result = ensure_worktree_exists(dir.path(), &existing_dir, "some-branch", None);
+        assert!(result.is_err());
     }
 }

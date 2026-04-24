@@ -2943,14 +2943,17 @@ mod tests {
         allow_tls_certificate_paths, build_sandbox_command, classify_devenv_stderr_line,
         current_shell_user, deploy_host_lookup_queries, devenv_already_running_pid, doctor_report,
         effective_ssh_agent_hosts, elixir_project_roots, ensure_project_directory,
-        extract_project_ssh_public_key_files, git_remote_ssh_hosts, harmonize_tls_certificate_env,
-        humanize_process_command, is_overlay_xdg_root, is_plain_ssh_host_alias,
-        mix_exs_path_from_metadata, parse_process_snapshot, parse_ssh_config_details,
-        parse_ssh_scan_target, postgres_shell_user_ensure_command, preferred_swiftpm_host_paths,
+        extract_project_ssh_public_key_files, find_mix_list_bounds, git_remote_ssh_hosts,
+        harmonize_tls_certificate_env, humanize_process_command, insert_into_deps_block,
+        insert_into_mix_list, insert_into_project_block, insert_usage_rules_block,
+        is_overlay_xdg_root, is_plain_ssh_host_alias, join_or_none, mix_exs_path_from_metadata,
+        parse_process_snapshot, parse_ssh_config_details, parse_ssh_scan_target,
+        postgres_shell_user_ensure_command, preferred_swiftpm_host_paths,
         prepare_agent_home_overlay_from, prepare_deploy_ssh, prepare_postgres_shell_environment,
         prepare_swiftpm_shell_environment, prepend_path, prioritize_launch_executable,
-        render_project_ssh_config_block, shell_escape_for_env, shell_total_steps,
-        should_skip_overlay_relative_path, ssh_config_value, ssh_host_from_remote_url,
+        render_project_ssh_config_block, rewrite_inline_mix_list, rewrite_multiline_mix_list,
+        shell_escape_for_env, shell_total_steps, should_skip_overlay_relative_path,
+        sql_string_literal, ssh_config_value, ssh_host_from_remote_url,
         stale_devenv_cache_detected, summarize_devenv_failure, summarize_process_tree,
         sync_elixir_usage_rules, uses_postgres_shell, write_project_known_hosts,
         write_ssh_wrapper_scripts,
@@ -4353,5 +4356,93 @@ Error:   × Could not bind localhost:5432
                 env::remove_var("SSH_AUTH_SOCK");
             },
         }
+    }
+
+    #[test]
+    fn sql_string_literal_escapes_single_quotes() {
+        assert_eq!(sql_string_literal("hello"), "'hello'");
+        assert_eq!(sql_string_literal("it's"), "'it''s'");
+        assert_eq!(sql_string_literal(""), "''");
+    }
+
+    #[test]
+    fn join_or_none_returns_none_for_empty() {
+        assert_eq!(join_or_none(Vec::new()), "none");
+    }
+
+    #[test]
+    fn join_or_none_joins_values() {
+        assert_eq!(join_or_none(vec!["a".to_string(), "b".to_string()]), "a, b");
+    }
+
+    #[test]
+    fn find_mix_list_bounds_locates_list_in_deps_block() {
+        let contents = "defmodule M do\n  defp deps do\n    [{:phoenix, \"~> 1.7\"}]\n  end\nend";
+        let (open, close) = find_mix_list_bounds(contents, "defp deps do").unwrap();
+        assert!(open < close);
+        assert_eq!(&contents[open..=open], "[");
+        assert_eq!(&contents[close..=close], "]");
+    }
+
+    #[test]
+    fn find_mix_list_bounds_errors_for_missing_signature() {
+        let contents = "defmodule M do\nend";
+        assert!(find_mix_list_bounds(contents, "defp deps do").is_err());
+    }
+
+    #[test]
+    fn rewrite_inline_mix_list_appends_entry_to_empty_list() {
+        let contents = "defp deps do\n    []\n  end";
+        let (open, close) = find_mix_list_bounds(contents, "defp deps do").unwrap();
+        let result = rewrite_inline_mix_list(contents, open, close, "{:new_dep, \"~> 1.0\"}");
+        assert!(result.contains(":new_dep"));
+    }
+
+    #[test]
+    fn rewrite_inline_mix_list_appends_entry_to_existing_list() {
+        let contents = "defp deps do\n    [{:phoenix, \"~> 1.7\"}]\n  end";
+        let (open, close) = find_mix_list_bounds(contents, "defp deps do").unwrap();
+        let result = rewrite_inline_mix_list(contents, open, close, "{:new_dep, \"~> 1.0\"}");
+        assert!(result.contains(":phoenix"));
+        assert!(result.contains(":new_dep"));
+    }
+
+    #[test]
+    fn rewrite_multiline_mix_list_inserts_before_closing_bracket() {
+        let contents = "defp deps do\n    [\n      {:phoenix, \"~> 1.7\"}\n    ]\n  end";
+        let (open, close) = find_mix_list_bounds(contents, "defp deps do").unwrap();
+        let result = rewrite_multiline_mix_list(contents, open, close, "{:new_dep, \"~> 1.0\"},");
+        assert!(result.contains(":new_dep"));
+    }
+
+    #[test]
+    fn insert_into_deps_block_adds_dependency_to_inline_list() {
+        let contents = "defmodule M do\n  defp deps do\n    []\n  end\nend";
+        let result = insert_into_deps_block(contents, "{:redix, \"~> 1.0\"},").unwrap();
+        assert!(result.contains(":redix"));
+    }
+
+    #[test]
+    fn insert_into_project_block_adds_entry_to_project() {
+        let contents = "defmodule M do\n  def project do\n    [app: :demo]\n  end\nend";
+        let result = insert_into_project_block(contents, "releases: [demo: []]").unwrap();
+        assert!(result.contains("releases"));
+    }
+
+    #[test]
+    fn insert_into_mix_list_round_trips_multiline() {
+        let contents = "defp deps do\n    [\n      {:phoenix, \"~> 1.7\"},\n      {:postgrex, \"~> 0.18\"}\n    ]\n  end";
+        let result =
+            insert_into_mix_list(contents, "defp deps do", "{:redix, \"~> 1.0\"},").unwrap();
+        assert!(result.contains(":phoenix"));
+        assert!(result.contains(":postgrex"));
+        assert!(result.contains(":redix"));
+    }
+
+    #[test]
+    fn insert_usage_rules_block_inserts_before_application_comment() {
+        let contents = "defmodule M do\n  def project do\n    [app: :demo]\n  end\n\n  # Configuration for the OTP application.\n  def application do\n    []\n  end\nend";
+        let result = insert_usage_rules_block(contents).unwrap();
+        assert!(result.contains("usage_rules"));
     }
 }

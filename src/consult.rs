@@ -207,7 +207,12 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{generate_consult_id, shell_escape};
+    use super::{
+        ConsultMetadata, build_consult_command, generate_consult_id, load_metadata, now_ms,
+        shell_escape, write_metadata,
+    };
+    use std::path::PathBuf;
+    use tempfile::tempdir;
 
     #[test]
     fn consult_id_has_expected_prefix() {
@@ -241,5 +246,64 @@ mod tests {
     fn shell_escape_unsafe_string() {
         assert_eq!(shell_escape("hello world"), "'hello world'");
         assert_eq!(shell_escape("it's"), r#"'it'"'"'s'"#);
+    }
+
+    #[test]
+    fn shell_escape_empty_string() {
+        assert_eq!(shell_escape(""), "''");
+    }
+
+    #[test]
+    fn write_and_load_metadata_round_trip() {
+        let dir = tempdir().unwrap();
+        let metadata = ConsultMetadata {
+            consult_id: "consult-claude-20260424-abcd".to_string(),
+            agent: "claude".to_string(),
+            worktree: PathBuf::from("/tmp/worktree"),
+            branch: "consult/consult-claude-20260424-abcd".to_string(),
+            created_at_ms: 1_234_567_890,
+        };
+        write_metadata(dir.path(), &metadata).unwrap();
+        let loaded = load_metadata(dir.path(), "consult-claude-20260424-abcd").unwrap();
+        assert_eq!(loaded.consult_id, metadata.consult_id);
+        assert_eq!(loaded.agent, metadata.agent);
+        assert_eq!(loaded.branch, metadata.branch);
+        assert_eq!(loaded.created_at_ms, metadata.created_at_ms);
+        assert_eq!(loaded.worktree, metadata.worktree);
+    }
+
+    #[test]
+    fn load_metadata_fails_for_missing_consult_id() {
+        let dir = tempdir().unwrap();
+        let result = load_metadata(dir.path(), "nonexistent-id");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("nonexistent-id"), "error: {msg}");
+    }
+
+    #[test]
+    fn build_consult_command_formats_args() {
+        let cmd = build_consult_command("claude", &["-p".to_string(), "hello world".to_string()])
+            .unwrap();
+        assert!(cmd.contains("-p"));
+        assert!(cmd.contains("'hello world'"));
+    }
+
+    #[test]
+    fn build_consult_command_no_args() {
+        let cmd = build_consult_command("gemini", &[]).unwrap();
+        assert!(cmd.contains("gemini"));
+    }
+
+    #[test]
+    fn now_ms_returns_positive_value() {
+        assert!(now_ms() > 0);
+    }
+
+    #[test]
+    fn now_ms_is_monotonically_non_decreasing() {
+        let a = now_ms();
+        let b = now_ms();
+        assert!(b >= a);
     }
 }

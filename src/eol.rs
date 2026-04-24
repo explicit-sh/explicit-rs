@@ -303,7 +303,11 @@ fn remote_product_cache() -> &'static Mutex<BTreeMap<String, ProductSnapshot>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiDocument, EOL_DB_TOML, ensure_supported_runtime_versions, parse_embedded_db};
+    use super::{
+        ApiDocument, CycleSnapshot, EOL_DB_TOML, ProductSnapshot, ResolvedStatus, cache_is_stale,
+        ensure_supported_runtime_versions, find_cycle, format_failure, parse_embedded_db,
+        product_label, read_cached_product, remote_cache_path, write_cached_product,
+    };
     use crate::analysis::{DetectedVersion, RuntimeKind, VersionKind};
 
     #[test]
@@ -393,5 +397,165 @@ mod tests {
             false,
         );
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn warns_but_continues_for_eol_versions_with_allow_flag() {
+        let result = ensure_supported_runtime_versions(
+            &[DetectedVersion {
+                runtime: RuntimeKind::Nodejs,
+                version: "16.20.2".to_string(),
+                source: ".node-version".to_string(),
+                kind: VersionKind::Exact,
+                config_lines: Vec::new(),
+            }],
+            true,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn find_cycle_returns_matching_cycle() {
+        let products = vec![ProductSnapshot {
+            slug: "nodejs".to_string(),
+            label: "Node.js".to_string(),
+            cycles: vec![CycleSnapshot {
+                name: "20".to_string(),
+                is_eol: false,
+                is_maintained: true,
+                eol_from: Some("2026-04-30".to_string()),
+                latest: Some("20.18.0".to_string()),
+            }],
+        }];
+        let cycle = find_cycle(&products, "nodejs", "20");
+        assert!(cycle.is_some());
+        assert_eq!(cycle.unwrap().name, "20");
+        assert!(!cycle.unwrap().is_eol);
+    }
+
+    #[test]
+    fn find_cycle_returns_none_for_unknown_product() {
+        let db = parse_embedded_db();
+        assert!(find_cycle(&db.products, "nonexistent-product-xyz", "1").is_none());
+    }
+
+    #[test]
+    fn find_cycle_returns_none_for_unknown_cycle() {
+        let db = parse_embedded_db();
+        assert!(find_cycle(&db.products, "nodejs", "999").is_none());
+    }
+
+    #[test]
+    fn product_label_returns_label_for_known_product() {
+        let db = parse_embedded_db();
+        let label = product_label(&db.products, "nodejs");
+        assert!(label.is_some());
+        assert!(!label.unwrap().is_empty());
+    }
+
+    #[test]
+    fn product_label_returns_none_for_unknown() {
+        let db = parse_embedded_db();
+        assert!(product_label(&db.products, "xyz-unknown-product-99999").is_none());
+    }
+
+    #[test]
+    fn format_failure_includes_version_info() {
+        let version = DetectedVersion {
+            runtime: RuntimeKind::Nodejs,
+            version: "16.20.0".to_string(),
+            source: ".node-version".to_string(),
+            kind: VersionKind::Exact,
+            config_lines: Vec::new(),
+        };
+        let status = ResolvedStatus {
+            label: "Node.js".to_string(),
+            cycle: "16".to_string(),
+            is_eol: true,
+            eol_from: Some("2023-09-11".to_string()),
+            latest: Some("16.20.2".to_string()),
+            source: "embedded endoflife.date snapshot",
+        };
+        let msg = format_failure(&version, &status);
+        assert!(msg.contains("Node.js"));
+        assert!(msg.contains("16.20.0"));
+        assert!(msg.contains("2023-09-11"));
+        assert!(msg.contains("embedded endoflife.date snapshot"));
+    }
+
+    #[test]
+    fn format_failure_handles_missing_optional_fields() {
+        let version = DetectedVersion {
+            runtime: RuntimeKind::Nodejs,
+            version: "14.0.0".to_string(),
+            source: ".nvmrc".to_string(),
+            kind: VersionKind::Exact,
+            config_lines: Vec::new(),
+        };
+        let status = ResolvedStatus {
+            label: "Node.js".to_string(),
+            cycle: "14".to_string(),
+            is_eol: true,
+            eol_from: None,
+            latest: None,
+            source: "live endoflife.date API",
+        };
+        let msg = format_failure(&version, &status);
+        assert!(msg.contains("an unknown date"));
+        assert!(msg.contains("unknown"));
+    }
+
+    #[test]
+    fn cache_is_stale_returns_false_for_freshly_written_file() {
+        use std::fs;
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.json");
+        fs::write(&path, b"{}").unwrap();
+        let stale = cache_is_stale(&path).unwrap();
+        assert!(!stale, "freshly written file should not be stale");
+    }
+
+    #[test]
+    fn write_and_read_cached_product_round_trip() {
+        use tempfile::tempdir;
+        // Override cache dir via DIRS_CACHE_DIR isn't available, so we use
+        // `dirs::cache_dir` which reads XDG_CACHE_HOME on Linux/macOS.
+        // On macOS `dirs::cache_dir()` uses ~/Library/Caches (not XDG).
+        // We can't easily override it, so instead we use XDG_CACHE_HOME which
+        // the dirs crate respects when set.
+        let dir = tempdir().unwrap();
+        // Safety: test-only env manipulation.
+        unsafe { std::env::set_var("XDG_CACHE_HOME", dir.path()) };
+        let snapshot = ProductSnapshot {
+            slug: "test-slug-xyz".to_string(),
+            label: "TestProduct".to_string(),
+            cycles: vec![CycleSnapshot {
+                name: "1".to_string(),
+                is_eol: false,
+                is_maintained: true,
+                eol_from: None,
+                latest: Some("1.2.3".to_string()),
+            }],
+        };
+        write_cached_product("test-slug-xyz", &snapshot).unwrap();
+        let path = remote_cache_path("test-slug-xyz").unwrap();
+        assert!(path.exists());
+        let loaded = read_cached_product("test-slug-xyz").unwrap();
+        unsafe { std::env::remove_var("XDG_CACHE_HOME") };
+        let loaded = loaded.expect("cached product should be readable");
+        assert_eq!(loaded.slug, "test-slug-xyz");
+        assert_eq!(loaded.label, "TestProduct");
+        assert_eq!(loaded.cycles[0].latest, Some("1.2.3".to_string()));
+    }
+
+    #[test]
+    fn read_cached_product_returns_none_when_absent() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        unsafe { std::env::set_var("XDG_CACHE_HOME", dir.path()) };
+        let result = read_cached_product("no-such-product-xyz123").unwrap();
+        unsafe { std::env::remove_var("XDG_CACHE_HOME") };
+        assert!(result.is_none());
     }
 }

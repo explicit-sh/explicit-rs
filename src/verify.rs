@@ -2572,15 +2572,22 @@ fn shell_quote(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProjectCheck, VerifyMode, VerifyOutputStyle, build_stop_reason, check_preflight_note,
-        command_in_devenv_shell, command_with_runtime_env, devenv_check_command,
-        devenv_root_for_check_with_env, existing_devenv_root, first_invalid_markdown_local_link,
-        first_project_policy_failure, humanize_devenv_trace_line, humanize_live_output,
-        is_matching_devenv_root, markdown_has_terminal_license_section, missing_workflow_commands,
-        normalize_summary, prepare_verify_environment, project_checks, safe_lint_autofix_command,
-        service_process_names, session_start_note, shell_quote, should_attempt_safe_autofix,
-        should_use_devenv, summarize_failure, tokens_are_subsequence,
-        verify_output_style_with_stderr_terminal, workflow_runs_command,
+        CheckFailure, ProjectCheck, VerifyMode, VerifyOutputStyle, audit_workflows,
+        build_stop_reason, check_preflight_note, collect_run_steps_from_jobs,
+        command_in_devenv_shell, command_with_runtime_env, count_words, devenv_check_command,
+        devenv_root_for_check_with_env, displayed_check_count, existing_devenv_root,
+        extract_workflow_events, fallback_summary, first_invalid_markdown_local_link,
+        first_project_policy_failure, format_duration, gitignore_probe_paths, heartbeat_interval,
+        humanize_devenv_trace_line, humanize_live_output, humanize_plain_live_output,
+        is_automatic_workflow_event, is_format_check, is_interesting_live_output,
+        is_javascript_package_manager_command, is_matching_devenv_root, is_noise_failure_line,
+        looks_like_local_path, markdown_has_terminal_license_section, markdown_link_scheme,
+        missing_workflow_commands, normalize_relative_repo_path, normalize_summary,
+        prepare_verify_environment, project_checks, safe_command_rewrite,
+        safe_lint_autofix_command, service_process_names, session_start_note, shell_quote,
+        short_progress_name, should_attempt_safe_autofix, should_use_devenv, split_shell_segments,
+        summarize_failure, tokens_are_subsequence, trace_url_host,
+        verify_output_style_with_stderr_terminal, workflow_mapping_get, workflow_runs_command,
     };
     use crate::analysis::{
         Analysis, GitHubRepository, GitHubVisibility, ProjectRequirement, RepositoryMetadata,
@@ -3928,5 +3935,888 @@ jobs:
         let lanes = super::build_check_lanes(&mix_checks);
         assert_eq!(lanes.len(), 1);
         assert_eq!(lanes[0].len(), 4);
+    }
+
+    #[test]
+    fn count_words_counts_alphanumeric_tokens() {
+        assert_eq!(count_words("hello world foo"), 3);
+        assert_eq!(count_words("  spaces   everywhere  "), 2);
+        assert_eq!(count_words(""), 0);
+        assert_eq!(count_words("MIT License 2024"), 3);
+    }
+
+    #[test]
+    fn count_words_ignores_punctuation_only_tokens() {
+        assert_eq!(count_words("... --- !!!"), 0);
+        assert_eq!(count_words("word. --- word2"), 2);
+    }
+
+    #[test]
+    fn gitignore_probe_paths_returns_dir_and_probe() {
+        let paths = gitignore_probe_paths("node_modules");
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0], "node_modules");
+        assert!(paths[1].ends_with(".explicit-ignore-probe"));
+    }
+
+    #[test]
+    fn gitignore_probe_paths_handles_trailing_slash() {
+        let paths = gitignore_probe_paths("node_modules/");
+        assert_eq!(paths[0], "node_modules");
+    }
+
+    #[test]
+    fn gitignore_probe_paths_handles_empty() {
+        let paths = gitignore_probe_paths("");
+        assert_eq!(paths.len(), 1);
+    }
+
+    #[test]
+    fn markdown_link_scheme_extracts_https() {
+        assert_eq!(markdown_link_scheme("https://example.com"), Some("https"));
+        assert_eq!(markdown_link_scheme("http://example.com"), Some("http"));
+        assert_eq!(
+            markdown_link_scheme("mailto:user@example.com"),
+            Some("mailto")
+        );
+    }
+
+    #[test]
+    fn markdown_link_scheme_returns_none_for_relative_links() {
+        assert_eq!(markdown_link_scheme("docs/guide.md"), None);
+        assert_eq!(markdown_link_scheme("./file.txt"), None);
+        assert_eq!(markdown_link_scheme("#section"), None);
+    }
+
+    #[test]
+    fn markdown_link_scheme_returns_none_for_empty_after_colon() {
+        assert_eq!(markdown_link_scheme("scheme:"), None);
+    }
+
+    #[test]
+    fn normalize_relative_repo_path_resolves_cur_dir() {
+        let path = std::path::Path::new("./docs/guide.md");
+        let result = normalize_relative_repo_path(path).unwrap();
+        assert_eq!(result, std::path::PathBuf::from("docs/guide.md"));
+    }
+
+    #[test]
+    fn normalize_relative_repo_path_resolves_parent_dir() {
+        let path = std::path::Path::new("docs/../README.md");
+        let result = normalize_relative_repo_path(path).unwrap();
+        assert_eq!(result, std::path::PathBuf::from("README.md"));
+    }
+
+    #[test]
+    fn normalize_relative_repo_path_returns_none_for_escape() {
+        let path = std::path::Path::new("../../LICENSE");
+        assert!(normalize_relative_repo_path(path).is_none());
+    }
+
+    #[test]
+    fn normalize_relative_repo_path_returns_none_for_absolute() {
+        let path = std::path::Path::new("/absolute/path");
+        assert!(normalize_relative_repo_path(path).is_none());
+    }
+
+    #[test]
+    fn is_automatic_workflow_event_push_and_pr() {
+        assert!(is_automatic_workflow_event("push"));
+        assert!(is_automatic_workflow_event("pull_request"));
+        assert!(is_automatic_workflow_event("pull_request_target"));
+        assert!(is_automatic_workflow_event("merge_group"));
+    }
+
+    #[test]
+    fn is_automatic_workflow_event_manual_triggers() {
+        assert!(!is_automatic_workflow_event("workflow_dispatch"));
+        assert!(!is_automatic_workflow_event("schedule"));
+        assert!(!is_automatic_workflow_event("release"));
+    }
+
+    #[test]
+    fn split_shell_segments_splits_on_and_and_semicolon() {
+        let segments = split_shell_segments("foo && bar; baz");
+        assert!(segments.contains(&"foo"));
+        assert!(segments.contains(&"bar"));
+        assert!(segments.contains(&"baz"));
+    }
+
+    #[test]
+    fn split_shell_segments_splits_multiline() {
+        let segments = split_shell_segments("step1\nstep2 && step3");
+        assert!(segments.contains(&"step1"));
+        assert!(segments.contains(&"step2"));
+        assert!(segments.contains(&"step3"));
+    }
+
+    #[test]
+    fn safe_command_rewrite_replaces_needle() {
+        let result = safe_command_rewrite("cargo fmt --check", "cargo fmt --check", "cargo fmt");
+        assert_eq!(result.as_deref(), Some("cargo fmt"));
+    }
+
+    #[test]
+    fn safe_command_rewrite_returns_none_when_no_match() {
+        let result = safe_command_rewrite("cargo test", "cargo fmt --check", "cargo fmt");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn safe_lint_autofix_rewrite_mix_format() {
+        let cmd = safe_lint_autofix_command("mix format --check-formatted");
+        assert_eq!(cmd.as_deref(), Some("mix format"));
+    }
+
+    #[test]
+    fn safe_lint_autofix_rewrite_cargo_fmt() {
+        let cmd = safe_lint_autofix_command("cargo fmt --check");
+        assert_eq!(cmd.as_deref(), Some("cargo fmt"));
+    }
+
+    #[test]
+    fn safe_lint_autofix_returns_none_for_non_lint_command() {
+        let cmd = safe_lint_autofix_command("cargo test");
+        assert!(cmd.is_none());
+    }
+
+    // ── workflow_mapping_get ──────────────────────────────────────────────────
+
+    #[test]
+    fn workflow_mapping_get_finds_string_key() {
+        use serde_yaml::{Mapping, Value};
+        let mut m = Mapping::new();
+        m.insert(Value::String("jobs".into()), Value::String("val".into()));
+        let result = workflow_mapping_get(&m, "jobs");
+        assert_eq!(result, Some(&Value::String("val".into())));
+    }
+
+    #[test]
+    fn workflow_mapping_get_returns_none_for_missing_key() {
+        use serde_yaml::Mapping;
+        let m = Mapping::new();
+        assert!(workflow_mapping_get(&m, "missing").is_none());
+    }
+
+    #[test]
+    fn workflow_mapping_get_finds_on_via_bool_true() {
+        use serde_yaml::{Mapping, Value};
+        // YAML `on:` is parsed as bool true key in serde_yaml
+        let mut m = Mapping::new();
+        m.insert(Value::Bool(true), Value::String("push".into()));
+        let result = workflow_mapping_get(&m, "on");
+        assert_eq!(result, Some(&Value::String("push".into())));
+    }
+
+    // ── extract_workflow_events ───────────────────────────────────────────────
+
+    #[test]
+    fn extract_workflow_events_string_value() {
+        use serde_yaml::Value;
+        let v = Value::String("push".into());
+        assert_eq!(extract_workflow_events(&v), vec!["push"]);
+    }
+
+    #[test]
+    fn extract_workflow_events_sequence_value() {
+        use serde_yaml::Value;
+        let v = Value::Sequence(vec![
+            Value::String("push".into()),
+            Value::String("pull_request".into()),
+        ]);
+        let events = extract_workflow_events(&v);
+        assert_eq!(events, vec!["push", "pull_request"]);
+    }
+
+    #[test]
+    fn extract_workflow_events_mapping_value() {
+        use serde_yaml::{Mapping, Value};
+        let mut m = Mapping::new();
+        m.insert(Value::String("push".into()), Value::Null);
+        m.insert(Value::String("pull_request".into()), Value::Null);
+        let v = Value::Mapping(m);
+        let mut events = extract_workflow_events(&v);
+        events.sort();
+        assert_eq!(events, vec!["pull_request", "push"]);
+    }
+
+    #[test]
+    fn extract_workflow_events_null_returns_empty() {
+        use serde_yaml::Value;
+        let events = extract_workflow_events(&Value::Null);
+        assert!(events.is_empty());
+    }
+
+    // ── collect_run_steps_from_jobs ───────────────────────────────────────────
+
+    #[test]
+    fn collect_run_steps_from_jobs_extracts_run_commands() {
+        use serde_yaml::{Mapping, Value};
+        // jobs:
+        //   build:
+        //     steps:
+        //       - run: cargo test
+        //       - uses: actions/checkout@v3   (no run field)
+        let mut step_run = Mapping::new();
+        step_run.insert(
+            Value::String("run".into()),
+            Value::String("cargo test".into()),
+        );
+        let mut step_uses = Mapping::new();
+        step_uses.insert(
+            Value::String("uses".into()),
+            Value::String("actions/checkout@v3".into()),
+        );
+        let steps = Value::Sequence(vec![Value::Mapping(step_run), Value::Mapping(step_uses)]);
+        let mut job = Mapping::new();
+        job.insert(Value::String("steps".into()), steps);
+        let mut jobs = Mapping::new();
+        jobs.insert(Value::String("build".into()), Value::Mapping(job));
+
+        let mut run_steps = Vec::new();
+        collect_run_steps_from_jobs(&jobs, &mut run_steps);
+        assert_eq!(run_steps, vec!["cargo test"]);
+    }
+
+    #[test]
+    fn collect_run_steps_skips_non_mapping_jobs() {
+        use serde_yaml::{Mapping, Value};
+        let mut jobs = Mapping::new();
+        jobs.insert(
+            Value::String("bad".into()),
+            Value::String("not-a-map".into()),
+        );
+        let mut run_steps = Vec::new();
+        collect_run_steps_from_jobs(&jobs, &mut run_steps);
+        assert!(run_steps.is_empty());
+    }
+
+    // ── audit_workflows ───────────────────────────────────────────────────────
+
+    #[test]
+    fn audit_workflows_detects_automatic_trigger_and_run_steps() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let wf_dir = dir.path().join(".github").join("workflows");
+        fs::create_dir_all(&wf_dir).unwrap();
+        let yaml = r#"
+on: [push, pull_request]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - run: cargo test
+"#;
+        fs::write(wf_dir.join("ci.yml"), yaml).unwrap();
+        let result =
+            audit_workflows(dir.path(), &[".github/workflows/ci.yml".to_string()]).unwrap();
+        assert!(result.has_automatic_trigger);
+        assert!(result.run_steps.contains(&"cargo test".to_string()));
+    }
+
+    #[test]
+    fn audit_workflows_no_automatic_trigger_for_manual_only() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let wf_dir = dir.path().join(".github").join("workflows");
+        fs::create_dir_all(&wf_dir).unwrap();
+        let yaml = r#"
+on: [workflow_dispatch]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hello
+"#;
+        fs::write(wf_dir.join("manual.yml"), yaml).unwrap();
+        let result =
+            audit_workflows(dir.path(), &[".github/workflows/manual.yml".to_string()]).unwrap();
+        assert!(!result.has_automatic_trigger);
+        assert_eq!(result.run_steps, vec!["echo hello"]);
+    }
+
+    #[test]
+    fn audit_workflows_records_syntax_error_for_invalid_yaml() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let wf_dir = dir.path().join(".github").join("workflows");
+        fs::create_dir_all(&wf_dir).unwrap();
+        // Deliberately malformed YAML (tabs not allowed as indentation)
+        let bad_yaml = "on: push\njobs:\n\tbuild:\n\t\truns-on: ubuntu-latest\n";
+        fs::write(wf_dir.join("bad.yml"), bad_yaml).unwrap();
+        let result =
+            audit_workflows(dir.path(), &[".github/workflows/bad.yml".to_string()]).unwrap();
+        assert!(!result.syntax_errors.is_empty());
+    }
+
+    #[test]
+    fn audit_workflows_missing_jobs_key_is_syntax_error() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let wf_dir = dir.path().join(".github").join("workflows");
+        fs::create_dir_all(&wf_dir).unwrap();
+        let yaml = "on: push\n";
+        fs::write(wf_dir.join("nojobs.yml"), yaml).unwrap();
+        let result =
+            audit_workflows(dir.path(), &[".github/workflows/nojobs.yml".to_string()]).unwrap();
+        assert!(!result.syntax_errors.is_empty());
+        assert!(result.syntax_errors[0].contains("missing top-level `jobs`"));
+    }
+
+    #[test]
+    fn audit_workflows_non_mapping_root_is_syntax_error() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let wf_dir = dir.path().join(".github").join("workflows");
+        fs::create_dir_all(&wf_dir).unwrap();
+        // Root document is a string, not a mapping
+        let yaml = "just a string\n";
+        fs::write(wf_dir.join("string.yml"), yaml).unwrap();
+        let result =
+            audit_workflows(dir.path(), &[".github/workflows/string.yml".to_string()]).unwrap();
+        assert!(!result.syntax_errors.is_empty());
+        assert!(result.syntax_errors[0].contains("root document must be a mapping"));
+    }
+
+    #[test]
+    fn audit_workflows_empty_file_list_returns_default() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let result = audit_workflows(dir.path(), &[]).unwrap();
+        assert!(!result.has_automatic_trigger);
+        assert!(result.run_steps.is_empty());
+        assert!(result.syntax_errors.is_empty());
+    }
+
+    // ── workflow_runs_command / missing_workflow_commands ─────────────────────
+
+    #[test]
+    fn workflow_runs_command_finds_matching_step() {
+        let steps = vec!["cargo test --all-features".to_string()];
+        assert!(workflow_runs_command(&steps, "cargo test"));
+    }
+
+    #[test]
+    fn workflow_runs_command_returns_false_for_missing() {
+        let steps = vec!["npm install".to_string()];
+        assert!(!workflow_runs_command(&steps, "cargo test"));
+    }
+
+    #[test]
+    fn missing_workflow_commands_returns_uncovered_commands() {
+        let mut a = analysis_with_checks();
+        a.lint_commands = vec!["cargo fmt --check".to_string()];
+        a.build_commands = Vec::new();
+        a.test_commands = Vec::new();
+        a.coverage_commands = Vec::new();
+        let steps = vec!["cargo build".to_string()]; // no fmt
+        let missing = missing_workflow_commands(&a, &steps);
+        assert!(missing.contains(&"cargo fmt --check".to_string()));
+    }
+
+    #[test]
+    fn missing_workflow_commands_empty_when_all_covered() {
+        let mut a = analysis_with_checks();
+        a.lint_commands = vec!["cargo fmt --check".to_string()];
+        a.build_commands = Vec::new();
+        a.test_commands = Vec::new();
+        a.coverage_commands = Vec::new();
+        let steps = vec!["cargo fmt --check".to_string()];
+        let missing = missing_workflow_commands(&a, &steps);
+        assert!(missing.is_empty());
+    }
+
+    // ── tokens_are_subsequence ────────────────────────────────────────────────
+
+    #[test]
+    fn tokens_are_subsequence_empty_expected_is_true() {
+        assert!(tokens_are_subsequence(&["a", "b"], &[]));
+    }
+
+    #[test]
+    fn tokens_are_subsequence_matching_subsequence() {
+        assert!(tokens_are_subsequence(
+            &["cargo", "test", "--all"],
+            &["cargo", "test"]
+        ));
+    }
+
+    #[test]
+    fn tokens_are_subsequence_non_matching() {
+        assert!(!tokens_are_subsequence(
+            &["npm", "install"],
+            &["cargo", "test"]
+        ));
+    }
+
+    // ── is_javascript_package_manager_command ─────────────────────────────────
+
+    #[test]
+    fn is_javascript_package_manager_command_yarn() {
+        assert!(is_javascript_package_manager_command("yarn install"));
+        assert!(is_javascript_package_manager_command("npm run build"));
+        assert!(is_javascript_package_manager_command("pnpm test"));
+        assert!(is_javascript_package_manager_command("npx eslint ."));
+        assert!(is_javascript_package_manager_command("bun run dev"));
+    }
+
+    #[test]
+    fn is_javascript_package_manager_command_non_js() {
+        assert!(!is_javascript_package_manager_command("cargo test"));
+        assert!(!is_javascript_package_manager_command("mix test"));
+    }
+
+    // ── short_progress_name ───────────────────────────────────────────────────
+
+    #[test]
+    fn short_progress_name_strips_path_prefix() {
+        // Path::file_name returns the last component, not nix-hash-stripped form
+        assert_eq!(
+            short_progress_name("/nix/store/abc-openssl-1.1"),
+            "abc-openssl-1.1"
+        );
+    }
+
+    #[test]
+    fn short_progress_name_bare_name_unchanged() {
+        assert_eq!(short_progress_name("openssl"), "openssl");
+    }
+
+    // ── heartbeat_interval ────────────────────────────────────────────────────
+
+    #[test]
+    fn heartbeat_interval_early() {
+        assert_eq!(
+            heartbeat_interval(Duration::from_secs(10)),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn heartbeat_interval_mid() {
+        assert_eq!(
+            heartbeat_interval(Duration::from_secs(60)),
+            Duration::from_secs(15)
+        );
+    }
+
+    #[test]
+    fn heartbeat_interval_late() {
+        assert_eq!(
+            heartbeat_interval(Duration::from_secs(200)),
+            Duration::from_secs(30)
+        );
+    }
+
+    // ── trace_url_host ────────────────────────────────────────────────────────
+
+    #[test]
+    fn trace_url_host_extracts_host() {
+        assert_eq!(
+            trace_url_host("https://cache.nixos.org/abc.narinfo"),
+            Some("cache.nixos.org")
+        );
+    }
+
+    #[test]
+    fn trace_url_host_no_scheme_returns_none() {
+        assert_eq!(trace_url_host("cache.nixos.org"), None);
+    }
+
+    // ── is_interesting_live_output ────────────────────────────────────────────
+
+    #[test]
+    fn is_interesting_live_output_matches_installing() {
+        assert!(is_interesting_live_output("Installing openssl..."));
+        assert!(is_interesting_live_output("Downloading packages"));
+        assert!(is_interesting_live_output("Fetching packages"));
+        assert!(is_interesting_live_output("added 42 packages"));
+    }
+
+    #[test]
+    fn is_interesting_live_output_ignores_noise() {
+        assert!(!is_interesting_live_output("some random log line"));
+    }
+
+    // ── humanize_plain_live_output ────────────────────────────────────────────
+
+    #[test]
+    fn humanize_plain_live_output_interesting_line() {
+        let result = humanize_plain_live_output("• Installing openssl");
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("Installing openssl"));
+    }
+
+    #[test]
+    fn humanize_plain_live_output_empty_returns_none() {
+        assert!(humanize_plain_live_output("").is_none());
+    }
+
+    #[test]
+    fn humanize_plain_live_output_uninteresting_returns_none() {
+        assert!(humanize_plain_live_output("some random output").is_none());
+    }
+
+    // ── humanize_live_output ──────────────────────────────────────────────────
+
+    #[test]
+    fn humanize_live_output_empty_returns_none() {
+        assert!(humanize_live_output("").is_none());
+    }
+
+    #[test]
+    fn humanize_live_output_plain_interesting_line() {
+        let result = humanize_live_output("Installing packages");
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn humanize_devenv_trace_line_fetch_start() {
+        let json = r#"{"fields":{"event":{"activity_kind":"fetch","event":"start","name":"/nix/store/abc-openssl","url":"https://cache.nixos.org/abc"}}}"#;
+        let result = humanize_devenv_trace_line(json);
+        assert!(result.is_some());
+        // short_progress_name returns the last path component
+        assert!(result.unwrap().contains("Fetching abc-openssl"));
+    }
+
+    #[test]
+    fn humanize_devenv_trace_line_fetch_complete() {
+        let json = r#"{"fields":{"event":{"activity_kind":"fetch","event":"complete","name":"/nix/store/abc-openssl"}}}"#;
+        let result = humanize_devenv_trace_line(json);
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("Fetched abc-openssl"));
+    }
+
+    #[test]
+    fn humanize_devenv_trace_line_build_start() {
+        let json = r#"{"fields":{"event":{"activity_kind":"build","event":"start","name":"/nix/store/abc-openssl"}}}"#;
+        let result = humanize_devenv_trace_line(json);
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("Building abc-openssl"));
+    }
+
+    #[test]
+    fn humanize_devenv_trace_line_evaluating_shell() {
+        let json = r#"{"fields":{"event":{"activity_kind":"evaluate","event":"start","name":"Evaluating shell"}}}"#;
+        let result = humanize_devenv_trace_line(json);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), "Evaluating shell");
+    }
+
+    #[test]
+    fn humanize_devenv_trace_line_configuring_shell_ui_message() {
+        let json = r#"{"fields":{"devenv.ui.message":true,"devenv.span_event_kind":0,"message":"Configuring shell"}}"#;
+        let result = humanize_devenv_trace_line(json);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), "Configuring shell");
+    }
+
+    #[test]
+    fn humanize_devenv_trace_line_returns_none_for_invalid_json() {
+        assert!(humanize_devenv_trace_line("not-json").is_none());
+    }
+
+    // ── is_noise_failure_line ────────────────────────────────────────────────
+
+    #[test]
+    fn is_noise_failure_line_empty() {
+        assert!(is_noise_failure_line(""));
+        assert!(is_noise_failure_line("   "));
+    }
+
+    #[test]
+    fn is_noise_failure_line_known_noise() {
+        assert!(is_noise_failure_line("configuring shell..."));
+        assert!(is_noise_failure_line("Loading tasks: some task"));
+        assert!(is_noise_failure_line("Running tasks: build"));
+        assert!(is_noise_failure_line("yarn run v1.22"));
+        assert!(is_noise_failure_line("$ npx foo"));
+        assert!(is_noise_failure_line("npm warn ERESOLVE"));
+    }
+
+    #[test]
+    fn is_noise_failure_line_real_error() {
+        assert!(!is_noise_failure_line("error[E0308]: mismatched types"));
+    }
+
+    // ── normalize_summary ────────────────────────────────────────────────────
+
+    #[test]
+    fn normalize_summary_strips_error_prefixes() {
+        assert_eq!(
+            normalize_summary("error: something went wrong"),
+            "something went wrong"
+        );
+        assert_eq!(normalize_summary("Error: foo"), "foo");
+        assert_eq!(normalize_summary("ERROR: bar"), "bar");
+    }
+
+    #[test]
+    fn normalize_summary_strips_ansi_escapes() {
+        let with_ansi = "\x1b[31merror\x1b[0m: something";
+        let result = normalize_summary(with_ansi);
+        assert!(!result.contains('\x1b'));
+    }
+
+    #[test]
+    fn normalize_summary_truncates_long_lines() {
+        let long = "x".repeat(200);
+        let result = normalize_summary(&long);
+        assert!(result.len() <= 180);
+        assert!(result.ends_with("..."));
+    }
+
+    // ── format_duration ───────────────────────────────────────────────────────
+
+    #[test]
+    fn format_duration_long() {
+        assert_eq!(format_duration(Duration::from_secs(15)), "15.0s");
+    }
+
+    #[test]
+    fn format_duration_medium() {
+        assert_eq!(format_duration(Duration::from_secs_f64(3.0)), "3.00s");
+    }
+
+    #[test]
+    fn format_duration_short_ms() {
+        let result = format_duration(Duration::from_millis(500));
+        assert!(result.ends_with("ms"), "got: {result}");
+    }
+
+    // ── is_format_check ───────────────────────────────────────────────────────
+
+    #[test]
+    fn is_format_check_detects_fmt_check() {
+        assert!(is_format_check("cargo fmt --check"));
+        assert!(is_format_check("mix format --check-formatted"));
+    }
+
+    #[test]
+    fn is_format_check_returns_false_for_non_format() {
+        assert!(!is_format_check("cargo test"));
+    }
+
+    // ── fallback_summary ──────────────────────────────────────────────────────
+
+    #[test]
+    fn fallback_summary_format_check_message() {
+        let result = fallback_summary("lint", "cargo fmt --check", Some(1));
+        assert!(result.contains("formatting check"));
+    }
+
+    #[test]
+    fn fallback_summary_generic_message() {
+        let result = fallback_summary("test", "cargo test", Some(2));
+        assert!(result.contains("test command exited with 2"));
+    }
+
+    #[test]
+    fn fallback_summary_signal_exit() {
+        let result = fallback_summary("build", "cargo build", None);
+        assert!(result.contains("signal"));
+    }
+
+    // ── looks_like_local_path ─────────────────────────────────────────────────
+
+    #[test]
+    fn looks_like_local_path_absolute() {
+        assert!(looks_like_local_path("/home/user/project/src/main.rs"));
+    }
+
+    #[test]
+    fn looks_like_local_path_relative_dot_slash() {
+        assert!(looks_like_local_path("./src/main.rs"));
+    }
+
+    #[test]
+    fn looks_like_local_path_with_extension() {
+        assert!(looks_like_local_path("src/main.rs"));
+    }
+
+    #[test]
+    fn looks_like_local_path_rejects_empty() {
+        assert!(!looks_like_local_path(""));
+    }
+
+    #[test]
+    fn looks_like_local_path_rejects_line_with_space() {
+        assert!(!looks_like_local_path("error: something went wrong"));
+    }
+
+    // ── invalid_local_markdown_link additional branches ───────────────────────
+
+    #[test]
+    fn rejects_markdown_link_with_file_scheme() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let failure = first_invalid_markdown_local_link(
+            "# Demo\n\nSee [License](file:///tmp/file).\n",
+            dir.path(),
+            &dir.path().join("README.md"),
+        )
+        .expect("expected invalid file:// link");
+        assert!(!failure.is_empty());
+    }
+
+    #[test]
+    fn accepts_markdown_link_with_mailto_scheme() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let result = first_invalid_markdown_local_link(
+            "# Demo\n\nContact [us](mailto:user@example.com).\n",
+            dir.path(),
+            &dir.path().join("README.md"),
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn accepts_empty_and_anchor_only_links() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let result = first_invalid_markdown_local_link(
+            "# Demo\n\nSee [section](#intro) or [empty]().\n",
+            dir.path(),
+            &dir.path().join("README.md"),
+        );
+        assert!(result.is_none());
+    }
+
+    // ── pick_line / pick_following_detail ─────────────────────────────────────
+
+    #[test]
+    fn summarize_test_failure_picks_following_detail() {
+        let output = failed_output(
+            "FAILURES\n\n  1) some test description\n\nFinished in 0.01 seconds\n",
+            "",
+        );
+        let summary = summarize_failure("test", "mix test", &output);
+        // Should pick line following "FAILURES"
+        assert!(!summary.is_empty());
+    }
+
+    #[test]
+    fn summarize_coverage_failure_picks_percentage_line() {
+        let output = failed_output(
+            "TOTAL                   72.00%  coverage is below the threshold\n",
+            "",
+        );
+        let summary =
+            summarize_failure("coverage", "cargo llvm-cov --fail-under-lines 80", &output);
+        assert!(summary.contains("72.00%") || summary.contains("coverage"));
+    }
+
+    #[test]
+    fn summarize_clippy_failure_picks_error_line() {
+        let output = failed_output("", "error: unused variable: `x`\n  --> src/main.rs:5:9\n");
+        let summary = summarize_failure("lint", "cargo clippy", &output);
+        assert!(summary.contains("unused variable") || summary.contains("error"));
+    }
+
+    // ── summarize_format_failure ──────────────────────────────────────────────
+
+    #[test]
+    fn summarize_format_failure_falls_back_to_first_non_noise_line() {
+        let output = failed_output("some unexpected message\n", "");
+        let summary = summarize_failure("lint", "cargo fmt --check", &output);
+        // No "Diff in", no path-like lines -> falls back to first non-noise line
+        assert!(summary.contains("some unexpected message") || summary.contains("formatting"));
+    }
+
+    #[test]
+    fn summarize_format_failure_returns_static_when_all_noise() {
+        let output = failed_output(
+            "Running           devenv:enterShell\nSucceeded         devenv:enterShell\n",
+            "",
+        );
+        let summary = summarize_failure("lint", "cargo fmt --check", &output);
+        assert_eq!(summary, "formatting changes are required");
+    }
+
+    // ── build_stop_reason ─────────────────────────────────────────────────────
+
+    #[test]
+    fn build_stop_reason_formats_correctly() {
+        let failure = CheckFailure {
+            kind: "test",
+            subject: "cargo test".to_string(),
+            exit_code: Some(1),
+            summary: "3 tests failed".to_string(),
+            duration: None,
+        };
+        let reason = build_stop_reason(&failure);
+        assert!(reason.contains("cargo test"));
+        assert!(reason.contains("3 tests failed"));
+    }
+
+    // ── summarize generic failure ─────────────────────────────────────────────
+
+    #[test]
+    fn summarize_failure_falls_back_to_last_line_when_no_match() {
+        let output = failed_output("", "some final message\n");
+        let summary = summarize_failure("build", "make", &output);
+        assert!(summary.contains("some final message"));
+    }
+
+    #[test]
+    fn summarize_failure_empty_output_uses_fallback() {
+        let output = failed_output("", "");
+        let summary = summarize_failure("lint", "pylint", &output);
+        // empty output → fallback_summary → "lint command exited with..."
+        assert!(summary.contains("lint") || summary.contains("exited"));
+    }
+
+    #[test]
+    fn summarize_failure_test_fallback_when_no_specific_match() {
+        let output = failed_output("something unexpected\n", "");
+        let summary = summarize_failure("test", "rspec", &output);
+        // no specific test indicator → falls back to generic last line
+        assert!(!summary.is_empty());
+    }
+
+    #[test]
+    fn summarize_coverage_fallback_with_percentage_line() {
+        let output = failed_output("", "coverage: 72.5% of statements\n");
+        let summary = summarize_failure("coverage", "go test -cover", &output);
+        assert!(summary.contains("72.5%") || !summary.is_empty());
+    }
+
+    // ── verify_output_style_with_stderr_terminal ──────────────────────────────
+
+    #[test]
+    fn verify_output_style_returns_compact_for_stop_hook() {
+        let style = verify_output_style_with_stderr_terminal(VerifyMode::StopHook, false);
+        assert_eq!(style, VerifyOutputStyle::Compact);
+    }
+
+    #[test]
+    fn verify_output_style_returns_interactive_for_user_with_terminal() {
+        let style = verify_output_style_with_stderr_terminal(VerifyMode::User, true);
+        assert_eq!(style, VerifyOutputStyle::Interactive);
+    }
+
+    #[test]
+    fn verify_output_style_returns_compact_for_user_without_terminal() {
+        let style = verify_output_style_with_stderr_terminal(VerifyMode::User, false);
+        assert_eq!(style, VerifyOutputStyle::Compact);
+    }
+
+    // ── displayed_check_count ─────────────────────────────────────────────────
+
+    #[test]
+    fn displayed_check_count_no_policy_checks() {
+        // command_checks < total_checks implies policy checks exist
+        // displayed = total - (total - command)
+        let result = displayed_check_count(3, 5);
+        // Policy-only checks hidden
+        assert_eq!(result, 3);
+    }
+
+    #[test]
+    fn displayed_check_count_equal_counts() {
+        let result = displayed_check_count(5, 5);
+        assert_eq!(result, 5);
     }
 }

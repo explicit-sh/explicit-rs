@@ -469,7 +469,8 @@ fn extract_observe_flag(args: Vec<String>) -> (bool, Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, ObserveCommand, build_agent_command, extract_observe_flag, shell_escape,
+        Cli, Command, ConsultAgent, ObserveCommand, build_agent_command, extract_observe_flag,
+        shell_escape,
     };
     use clap::Parser;
     use std::path::PathBuf;
@@ -590,5 +591,65 @@ mod tests {
             panic!("expected codex command");
         };
         assert_eq!(args.args, vec!["resume"]);
+    }
+
+    #[test]
+    fn consult_claude_subcommand_parses() {
+        let cli = Cli::try_parse_from(["explicit", "consult", "claude", "--", "-p", "hello"])
+            .expect("expected consult claude to parse");
+        let Command::Consult(args) = cli.command else {
+            panic!("expected consult command");
+        };
+        let ConsultAgent::Claude(agent_args) = args.agent else {
+            panic!("expected claude agent");
+        };
+        assert_eq!(agent_args.args, vec!["-p", "hello"]);
+        assert!(agent_args.resume.is_none());
+    }
+
+    #[test]
+    fn consult_claude_resume_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "explicit",
+            "consult",
+            "claude",
+            "--resume",
+            "consult-claude-20260424-abcd",
+            "--",
+            "-p",
+            "follow up",
+        ])
+        .expect("expected consult resume to parse");
+        let Command::Consult(args) = cli.command else {
+            panic!("expected consult command");
+        };
+        let ConsultAgent::Claude(agent_args) = args.agent else {
+            panic!("expected claude agent");
+        };
+        assert_eq!(
+            agent_args.resume.as_deref(),
+            Some("consult-claude-20260424-abcd")
+        );
+        assert_eq!(agent_args.args, vec!["-p", "follow up"]);
+    }
+
+    #[test]
+    fn consult_gemini_subcommand_parses() {
+        let cli = Cli::try_parse_from(["explicit", "consult", "gemini", "--", "-p", "test"])
+            .expect("expected consult gemini to parse");
+        let Command::Consult(args) = cli.command else {
+            panic!("expected consult command");
+        };
+        assert!(matches!(args.agent, ConsultAgent::Gemini(_)));
+    }
+
+    #[test]
+    fn consult_codex_subcommand_parses() {
+        let cli = Cli::try_parse_from(["explicit", "consult", "codex", "--", "-p", "test"])
+            .expect("expected consult codex to parse");
+        let Command::Consult(args) = cli.command else {
+            panic!("expected consult command");
+        };
+        assert!(matches!(args.agent, ConsultAgent::Codex(_)));
     }
 }

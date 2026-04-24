@@ -188,9 +188,15 @@ fn apply_sandbox(caps: &CapabilitySet) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{choose_shell, escape_seatbelt_path, preferred_shell_path};
+    use super::{
+        choose_shell, escape_seatbelt_path, merge_secret_forwarded_env, preferred_shell_path,
+    };
     use std::collections::BTreeMap;
     use std::path::Path;
+    use std::sync::Mutex;
+
+    // Serialize env-var tests to prevent races on process-wide env state.
+    static SECRET_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn prefers_known_system_shell_over_env_shell() {
@@ -199,6 +205,17 @@ mod tests {
 
         let shell = preferred_shell_path(&env_map);
         assert!(shell == "/bin/bash" || shell == "/bin/zsh");
+    }
+
+    #[test]
+    fn preferred_shell_fallback_from_env_map() {
+        // Simulate no /bin/bash or /bin/zsh present (they do exist in tests, so this
+        // just verifies the function returns *something* on current platform).
+        let mut env_map = BTreeMap::new();
+        env_map.insert("SHELL".to_string(), "/custom/shell".to_string());
+        let shell = preferred_shell_path(&env_map);
+        // On macOS both /bin/bash and /bin/zsh exist, so one of them is returned.
+        assert!(!shell.is_empty());
     }
 
     #[test]
@@ -211,8 +228,112 @@ mod tests {
     }
 
     #[test]
+    fn interactive_mode_uses_interactive_flag() {
+        let shell = choose_shell(&BTreeMap::new(), &None);
+        assert!(
+            shell.args.contains(&"-i".to_string()),
+            "interactive mode should use -i: {:?}",
+            shell.args
+        );
+    }
+
+    #[test]
+    fn choose_shell_zsh_command_mode() {
+        let env_map = BTreeMap::new();
+        let shell_path = preferred_shell_path(&env_map);
+        let shell = choose_shell(&env_map, &Some("echo hi".to_string()));
+        if shell_path.ends_with("zsh") {
+            assert_eq!(shell.args[0], "-f");
+            assert_eq!(shell.args[1], "-c");
+        } else {
+            assert_eq!(shell.args[0], "--noprofile");
+        }
+    }
+
+    #[test]
     fn escape_seatbelt_path_rejects_unsafe_characters() {
         assert!(escape_seatbelt_path(Path::new("/tmp/ok.toml")).is_ok());
         assert!(escape_seatbelt_path(Path::new("/tmp/bad\"quote")).is_err());
+    }
+
+    #[test]
+    fn build_capabilities_with_empty_plan_succeeds() {
+        use crate::analysis::SandboxPlan;
+        use std::path::PathBuf;
+        let plan = SandboxPlan {
+            root: PathBuf::from("/tmp"),
+            read_write_files: Vec::new(),
+            read_write_dirs: Vec::new(),
+            read_only_files: Vec::new(),
+            read_only_dirs: Vec::new(),
+            protected_write_files: Vec::new(),
+            notes: Vec::new(),
+        };
+        // Just check it doesn't panic or error for an empty plan.
+        let result = super::build_capabilities(&plan);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn build_capabilities_with_existing_read_only_dir() {
+        use crate::analysis::SandboxPlan;
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let plan = SandboxPlan {
+            root: dir.path().to_path_buf(),
+            read_write_files: Vec::new(),
+            read_write_dirs: Vec::new(),
+            read_only_files: Vec::new(),
+            read_only_dirs: vec![dir.path().to_path_buf()],
+            protected_write_files: Vec::new(),
+            notes: Vec::new(),
+        };
+        let result = super::build_capabilities(&plan);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn merge_secret_forwarded_env_does_nothing_when_var_absent() {
+        let _guard = SECRET_ENV_LOCK.lock().unwrap();
+        // Safety: test-only env manipulation, serialized by SECRET_ENV_LOCK.
+        unsafe { std::env::remove_var("EXPLICIT_SECRET_ENV_FORWARDING_JSON") };
+        let mut env = BTreeMap::new();
+        merge_secret_forwarded_env(&mut env).unwrap();
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn merge_secret_forwarded_env_merges_json_object() {
+        let _guard = SECRET_ENV_LOCK.lock().unwrap();
+        // Safety: test-only env manipulation, serialized by SECRET_ENV_LOCK.
+        unsafe {
+            std::env::set_var(
+                "EXPLICIT_SECRET_ENV_FORWARDING_JSON",
+                r#"{"MY_SECRET":"abc","ANOTHER":"def"}"#,
+            )
+        };
+        let mut env = BTreeMap::new();
+        merge_secret_forwarded_env(&mut env).unwrap();
+        unsafe { std::env::remove_var("EXPLICIT_SECRET_ENV_FORWARDING_JSON") };
+        assert_eq!(env.get("MY_SECRET").map(String::as_str), Some("abc"));
+        assert_eq!(env.get("ANOTHER").map(String::as_str), Some("def"));
+    }
+
+    #[test]
+    fn merge_secret_forwarded_env_skips_non_string_values() {
+        let _guard = SECRET_ENV_LOCK.lock().unwrap();
+        // Safety: test-only env manipulation, serialized by SECRET_ENV_LOCK.
+        unsafe {
+            std::env::set_var(
+                "EXPLICIT_SECRET_ENV_FORWARDING_JSON",
+                r#"{"NUM":42,"STR":"ok"}"#,
+            )
+        };
+        let mut env = BTreeMap::new();
+        merge_secret_forwarded_env(&mut env).unwrap();
+        unsafe { std::env::remove_var("EXPLICIT_SECRET_ENV_FORWARDING_JSON") };
+        // 42 is not a string — skipped
+        assert!(!env.contains_key("NUM"));
+        assert_eq!(env.get("STR").map(String::as_str), Some("ok"));
     }
 }

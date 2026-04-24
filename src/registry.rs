@@ -677,8 +677,10 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        Confidence, collect_python_dependencies, detect_registry_matches,
-        normalize_requirement_name, parse_registry,
+        Confidence, collect_cargo_dependencies, collect_composer_dependencies_from_payload,
+        collect_go_dependencies, collect_mix_dependencies, collect_python_dependencies,
+        collect_ruby_dependencies, detect_registry_matches, normalize_requirement_name,
+        parse_registry,
     };
     use crate::analysis::{LanguageRequirement, ServiceRequirement};
 
@@ -831,5 +833,148 @@ dependencies {
         assert!(matches.packages.contains(&"postgresql".to_string()));
         assert!(matches.services.contains(&ServiceRequirement::Postgres));
         assert!(matches.services.contains(&ServiceRequirement::Redis));
+    }
+
+    #[test]
+    fn normalizes_requirement_name_edge_cases() {
+        // Comments
+        assert_eq!(normalize_requirement_name("# this is a comment"), None);
+        assert_eq!(normalize_requirement_name(""), None);
+        // URL references
+        assert_eq!(
+            normalize_requirement_name("git+https://github.com/foo/bar.git"),
+            None
+        );
+        assert_eq!(
+            normalize_requirement_name("https://example.com/pkg.whl"),
+            None
+        );
+        // With extras and markers
+        assert_eq!(
+            normalize_requirement_name("requests[security]>=2.28 ; python_version >= '3.8'"),
+            Some("requests".to_string())
+        );
+        // Inline comment
+        assert_eq!(
+            normalize_requirement_name("flask==3.0 # web framework"),
+            Some("flask".to_string())
+        );
+    }
+
+    #[test]
+    fn collect_ruby_dependencies_from_gemfile() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Gemfile"),
+            "gem 'rails', '~> 7.0'\ngem \"pg\", '>= 0.18'\n",
+        )
+        .unwrap();
+        let deps = collect_ruby_dependencies(dir.path()).unwrap();
+        assert!(deps.contains("rails"));
+        assert!(deps.contains("pg"));
+    }
+
+    #[test]
+    fn collect_ruby_dependencies_from_lockfile() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Gemfile.lock"),
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.0.0)\n    pg (1.5.6)\n",
+        )
+        .unwrap();
+        let deps = collect_ruby_dependencies(dir.path()).unwrap();
+        assert!(deps.contains("rails"));
+        assert!(deps.contains("pg"));
+    }
+
+    #[test]
+    fn collect_ruby_dependencies_returns_empty_without_gemfile() {
+        let dir = tempdir().unwrap();
+        let deps = collect_ruby_dependencies(dir.path()).unwrap();
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn collect_mix_dependencies_from_mix_exs() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("mix.exs"),
+            "defmodule Demo.MixProject do\n  defp deps do\n    [{:phoenix, \"~> 1.7\"}, {:postgrex, \">= 0.0.0\"}]\n  end\nend\n",
+        )
+        .unwrap();
+        let deps = collect_mix_dependencies(dir.path()).unwrap();
+        assert!(deps.contains("phoenix"));
+        assert!(deps.contains("postgrex"));
+    }
+
+    #[test]
+    fn collect_mix_dependencies_returns_empty_without_mix_exs() {
+        let dir = tempdir().unwrap();
+        let deps = collect_mix_dependencies(dir.path()).unwrap();
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn collect_cargo_dependencies_from_cargo_toml() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"test\"\nversion = \"0.1.0\"\n\n[dependencies]\nreqwest = \"0.12\"\n\n[dev-dependencies]\ntempfile = \"3\"\n",
+        )
+        .unwrap();
+        let deps = collect_cargo_dependencies(dir.path()).unwrap();
+        assert!(deps.contains("reqwest"));
+        assert!(deps.contains("tempfile"));
+    }
+
+    #[test]
+    fn collect_cargo_dependencies_returns_empty_without_cargo_toml() {
+        let dir = tempdir().unwrap();
+        let deps = collect_cargo_dependencies(dir.path()).unwrap();
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn collect_go_dependencies_from_go_mod() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("go.mod"),
+            "module example.com/app\n\ngo 1.21\n\nrequire (\n\tgithub.com/lib/pq v1.10.9\n\tgithub.com/redis/go-redis/v9 v9.5.1\n)\n",
+        )
+        .unwrap();
+        let deps = collect_go_dependencies(dir.path()).unwrap();
+        assert!(deps.contains("github.com/lib/pq"));
+        assert!(deps.contains("github.com/redis/go-redis/v9"));
+    }
+
+    #[test]
+    fn collect_go_dependencies_returns_empty_without_go_mod() {
+        let dir = tempdir().unwrap();
+        let deps = collect_go_dependencies(dir.path()).unwrap();
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn collect_composer_dependencies_from_payload_extracts_both_sections() {
+        let payload: serde_json::Value = serde_json::json!({
+            "require": {
+                "ext-pgsql": "*",
+                "symfony/console": "^6.0"
+            },
+            "require-dev": {
+                "phpunit/phpunit": "^10"
+            }
+        });
+        let deps = collect_composer_dependencies_from_payload(&payload);
+        assert!(deps.contains("ext-pgsql"));
+        assert!(deps.contains("symfony/console"));
+        assert!(deps.contains("phpunit/phpunit"));
+    }
+
+    #[test]
+    fn collect_composer_dependencies_empty_for_missing_fields() {
+        let payload: serde_json::Value = serde_json::json!({});
+        let deps = collect_composer_dependencies_from_payload(&payload);
+        assert!(deps.is_empty());
     }
 }

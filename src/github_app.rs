@@ -397,7 +397,10 @@ fn github_client(jwt: &str) -> Result<Client> {
 
 #[cfg(test)]
 mod tests {
-    use super::{allowed_repository_names, parse_github_slug};
+    use super::{
+        allowed_repository_names, github_submodule_slugs, load_config, parse_github_slug,
+        resolve_config_path, split_slug, xdg_config_file_path,
+    };
     use crate::analysis::{
         Analysis, GitHubRepository, GitHubVisibility, RepositoryMetadata, SandboxPlan,
     };
@@ -490,5 +493,175 @@ mod tests {
                 "sub-a".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn split_slug_returns_owner_and_name() {
+        assert_eq!(split_slug("owner/repo"), Some(("owner", "repo")));
+    }
+
+    #[test]
+    fn split_slug_returns_none_for_no_slash() {
+        assert_eq!(split_slug("no-slash"), None);
+    }
+
+    #[test]
+    fn split_slug_returns_none_for_empty_owner() {
+        assert_eq!(split_slug("/repo"), None);
+    }
+
+    #[test]
+    fn split_slug_returns_none_for_empty_name() {
+        assert_eq!(split_slug("owner/"), None);
+    }
+
+    #[test]
+    fn parse_github_slug_handles_ssh_colon_form() {
+        assert_eq!(
+            parse_github_slug("git@github.com:owner/repo.git").as_deref(),
+            Some("owner/repo")
+        );
+    }
+
+    #[test]
+    fn parse_github_slug_handles_https_form() {
+        assert_eq!(
+            parse_github_slug("https://github.com/owner/repo").as_deref(),
+            Some("owner/repo")
+        );
+    }
+
+    #[test]
+    fn parse_github_slug_handles_http_form() {
+        assert_eq!(
+            parse_github_slug("http://github.com/owner/repo.git").as_deref(),
+            Some("owner/repo")
+        );
+    }
+
+    #[test]
+    fn parse_github_slug_handles_ssh_url_form() {
+        assert_eq!(
+            parse_github_slug("ssh://git@github.com/owner/repo.git").as_deref(),
+            Some("owner/repo")
+        );
+    }
+
+    #[test]
+    fn parse_github_slug_returns_none_for_non_github_url() {
+        assert_eq!(parse_github_slug("https://gitlab.com/owner/repo"), None);
+    }
+
+    #[test]
+    fn resolve_config_path_absolute_passes_through() {
+        let result =
+            resolve_config_path(PathBuf::from("/config").as_path(), "/absolute/key.pem").unwrap();
+        assert_eq!(result, PathBuf::from("/absolute/key.pem"));
+    }
+
+    #[test]
+    fn resolve_config_path_relative_joins_to_config_dir() {
+        let result =
+            resolve_config_path(PathBuf::from("/config").as_path(), "relative/key.pem").unwrap();
+        assert_eq!(result, PathBuf::from("/config/relative/key.pem"));
+    }
+
+    #[test]
+    fn resolve_config_path_tilde_slash_resolves_to_home() {
+        let result = resolve_config_path(PathBuf::from("/config").as_path(), "~/key.pem").unwrap();
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(result, home.join("key.pem"));
+    }
+
+    #[test]
+    fn resolve_config_path_bare_tilde_resolves_to_home() {
+        let result = resolve_config_path(PathBuf::from("/config").as_path(), "~").unwrap();
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(result, home);
+    }
+
+    #[test]
+    fn xdg_config_file_path_uses_xdg_config_home_env() {
+        let dir = tempdir().unwrap();
+        // Safety: test-only env manipulation.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path().as_os_str()) };
+        let path = xdg_config_file_path().unwrap();
+        assert_eq!(path, dir.path().join("explicit/config.toml"));
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+    }
+
+    #[test]
+    fn github_submodule_slugs_parses_gitmodules() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".gitmodules"),
+            "[submodule \"deps/a\"]\n    path = deps/a\n    url = git@github.com:owner/repo-a.git\n[submodule \"deps/b\"]\n    path = deps/b\n    url = https://github.com/owner/repo-b.git\n",
+        )
+        .unwrap();
+        let slugs = github_submodule_slugs(dir.path()).unwrap();
+        assert!(slugs.contains(&"owner/repo-a".to_string()));
+        assert!(slugs.contains(&"owner/repo-b".to_string()));
+    }
+
+    #[test]
+    fn github_submodule_slugs_returns_empty_when_no_file() {
+        let dir = tempdir().unwrap();
+        let slugs = github_submodule_slugs(dir.path()).unwrap();
+        assert!(slugs.is_empty());
+    }
+
+    #[test]
+    fn github_submodule_slugs_skips_non_github_urls() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".gitmodules"),
+            "[submodule \"deps/x\"]\n    path = deps/x\n    url = https://gitlab.com/owner/repo.git\n",
+        )
+        .unwrap();
+        let slugs = github_submodule_slugs(dir.path()).unwrap();
+        assert!(slugs.is_empty());
+    }
+
+    #[test]
+    fn load_config_returns_none_when_no_config_file() {
+        let dir = tempdir().unwrap();
+        // Safety: test-only env manipulation.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path().as_os_str()) };
+        let result = load_config().unwrap();
+        assert!(result.is_none());
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+    }
+
+    #[test]
+    fn load_config_returns_config_when_file_present() {
+        let dir = tempdir().unwrap();
+        let explicit_dir = dir.path().join("explicit");
+        std::fs::create_dir_all(&explicit_dir).unwrap();
+        std::fs::write(
+            explicit_dir.join("config.toml"),
+            "[github_app]\napp_id = 123456\nprivate_key_file = \"app.pem\"\n",
+        )
+        .unwrap();
+        // Safety: test-only env manipulation.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path().as_os_str()) };
+        let result = load_config().unwrap();
+        assert!(result.is_some());
+        let (config, config_dir) = result.unwrap();
+        assert_eq!(config.app_id, Some(123456));
+        assert_eq!(config_dir, explicit_dir);
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+    }
+
+    #[test]
+    fn load_config_returns_none_when_no_github_app_section() {
+        let dir = tempdir().unwrap();
+        let explicit_dir = dir.path().join("explicit");
+        std::fs::create_dir_all(&explicit_dir).unwrap();
+        std::fs::write(explicit_dir.join("config.toml"), "# no github_app\n").unwrap();
+        // Safety: test-only env manipulation.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path().as_os_str()) };
+        let result = load_config().unwrap();
+        assert!(result.is_none());
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
     }
 }
